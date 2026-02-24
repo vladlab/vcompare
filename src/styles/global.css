@@ -1,0 +1,182 @@
+/*
+ * vcompare — dark theme
+ *
+ * Inspired by DaVinci Resolve's panel aesthetic:
+ * dark neutral grays, minimal chrome, data-forward.
+ * Accent colors match the TUI: yellow=VMAF, cyan=PSNR, red=threshold.
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+
+:root {
+  /* Surface layers (darkest → lightest) */
+  --bg-base:     #0d0d0d;
+  --bg-surface:  #161616;
+  --bg-raised:   #1e1e1e;
+  --bg-overlay:  #262626;
+  --bg-hover:    #2e2e2e;
+  --bg-active:   #363636;
+
+  /* Borders */
+  --border-subtle:  #2a2a2a;
+  --border-default: #3a3a3a;
+  --border-strong:  #505050;
+
+  /* Text */
+  --text-primary:   #e8e8e8;
+  --text-secondary: #999999;
+  --text-muted:     #666666;
+
+  /* Metric accent colors */
+  --vmaf-color:      #e8b830;
+  --vmaf-color-dim:  #8a6e1c;
+  --psnr-color:      #4ec9b0;
+  --psnr-color-dim:  #2e7a68;
+  --threshold-color: #e54545;
+  --threshold-dim:   #8a2a2a;
+
+  /* UI accents */
+  --accent:      #5a8fd4;
+  --accent-dim:  #3a5f8a;
+  --success:     #4ec966;
+  --warning:     #e8b830;
+
+  /* Spacing */
+  --gap-xs: 4px;
+  --gap-sm: 8px;
+  --gap-md: 12px;
+  --gap-lg: 16px;
+  --gap-xl: 24px;
+
+  /* Radii */
+  --radius-sm: 3px;
+  --radius-md: 5px;
+
+  /* Fonts */
+  --font-ui:   'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #app {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Prevent text selection on UI elements (feels more native) */
+  user-select: none;
+}
+
+/* ── Form controls (force dark appearance) ───────────────────────────── */
+
+select, input {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  padding: 3px 6px;
+}
+
+select:focus, input:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
+select option {
+  background: var(--bg-raised);
+  color: var(--text-primary);
+}
+
+/* ── Scrollbar (thin, dark) ─────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+/* ── Utility classes ────────────────────────────────────────────────────── */
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.text-vmaf  { color: var(--vmaf-color); }
+.text-psnr  { color: var(--psnr-color); }
+.text-error { color: var(--threshold-color); }
+.text-muted { color: var(--text-muted); }
+.text-secondary { color: var(--text-secondary); }
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+
+button {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s;
+}
+button:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+button:active {
+  background: var(--bg-active);
+}
+button.primary {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: #fff;
+}
+button.primary:hover {
+  background: var(--accent);
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── Kbd hints (keyboard shortcut labels) ───────────────────────────────── */
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  background: var(--bg-overlay);
+  color: var(--text-muted);
+  margin-left: 6px;
+  vertical-align: middle;
+}

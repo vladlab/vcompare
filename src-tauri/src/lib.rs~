@@ -1,0 +1,120 @@
+mod bridge;
+mod sidecar;
+
+use bridge::SidecarState;
+use std::env;
+use std::path::PathBuf;
+
+/// Locate the Python sidecar script.
+/// In dev: relative to the project root.
+/// In production: bundled alongside the binary via externalBin.
+fn find_sidecar_script() -> PathBuf {
+    // Check for explicit override
+    if let Ok(path) = env::var("VCOMPARE_SIDECAR") {
+        return PathBuf::from(path);
+    }
+
+    // Dev mode: look relative to Cargo manifest directory
+    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("sidecar")
+        .join("vcompare_engine.py");
+    if dev_path.exists() {
+        return dev_path;
+    }
+
+    // Production: next to the binary
+    if let Ok(exe) = env::current_exe() {
+        let prod_path = exe.parent().unwrap().join("sidecar").join("vcompare_engine.py");
+        if prod_path.exists() {
+            return prod_path;
+        }
+    }
+
+    // Fallback
+    PathBuf::from("sidecar/vcompare_engine.py")
+}
+
+/// Locate Python 3 interpreter.
+fn find_python() -> String {
+    // Explicit override
+    if let Ok(p) = env::var("VCOMPARE_PYTHON") {
+        return p;
+    }
+
+    // Try common names
+    for candidate in &["python3", "python"] {
+        if let Ok(output) = std::process::Command::new(candidate)
+            .arg("--version")
+            .output()
+        {
+            if output.status.success() {
+                let version = String::from_utf8_lossy(&output.stdout);
+                if version.contains("Python 3") {
+                    return candidate.to_string();
+                }
+                // Some systems print to stderr
+                let version_err = String::from_utf8_lossy(&output.stderr);
+                if version_err.contains("Python 3") {
+                    return candidate.to_string();
+                }
+            }
+        }
+    }
+
+    "python3".to_string()
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    env_logger::init();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
+        .setup(|app| {
+            let python = find_python();
+            let script = find_sidecar_script();
+
+            log::info!("Spawning sidecar: {python} {}", script.display());
+
+            let sidecar = sidecar::Sidecar::spawn(
+                app.handle(),
+                &python,
+                script.to_str().unwrap(),
+            )
+            .map_err(|e| {
+                log::error!("Sidecar spawn failed: {e}");
+                Box::<dyn std::error::Error>::from(e)
+            })?;
+
+            // Verify sidecar is alive
+            let sc = sidecar.clone();
+            tauri::async_runtime::spawn(async move {
+                match sc.call("ping", serde_json::json!({})).await {
+                    Ok(resp) => log::info!("Sidecar alive: {resp}"),
+                    Err(e) => log::error!("Sidecar ping failed: {e}"),
+                }
+            });
+
+            app.manage(SidecarState(sidecar));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            bridge::ping,
+            bridge::detect_capabilities,
+            bridge::probe_file,
+            bridge::analyze,
+            bridge::get_frames,
+            bridge::get_metric_series,
+            bridge::mpv_launch,
+            bridge::mpv_seek,
+            bridge::mpv_step,
+            bridge::mpv_toggle_pause,
+            bridge::mpv_kill,
+            bridge::export_csv,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
