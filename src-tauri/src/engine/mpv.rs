@@ -17,6 +17,15 @@ use std::time::Duration;
 use crate::engine::timecode::TimecodeFormat;
 use crate::engine::types::TimelineInfo;
 
+/// How to combine the two video streams in mpv.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ViewMode {
+    /// Side-by-side: `[ref][dist]hstack[vo]`
+    SideBySide,
+    /// Pixel difference: `[ref][dist]blend=all_mode=difference[vo]`
+    Difference,
+}
+
 /// mpv process controller with IPC.
 pub struct MpvController {
     ref_path: String,
@@ -26,6 +35,8 @@ pub struct MpvController {
     ref_file_start_tc: i64,
     /// Timeline info for TC-aligned playback
     timeline: Option<TimelineInfo>,
+    /// How to combine the two streams
+    view_mode: ViewMode,
     process: Mutex<Option<Child>>,
     sock_path: PathBuf,
     /// Temp EDL file path (cleaned up on kill)
@@ -39,15 +50,21 @@ impl MpvController {
         tc_format: TimecodeFormat,
         ref_file_start_tc: i64,
         timeline: Option<TimelineInfo>,
+        view_mode: ViewMode,
     ) -> Self {
         let pid = std::process::id();
-        let sock_path = std::env::temp_dir().join(format!("vcompare_mpv_{pid}.sock"));
+        let suffix = match view_mode {
+            ViewMode::SideBySide => "sbs",
+            ViewMode::Difference => "diff",
+        };
+        let sock_path = std::env::temp_dir().join(format!("vcompare_mpv_{pid}_{suffix}.sock"));
         Self {
             ref_path,
             dist_path,
             tc_format,
             ref_file_start_tc,
             timeline,
+            view_mode,
             process: Mutex::new(None),
             sock_path,
             edl_path: Mutex::new(None),
@@ -109,6 +126,11 @@ impl MpvController {
             lavfi
         );
 
+        let mode_label = match self.view_mode {
+            ViewMode::SideBySide => "SBS",
+            ViewMode::Difference => "DIFF",
+        };
+
         let cmd_result = Command::new("mpv")
             .arg(&primary)
             .arg(format!("--external-file={}", external))
@@ -118,9 +140,10 @@ impl MpvController {
             .arg("--hr-seek=yes")
             .arg("--keep-open=yes")
             .arg("--force-window=yes")
+            .arg("--autofit=25%x25%")
             .arg("--osd-level=2")
             .arg("--osd-fractions")
-            .arg(format!("--title=vcompare: {ref_name} | {dist_name}"))
+            .arg(format!("--title=vcompare [{mode_label}]: {ref_name} | {dist_name}"))
             .arg("--no-terminal")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -158,7 +181,7 @@ impl MpvController {
                 return (
                     self.ref_path.clone(),
                     self.dist_path.clone(),
-                    "[vid1][vid2]hstack[vo]".into(),
+                    self.make_lavfi("[vid1]", "[vid2]"),
                 );
             }
         };
@@ -174,11 +197,11 @@ impl MpvController {
             *self.edl_path.lock().unwrap() = Some(edl_path);
 
             // vid1=dist(primary), vid2=ref(EDL)
-            // hstack: ref on left, dist on right → [vid2][vid1]
+            // ref on left, dist on right → ref=[vid2], dist=[vid1]
             (
                 self.dist_path.clone(),
                 edl_str,
-                "[vid2][vid1]hstack[vo]".into(),
+                self.make_lavfi("[vid2]", "[vid1]"),
             )
         } else if dist_skip_sec > 0.01 {
             // Dist needs to skip ahead → wrap dist in EDL, ref is primary
@@ -186,20 +209,29 @@ impl MpvController {
             let edl_str = edl_path.to_string_lossy().to_string();
             *self.edl_path.lock().unwrap() = Some(edl_path);
 
-            // vid1=ref(primary), vid2=dist(EDL)
-            // hstack: ref on left, dist on right → [vid1][vid2]
             (
                 self.ref_path.clone(),
                 edl_str,
-                "[vid1][vid2]hstack[vo]".into(),
+                self.make_lavfi("[vid1]", "[vid2]"),
             )
         } else {
             // No skip needed — both start at overlap
             (
                 self.ref_path.clone(),
                 self.dist_path.clone(),
-                "[vid1][vid2]hstack[vo]".into(),
+                self.make_lavfi("[vid1]", "[vid2]"),
             )
+        }
+    }
+
+    /// Build the lavfi filter string for the given input labels.
+    /// `ref_label` and `dist_label` are the mpv stream labels (e.g. "[vid1]", "[vid2]").
+    fn make_lavfi(&self, ref_label: &str, dist_label: &str) -> String {
+        match self.view_mode {
+            ViewMode::SideBySide => format!("{ref_label}{dist_label}hstack[vo]"),
+            ViewMode::Difference => format!(
+                "{ref_label}format=gbrp[_r];{dist_label}format=gbrp[_d];[_r][_d]blend=all_mode=difference[vo]"
+            ),
         }
     }
 
@@ -211,9 +243,13 @@ impl MpvController {
     /// /path/to/file.mov,56.48
     /// ```
     fn write_edl(&self, file_path: &str, start_sec: f64) -> PathBuf {
+        let suffix = match self.view_mode {
+            ViewMode::SideBySide => "sbs",
+            ViewMode::Difference => "diff",
+        };
         let edl_path = std::env::temp_dir().join(format!(
-            "vcompare_mpv_{}.edl",
-            std::process::id()
+            "vcompare_mpv_{}_{}.edl",
+            std::process::id(), suffix
         ));
         let content = format!("# mpv EDL v0\n{},{:.6}\n", file_path, start_sec);
         eprintln!("[vcompare] mpv EDL: {}", content.trim());

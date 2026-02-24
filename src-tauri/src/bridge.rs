@@ -6,7 +6,7 @@
 use crate::engine;
 use crate::engine::analysis::ProcessHandle;
 use crate::engine::cache;
-use crate::engine::mpv::MpvController;
+use crate::engine::mpv::{MpvController, ViewMode};
 use crate::engine::pixfmt::choose_diff_pixfmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -69,6 +69,19 @@ pub struct MpvState {
 }
 
 impl MpvState {
+    pub fn new() -> Self {
+        Self {
+            controller: Mutex::new(None),
+        }
+    }
+}
+
+/// Manages the difference-view mpv controller (separate instance).
+pub struct DiffViewState {
+    pub controller: Mutex<Option<Arc<MpvController>>>,
+}
+
+impl DiffViewState {
     pub fn new() -> Self {
         Self {
             controller: Mutex::new(None),
@@ -484,6 +497,7 @@ pub async fn mpv_launch(
         ctx.tc_format,
         ctx.ref_file_start_tc,
         ctx.timeline,
+        ViewMode::SideBySide,
     ));
 
     if let Some(err) = mpv.launch() {
@@ -560,6 +574,109 @@ pub async fn mpv_kill(
     let mut ctrl = mpv_state.controller.lock().unwrap();
     if let Some(mpv) = ctrl.take() {
         mpv.kill(); // kills the process → poll thread's is_running() returns false
+    }
+    Ok(json!({"status": "killed"}))
+}
+
+// ─── Difference View (separate mpv instance) ──────────────────────────────
+
+#[tauri::command]
+pub async fn diffview_launch(
+    app: AppHandle,
+    engine_state: State<'_, EngineState>,
+    diffview_state: State<'_, DiffViewState>,
+) -> Result<Value, String> {
+    let ctx = engine_state.mpv_context()?;
+
+    {
+        let existing = diffview_state.controller.lock().unwrap();
+        if let Some(ref mpv) = *existing {
+            if mpv.is_running() {
+                return Ok(json!({"status": "already_running"}));
+            }
+        }
+    }
+
+    let mpv = Arc::new(MpvController::new(
+        ctx.ref_path,
+        ctx.dist_path,
+        ctx.tc_format,
+        ctx.ref_file_start_tc,
+        ctx.timeline,
+        ViewMode::Difference,
+    ));
+
+    if let Some(err) = mpv.launch() {
+        return Err(err);
+    }
+
+    *diffview_state.controller.lock().unwrap() = Some(mpv.clone());
+
+    let poll_mpv = mpv.clone();
+    let app_poll = app.clone();
+
+    std::thread::spawn(move || {
+        let mut last_frame: Option<i64> = None;
+        loop {
+            if !poll_mpv.is_running() {
+                eprintln!("[vcompare] diffview process exited");
+                let _ = app_poll.emit("rpc:diffview-exited", json!({"reason": "closed"}));
+                break;
+            }
+            if let Some(frame) = poll_mpv.get_frame() {
+                if last_frame != Some(frame) {
+                    last_frame = Some(frame);
+                    let _ = app_poll.emit("rpc:diffview-position", json!({"frame": frame}));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+
+    Ok(json!({"status": "launched"}))
+}
+
+#[tauri::command]
+pub async fn diffview_seek(
+    frame: i64,
+    diffview_state: State<'_, DiffViewState>,
+) -> Result<Value, String> {
+    let ctrl = diffview_state.controller.lock().unwrap();
+    let mpv = ctrl.as_ref().ok_or("diffview not running")?;
+    Ok(json!({"ok": mpv.seek_to_frame(frame)}))
+}
+
+#[tauri::command]
+pub async fn diffview_step(
+    direction: String,
+    diffview_state: State<'_, DiffViewState>,
+) -> Result<Value, String> {
+    let ctrl = diffview_state.controller.lock().unwrap();
+    let mpv = ctrl.as_ref().ok_or("diffview not running")?;
+    let ok = match direction.as_str() {
+        "forward" => mpv.step_forward(),
+        "backward" => mpv.step_backward(),
+        _ => return Err("invalid direction".into()),
+    };
+    Ok(json!({"ok": ok}))
+}
+
+#[tauri::command]
+pub async fn diffview_pause(
+    diffview_state: State<'_, DiffViewState>,
+) -> Result<Value, String> {
+    let ctrl = diffview_state.controller.lock().unwrap();
+    let mpv = ctrl.as_ref().ok_or("diffview not running")?;
+    Ok(json!({"ok": mpv.toggle_pause()}))
+}
+
+#[tauri::command]
+pub async fn diffview_kill(
+    diffview_state: State<'_, DiffViewState>,
+) -> Result<Value, String> {
+    let mut ctrl = diffview_state.controller.lock().unwrap();
+    if let Some(mpv) = ctrl.take() {
+        mpv.kill();
     }
     Ok(json!({"status": "killed"}))
 }

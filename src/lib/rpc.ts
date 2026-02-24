@@ -207,6 +207,28 @@ export async function mpvKill(): Promise<{ status: string }> {
   return invoke("mpv_kill");
 }
 
+// ─── Difference view (second mpv instance) ────────────────────────────────
+
+export async function diffviewLaunch(): Promise<{ status: string }> {
+  return invoke("diffview_launch");
+}
+
+export async function diffviewSeek(frame: number): Promise<{ ok: boolean }> {
+  return invoke("diffview_seek", { frame });
+}
+
+export async function diffviewStep(direction: "forward" | "backward"): Promise<{ ok: boolean }> {
+  return invoke("diffview_step", { direction });
+}
+
+export async function diffviewPause(): Promise<{ ok: boolean }> {
+  return invoke("diffview_pause");
+}
+
+export async function diffviewKill(): Promise<{ status: string }> {
+  return invoke("diffview_kill");
+}
+
 export async function exportCsv(path?: string): Promise<{ path: string; rows: number }> {
   return invoke("export_csv", { path: path ?? null });
 }
@@ -223,6 +245,10 @@ export function onDiagnostics(callback: (e: DiagnosticsEvent) => void): Promise<
 
 export function onMpvPosition(callback: (e: MpvPositionEvent) => void): Promise<UnlistenFn> {
   return listen<MpvPositionEvent>("rpc:mpv-position", (event) => callback(event.payload));
+}
+
+export function onDiffviewPosition(callback: (e: MpvPositionEvent) => void): Promise<UnlistenFn> {
+  return listen<MpvPositionEvent>("rpc:diffview-position", (event) => callback(event.payload));
 }
 
 export { type UnlistenFn };

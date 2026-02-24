@@ -1,7 +1,7 @@
 mod bridge;
 mod engine;
 
-use bridge::{EngineState, FfmpegHandle, MpvState, RecentsState};
+use bridge::{DiffViewState, EngineState, FfmpegHandle, MpvState, RecentsState};
 use std::env;
 use tauri::{Emitter, Manager};
 
@@ -91,6 +91,7 @@ pub fn run() {
             // ── Engine state ──
             app.manage(EngineState::new());
             app.manage(MpvState::new());
+            app.manage(DiffViewState::new());
             app.manage(FfmpegHandle::new());
 
             // ── Recent analyses store ──
@@ -117,6 +118,11 @@ pub fn run() {
             bridge::mpv_step,
             bridge::mpv_toggle_pause,
             bridge::mpv_kill,
+            bridge::diffview_launch,
+            bridge::diffview_seek,
+            bridge::diffview_step,
+            bridge::diffview_pause,
+            bridge::diffview_kill,
             bridge::export_csv,
             bridge::get_recents,
             bridge::add_recent,
@@ -141,6 +147,15 @@ pub fn run() {
 
             // Kill mpv if running
             if let Some(state) = app_handle.try_state::<MpvState>() {
+                if let Ok(mut ctrl) = state.controller.lock() {
+                    if let Some(mpv) = ctrl.take() {
+                        mpv.kill();
+                    }
+                }
+            }
+
+            // Kill diffview if running
+            if let Some(state) = app_handle.try_state::<DiffViewState>() {
                 if let Ok(mut ctrl) = state.controller.lock() {
                     if let Some(mpv) = ctrl.take() {
                         mpv.kill();

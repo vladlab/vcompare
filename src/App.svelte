@@ -33,9 +33,15 @@
     mpvStep,
     mpvTogglePause,
     mpvKill,
+    diffviewLaunch,
+    diffviewSeek,
+    diffviewStep,
+    diffviewPause,
+    diffviewKill,
     onProgress,
     onDiagnostics,
     onMpvPosition,
+    onDiffviewPosition,
   } from "./lib/rpc";
   import MetricChart from "./components/MetricChart.svelte";
   import FrameTable from "./components/FrameTable.svelte";
@@ -88,18 +94,23 @@
   let chartComponent: MetricChart | undefined = $state();
   let mpvFrame: number = $state(-1);
 
-  // Debounced seek
+  // Difference view state
+  let diffviewRunning: boolean = $state(false);
+  let diffviewFrame: number = $state(-1);
+
+  // Debounced seek — sends to both mpv instances if running
   let seekTimer: ReturnType<typeof setTimeout> | null = null;
   let seekGeneration = 0;
 
   function debouncedMpvSeek(frame: number) {
-    if (!mpvRunning) return;
+    if (!mpvRunning && !diffviewRunning) return;
     seekGeneration++;
     const gen = seekGeneration;
     if (seekTimer) clearTimeout(seekTimer);
     seekTimer = setTimeout(() => {
       if (gen === seekGeneration) {
-        mpvSeek(frame).catch(() => {});
+        if (mpvRunning) mpvSeek(frame).catch(() => {});
+        if (diffviewRunning) diffviewSeek(frame).catch(() => {});
       }
     }, 50);
   }
@@ -128,11 +139,24 @@
     );
 
     unlisteners.push(
+      await onDiffviewPosition((e) => {
+        diffviewFrame = e.frame;
+      })
+    );
+    unlisteners.push(
+      await listen("rpc:diffview-exited", () => {
+        diffviewRunning = false;
+        diffviewFrame = -1;
+      })
+    );
+
+    unlisteners.push(
       await listen("menu-event", (event) => {
         const id = event.payload as string;
         if (id === "new-analysis") {
-          // Kill mpv if running
+          // Kill mpv instances if running
           mpvKill().catch(() => {});
+          diffviewKill().catch(() => {});
           // Reset to idle
           state = "idle";
           refPath = "";
@@ -149,6 +173,8 @@
           mpvRunning = false;
           mpvAutoSeek = false;
           mpvFrame = -1;
+          diffviewRunning = false;
+          diffviewFrame = -1;
         }
       })
     );
@@ -326,7 +352,7 @@
 
   function handleCursorChange(frame: number) {
     cursorFrame = frame;
-    if (mpvRunning) {
+    if (mpvRunning || diffviewRunning) {
       debouncedMpvSeek(frame);
     }
   }
@@ -371,22 +397,36 @@
       case "P":
         mpvKill().then(() => (mpvRunning = false));
         break;
+      case "d":
+        if (!diffviewRunning) {
+          diffviewLaunch().then(() => (diffviewRunning = true)).catch((e) => console.error("diffview:", e));
+        }
+        break;
+      case "D":
+        diffviewKill().then(() => (diffviewRunning = false));
+        break;
       case "s":
-        if (mpvRunning && cursorFrame >= 0) mpvSeek(cursorFrame);
+        if (cursorFrame >= 0) {
+          if (mpvRunning) mpvSeek(cursorFrame);
+          if (diffviewRunning) diffviewSeek(cursorFrame);
+        }
         break;
       case "a":
         mpvAutoSeek = !mpvAutoSeek;
         break;
       case ".":
         if (mpvRunning) mpvStep("forward");
+        if (diffviewRunning) diffviewStep("forward");
         break;
       case ",":
         if (mpvRunning) mpvStep("backward");
+        if (diffviewRunning) diffviewStep("backward");
         break;
       case " ":
-        if (mpvRunning) {
+        if (mpvRunning || diffviewRunning) {
           e.preventDefault();
-          mpvTogglePause();
+          if (mpvRunning) mpvTogglePause();
+          if (diffviewRunning) diffviewPause();
         }
         break;
       case "e":
@@ -651,6 +691,7 @@
         <kbd>+</kbd><kbd>-</kbd> zoom
         <kbd>0</kbd> reset
         <kbd>p</kbd> mpv
+        <kbd>d</kbd> diff
         <kbd>s</kbd> seek
         <kbd>a</kbd> sync {mpvAutoSeek ? "↔ bidi" : "→ fwd"}
         <kbd>.</kbd><kbd>,</kbd> step
