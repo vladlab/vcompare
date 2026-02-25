@@ -48,6 +48,7 @@ pub fn check_cache(ref_path: &str, dist_path: &str, log_path: Option<&str>) -> V
                     .map(|a| a.len())
                     .unwrap_or(0);
                 let sync_mode = data.get("sync_mode").and_then(|v| v.as_str());
+                let with_ssim = data.get("with_ssim").and_then(|v| v.as_bool()).unwrap_or(false);
 
                 serde_json::json!({
                     "exists": true,
@@ -55,6 +56,7 @@ pub fn check_cache(ref_path: &str, dist_path: &str, log_path: Option<&str>) -> V
                     "frame_count": fc,
                     "mode": mode,
                     "sync_mode": sync_mode,
+                    "with_ssim": with_ssim,
                 })
             }
             Err(_) => serde_json::json!({

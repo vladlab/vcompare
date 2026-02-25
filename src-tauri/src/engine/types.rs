@@ -56,6 +56,8 @@ pub struct ComparisonConfig {
     /// 0 = no scaling needed
     pub scale_w: u32,
     pub scale_h: u32,
+    /// true = scale ref, false = scale dist (default)
+    pub scale_ref: bool,
     /// Format filter for ref (None = no conversion)
     pub ref_pixfmt: Option<String>,
     /// Format filter for dist (None = no conversion)
@@ -84,6 +86,7 @@ impl Default for ComparisonConfig {
             dist_seek_sec: 0.0,
             scale_w: 0,
             scale_h: 0,
+            scale_ref: false,
             ref_pixfmt: None,
             dist_pixfmt: None,
             ref_src_pixfmt: "yuv420p".into(),

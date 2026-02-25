@@ -37,6 +37,11 @@ pub struct MpvController {
     timeline: Option<TimelineInfo>,
     /// How to combine the two streams
     view_mode: ViewMode,
+    /// If dist needs scaling to match ref (0 = no scaling)
+    scale_w: u32,
+    scale_h: u32,
+    /// true = scale ref, false = scale dist
+    scale_ref: bool,
     process: Mutex<Option<Child>>,
     sock_path: PathBuf,
     /// Temp EDL file path (cleaned up on kill)
@@ -51,6 +56,9 @@ impl MpvController {
         ref_file_start_tc: i64,
         timeline: Option<TimelineInfo>,
         view_mode: ViewMode,
+        scale_w: u32,
+        scale_h: u32,
+        scale_ref: bool,
     ) -> Self {
         let pid = std::process::id();
         let suffix = match view_mode {
@@ -65,6 +73,9 @@ impl MpvController {
             ref_file_start_tc,
             timeline,
             view_mode,
+            scale_w,
+            scale_h,
+            scale_ref,
             process: Mutex::new(None),
             sock_path,
             edl_path: Mutex::new(None),
@@ -227,10 +238,33 @@ impl MpvController {
     /// Build the lavfi filter string for the given input labels.
     /// `ref_label` and `dist_label` are the mpv stream labels (e.g. "[vid1]", "[vid2]").
     fn make_lavfi(&self, ref_label: &str, dist_label: &str) -> String {
+        // If scaling needed, prepend a scale filter to the correct stream
+        let scale_filter = if self.scale_w > 0 {
+            Some(format!("scale={}:{}:flags=lanczos", self.scale_w, self.scale_h))
+        } else {
+            None
+        };
+
+        let (ref_expr, ref_out, dist_expr, dist_out) = match &scale_filter {
+            Some(scale) if self.scale_ref => (
+                format!("{ref_label}{scale}[_scaled];"),
+                "[_scaled]",
+                String::new(),
+                dist_label,
+            ),
+            Some(scale) => (
+                String::new(),
+                ref_label,
+                format!("{dist_label}{scale}[_scaled];"),
+                "[_scaled]",
+            ),
+            None => (String::new(), ref_label, String::new(), dist_label),
+        };
+
         match self.view_mode {
-            ViewMode::SideBySide => format!("{ref_label}{dist_label}hstack[vo]"),
+            ViewMode::SideBySide => format!("{ref_expr}{dist_expr}{ref_out}{dist_out}hstack[vo]"),
             ViewMode::Difference => format!(
-                "{ref_label}format=gbrp[_r];{dist_label}format=gbrp[_d];[_r][_d]blend=all_mode=difference[vo]"
+                "{ref_expr}{dist_expr}{ref_out}format=gbrp[_r];{dist_out}format=gbrp[_d];[_r][_d]blend=all_mode=difference[vo]"
             ),
         }
     }

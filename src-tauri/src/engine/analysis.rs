@@ -57,14 +57,30 @@ pub fn prepare_comparison(
         dist_info.width, dist_info.height, dist_info.pix_fmt, dist_info.fps_num, dist_info.fps_den
     ));
 
-    // Resolution scaling — scale distorted to match reference
+    // Resolution scaling — always compare at the smaller resolution
     if ref_info.width != dist_info.width || ref_info.height != dist_info.height {
-        config.scale_w = ref_info.width;
-        config.scale_h = ref_info.height;
-        diagnostics.push(format!(
-            "resolution: MISMATCH → scaling dist to {}x{}",
-            ref_info.width, ref_info.height
-        ));
+        let ref_pixels = ref_info.width as u64 * ref_info.height as u64;
+        let dist_pixels = dist_info.width as u64 * dist_info.height as u64;
+
+        if ref_pixels > dist_pixels {
+            // Ref is larger → scale ref down to dist's size
+            config.scale_w = dist_info.width;
+            config.scale_h = dist_info.height;
+            config.scale_ref = true;
+            diagnostics.push(format!(
+                "resolution: MISMATCH → scaling ref down to {}x{}",
+                dist_info.width, dist_info.height
+            ));
+        } else {
+            // Dist is larger → scale dist down to ref's size
+            config.scale_w = ref_info.width;
+            config.scale_h = ref_info.height;
+            config.scale_ref = false;
+            diagnostics.push(format!(
+                "resolution: MISMATCH → scaling dist down to {}x{}",
+                ref_info.width, ref_info.height
+            ));
+        }
     } else {
         diagnostics.push(format!(
             "resolution: matched ({}x{})",
@@ -222,6 +238,7 @@ pub fn prepare_comparison(
 // ─── Diff analysis ──────────────────────────────────────────────────────────
 
 /// Run pixel-difference analysis using FFmpeg's psnr filter.
+/// When `with_ssim` is true, also runs the ssim filter in the same pass.
 ///
 /// Returns a JSON object with mode, frames, metadata — ready for state storage.
 pub fn run_diff_analysis(
@@ -231,6 +248,7 @@ pub fn run_diff_analysis(
     tc_fmt: &TimecodeFormat,
     target_fmt: &str,
     bit_depth: u32,
+    with_ssim: bool,
     progress: Option<ProgressFn>,
     process_handle: ProcessHandle,
 ) -> Result<Vec<Value>, String> {
@@ -238,22 +256,36 @@ pub fn run_diff_analysis(
     let stats_dir = std::env::temp_dir().join(format!("vcompare_diff_{}", std::process::id()));
     std::fs::create_dir_all(&stats_dir)
         .map_err(|e| format!("Failed to create temp dir: {e}"))?;
-    let stats_path = stats_dir.join("psnr_stats.txt");
-    let stats_path_str = stats_path.to_string_lossy().to_string();
+    let psnr_stats_path = stats_dir.join("psnr_stats.txt");
+    let psnr_stats_str = psnr_stats_path.to_string_lossy().to_string();
+    let ssim_stats_path = stats_dir.join("ssim_stats.txt");
+    let ssim_stats_str = ssim_stats_path.to_string_lossy().to_string();
 
     // Build filter chain
-    let ref_chain = format!("format={target_fmt}");
+    let mut ref_chain = format!("format={target_fmt}");
     let mut dist_chain = format!("format={target_fmt}");
     if config.scale_w > 0 {
-        dist_chain.push_str(&format!(
-            ",scale={}:{}:flags=lanczos",
-            config.scale_w, config.scale_h
-        ));
+        let scale = format!(",scale={}:{}:flags=lanczos", config.scale_w, config.scale_h);
+        if config.scale_ref {
+            ref_chain.push_str(&scale);
+        } else {
+            dist_chain.push_str(&scale);
+        }
     }
 
-    let filter_complex = format!(
-        "[0:v]{ref_chain}[ref];[1:v]{dist_chain}[dist];[ref][dist]psnr=stats_file={stats_path_str}"
-    );
+    let filter_complex = if with_ssim {
+        // Chain psnr → ssim in single pass: split dist, feed both filters
+        format!(
+            "[0:v]{ref_chain}[ref];[1:v]{dist_chain}[dist];\
+             [dist]split[dist1][dist2];\
+             [ref][dist1]psnr=stats_file={psnr_stats_str}[psnr_out];\
+             [psnr_out][dist2]ssim=stats_file={ssim_stats_str}"
+        )
+    } else {
+        format!(
+            "[0:v]{ref_chain}[ref];[1:v]{dist_chain}[dist];[ref][dist]psnr=stats_file={psnr_stats_str}"
+        )
+    };
 
     // Build command
     let mut args = vec!["ffmpeg".to_string(), "-y".to_string()];
@@ -281,12 +313,32 @@ pub fn run_diff_analysis(
     // Run ffmpeg
     run_ffmpeg_with_progress(&args[1..], config.total_frames, progress, process_handle)?;
 
-    // Parse stats
+    // Parse psnr stats
     let peak = (1u64 << bit_depth) - 1;
-    let frames = parse_psnr_stats(&stats_path_str, tc_fmt, config.ref_start_frame, peak)?;
+    let mut frames = parse_psnr_stats(&psnr_stats_str, tc_fmt, config.ref_start_frame, peak)?;
+
+    // Merge SSIM data if requested
+    if with_ssim {
+        let ssim_data = parse_ssim_stats(&ssim_stats_str)?;
+        // Merge by index (both should have same frame count)
+        for (i, frame) in frames.iter_mut().enumerate() {
+            if let Some(ssim_vals) = ssim_data.get(i) {
+                if let Some(obj) = frame.as_object_mut() {
+                    obj.insert("ssim".into(), serde_json::json!(ssim_vals.all));
+                    obj.insert("ssim_y".into(), serde_json::json!(ssim_vals.y));
+                    obj.insert("ssim_u".into(), serde_json::json!(ssim_vals.u));
+                    obj.insert("ssim_v".into(), serde_json::json!(ssim_vals.v));
+                }
+            }
+        }
+        eprintln!("[vcompare] Merged SSIM data: {} frames", ssim_data.len());
+    }
 
     // Cleanup temp
-    let _ = std::fs::remove_file(&stats_path);
+    let _ = std::fs::remove_file(&psnr_stats_path);
+    if with_ssim {
+        let _ = std::fs::remove_file(&ssim_stats_path);
+    }
     let _ = std::fs::remove_dir(&stats_dir);
 
     Ok(frames)
@@ -355,14 +407,19 @@ pub fn run_vmaf_analysis(
         }
         config.log_subsample = 1;
 
-        let ref_scale = "format=yuv420p".to_string();
-        let dist_scale = if config.scale_w > 0 {
-            format!(
+        let (ref_scale, dist_scale) = if config.scale_w > 0 {
+            let scaled = format!(
                 "w={}:h={}:format=yuv420p",
                 config.scale_w, config.scale_h
-            )
+            );
+            let plain = "format=yuv420p".to_string();
+            if config.scale_ref {
+                (scaled, plain)
+            } else {
+                (plain, scaled)
+            }
         } else {
-            "format=yuv420p".to_string()
+            ("format=yuv420p".to_string(), "format=yuv420p".to_string())
         };
 
         let all_filters = format!(
@@ -407,10 +464,15 @@ pub fn run_vmaf_analysis(
             dist_chain.push(format!("format={fmt}"));
         }
         if config.scale_w > 0 {
-            dist_chain.push(format!(
+            let scale = format!(
                 "scale={}:{}:flags=lanczos",
                 config.scale_w, config.scale_h
-            ));
+            );
+            if config.scale_ref {
+                ref_chain.push(scale);
+            } else {
+                dist_chain.push(scale);
+            }
         }
 
         let mut filters_before: Vec<String> = Vec::new();
@@ -715,6 +777,58 @@ fn parse_vmaf_log(
     Ok(frames)
 }
 
+// ─── SSIM stats parsing ────────────────────────────────────────────────────
+
+/// Parsed SSIM values for a single frame.
+struct SsimFrame {
+    y: f64,
+    u: f64,
+    v: f64,
+    all: f64,
+}
+
+/// Parse ssim filter stats_file output into per-frame SSIM values.
+///
+/// Format per line: `n:1 Y:0.999900 U:0.999800 V:0.999700 All:0.999800 (39.99)`
+fn parse_ssim_stats(stats_path: &str) -> Result<Vec<SsimFrame>, String> {
+    let content = std::fs::read_to_string(stats_path)
+        .map_err(|e| format!("Failed to read ssim stats: {e}"))?;
+
+    let kv_re = Regex::new(r"(\w+):([\d.inf]+)").unwrap();
+    let mut frames = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let pairs: std::collections::HashMap<&str, &str> = kv_re
+            .captures_iter(line)
+            .map(|c| (c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str()))
+            .collect();
+
+        // Skip if no frame number
+        if pairs.get("n").and_then(|s| s.parse::<i64>().ok()).is_none() {
+            continue;
+        }
+
+        let y = parse_float_or_zero(pairs.get("Y").copied());
+        let u = parse_float_or_zero(pairs.get("U").copied());
+        let v = parse_float_or_zero(pairs.get("V").copied());
+        let all = parse_float_or_zero(pairs.get("All").copied());
+
+        frames.push(SsimFrame {
+            y: round6(y),
+            u: round6(u),
+            v: round6(v),
+            all: round6(all),
+        });
+    }
+
+    Ok(frames)
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn parse_float_or_zero(s: Option<&str>) -> f64 {
@@ -734,4 +848,8 @@ fn round3(v: f64) -> f64 {
 
 fn round4(v: f64) -> f64 {
     (v * 10000.0).round() / 10000.0
+}
+
+fn round6(v: f64) -> f64 {
+    (v * 1000000.0).round() / 1000000.0
 }

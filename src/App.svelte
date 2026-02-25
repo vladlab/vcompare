@@ -28,6 +28,9 @@
     getMetricSeries,
     getFrames,
     exportCsv,
+    getRecents,
+    addRecent,
+    type RecentEntry,
     mpvLaunch,
     mpvSeek,
     mpvStep,
@@ -67,11 +70,16 @@
   // Cached analysis detection
   let cacheInfo: CacheCheck | null = $state(null);
 
+  // Recent analyses
+  let showRecents: boolean = $state(false);
+  let recentEntries: RecentEntry[] = $state([]);
+
   // Analysis options
   let analysisMode: "diff" | "vmaf" = $state("diff");
   let syncMode: string = $state("start");
   let hwaccelMode: string = $state("auto");
   let wantPsnr: boolean = $state(false);
+  let wantSsim: boolean = $state(false);
   let subsample: number = $state(1);
 
   // Analysis results
@@ -175,6 +183,12 @@
           mpvFrame = -1;
           diffviewRunning = false;
           diffviewFrame = -1;
+          showRecents = false;
+        } else if (id === "open-recent") {
+          getRecents().then((entries) => {
+            recentEntries = entries;
+            showRecents = true;
+          }).catch(() => {});
         }
       })
     );
@@ -300,6 +314,18 @@
     }
 
     state = "ready";
+
+    // Record in recents
+    if (cacheInfo?.path && refPath && distPath) {
+      addRecent({
+        ref_path: refPath,
+        dist_path: distPath,
+        cache_path: cacheInfo.path,
+        mode: result.mode,
+        frame_count: result.frame_count,
+        timestamp: Math.floor(Date.now() / 1000),
+      }).catch(() => {});
+    }
   }
 
   async function startAnalysis() {
@@ -316,6 +342,7 @@
         hwaccel: hwaccelMode,
         sync: syncMode,
         psnr: wantPsnr,
+        ssim: wantSsim,
         subsample,
         log_path: cacheInfo?.path,
         force: true,
@@ -336,6 +363,22 @@
     } catch (e) {
       state = "error";
       errorMessage = `Failed to load cached analysis: ${e}`;
+    }
+  }
+
+  async function loadRecentEntry(entry: RecentEntry) {
+    showRecents = false;
+    refPath = entry.ref_path;
+    distPath = entry.dist_path;
+    // Set cacheInfo so finishAnalysis can record it back to recents
+    cacheInfo = { exists: true, path: entry.cache_path, frame_count: entry.frame_count, mode: entry.mode };
+    state = "analyzing";
+    try {
+      const result = await loadSavedAnalysis(entry.cache_path);
+      await finishAnalysis(result);
+    } catch (e) {
+      state = "error";
+      errorMessage = `Failed to load recent analysis: ${e}`;
     }
   }
 
@@ -374,11 +417,14 @@
         break;
       case "t":
         // Recalculate threshold from active metric stats
+        // diff_* metrics: higher = worse (mean + σ)
+        // ssim/vmaf/psnr: lower = worse (mean - σ)
         if (summary) {
           const statsKey = `${activeMetric}_stats` as keyof AnalysisSummary;
           const stats = summary[statsKey] as any;
           if (stats) {
-            if (summary.mode === "diff") {
+            const higherIsWorse = activeMetric.startsWith("diff");
+            if (higherIsWorse) {
               threshold = Math.round((stats.mean + (stats.stddev ?? 0)) * 100) / 100;
             } else {
               threshold = Math.round((stats.mean - (stats.stddev ?? 0)) * 100) / 100;
@@ -432,6 +478,11 @@
       case "e":
         handleExport();
         break;
+      case "f": {
+        const idx = SMOOTH_OPTIONS.indexOf(smoothWindow);
+        smoothWindow = SMOOTH_OPTIONS[(idx + 1) % SMOOTH_OPTIONS.length];
+        break;
+      }
       case "=":
       case "+":
         chartComponent?.zoomIn();
@@ -464,6 +515,34 @@
 
   let activeSeries = $derived(metricSeries[activeMetric] ?? null);
 
+  // ── Temporal smoothing (running median) ──
+
+  let smoothWindow: number = $state(0); // 0 = off, otherwise odd window size
+  const SMOOTH_OPTIONS = [0, 5, 11, 21, 51]; // off, light, medium, heavy, very heavy
+
+  function runningMedian(values: number[], window: number): number[] {
+    if (window <= 1) return values;
+    const half = (window - 1) / 2;
+    const result = new Array(values.length);
+    for (let i = 0; i < values.length; i++) {
+      const lo = Math.max(0, i - half);
+      const hi = Math.min(values.length - 1, i + half);
+      const slice = values.slice(lo, hi + 1);
+      slice.sort((a, b) => a - b);
+      result[i] = slice[Math.floor(slice.length / 2)];
+    }
+    return result;
+  }
+
+  let displaySeries = $derived.by(() => {
+    if (!activeSeries) return null;
+    if (smoothWindow <= 1) return activeSeries;
+    return {
+      frames: activeSeries.frames,
+      values: runningMedian(activeSeries.values, smoothWindow),
+    };
+  });
+
   let activeStats = $derived(() => {
     if (!summary) return null;
     const key = `${activeMetric}_stats` as keyof AnalysisSummary;
@@ -475,7 +554,8 @@
     const fps = p.fps_den === 1001
       ? `${(p.fps_num / p.fps_den).toFixed(2)}`
       : `${p.fps_num / p.fps_den}`;
-    return `${p.width}×${p.height} ${p.codec} ${p.pix_fmt} ${fps}fps`;
+    const tc = p.timecode ? ` TC ${p.timecode}` : "";
+    return `${p.width}×${p.height} ${p.codec} ${p.pix_fmt} ${fps}fps${tc}`;
   }
 
   function fmtMetricLabel(m: string): string {
@@ -483,6 +563,10 @@
       diff_y: "Diff Y",
       diff_u: "Diff U",
       diff_v: "Diff V",
+      ssim: "SSIM",
+      ssim_y: "SSIM Y",
+      ssim_u: "SSIM U",
+      ssim_v: "SSIM V",
       vmaf: "VMAF",
       psnr: "PSNR",
     };
@@ -505,8 +589,8 @@
         {/if}
         {#if activeStats()}
           · {fmtMetricLabel(activeMetric)}
-          μ={activeStats().mean.toFixed(2)}
-          {summary.mode === "diff" ? "max" : "min"}={summary.mode === "diff" ? activeStats().max.toFixed(2) : activeStats().min.toFixed(2)}
+          μ={activeStats().mean.toFixed(activeMetric.startsWith("ssim") ? 4 : 2)}
+          {activeMetric.startsWith("diff") ? "max" : "min"}={activeMetric.startsWith("diff") ? activeStats().max.toFixed(2) : activeStats().min.toFixed(activeMetric.startsWith("ssim") ? 4 : 2)}
         {/if}
       </span>
       {#if summary.mode === "diff" && summary.diff_distribution}
@@ -539,7 +623,7 @@
 
         <div class="file-row">
           <label>Reference</label>
-          <button onclick={pickReference} class="file-btn">
+          <button onclick={pickReference} class="file-btn" title={refPath || ""}>
             {refPath ? refPath.split("/").pop() : "Choose file…"}
           </button>
           {#if refProbe}
@@ -549,7 +633,7 @@
 
         <div class="file-row">
           <label>Distorted</label>
-          <button onclick={pickDistorted} class="file-btn">
+          <button onclick={pickDistorted} class="file-btn" title={distPath || ""}>
             {distPath ? distPath.split("/").pop() : "Choose file…"}
           </button>
           {#if distProbe}
@@ -601,6 +685,11 @@
                   <option value={8}>8×</option>
                 </select>
               </label>
+            {:else}
+              <label class="checkbox-label">
+                <input type="checkbox" bind:checked={wantSsim} />
+                SSIM
+              </label>
             {/if}
           </div>
 
@@ -611,7 +700,7 @@
           {#if cacheInfo?.exists}
             <div class="cache-row">
               <span class="cache-info mono">
-                Cached ({cacheInfo.mode ?? "vmaf"}): {cacheInfo.frame_count?.toLocaleString()} frames
+                Cached ({cacheInfo.mode ?? "vmaf"}{cacheInfo.with_ssim ? "+ssim" : ""}, {cacheInfo.sync_mode ?? "start"}): {cacheInfo.frame_count?.toLocaleString()} frames
                 ({cacheInfo.path.split("/").pop()})
               </span>
               <button class="primary" onclick={loadCached}>
@@ -654,7 +743,7 @@
         <div class="chart-area">
           <MetricChart
             bind:this={chartComponent}
-            series={activeSeries}
+            series={displaySeries}
             metric={activeMetric}
             {threshold}
             {cursorFrame}
@@ -687,6 +776,7 @@
       <span class="footer-shortcuts">
         <kbd>m</kbd> metric
         <kbd>t</kbd> threshold
+        <kbd>f</kbd> smooth{smoothWindow > 0 ? ` (${smoothWindow})` : ""}
         <kbd>e</kbd> export
         <kbd>+</kbd><kbd>-</kbd> zoom
         <kbd>0</kbd> reset
@@ -700,6 +790,37 @@
     </footer>
   {/if}
 </div>
+
+<!-- ── Recents overlay ── -->
+{#if showRecents}
+  <div class="recents-overlay" onclick={() => (showRecents = false)}>
+    <div class="recents-panel" onclick={(e) => e.stopPropagation()}>
+      <div class="recents-header">
+        <h3>Recent Analyses</h3>
+        <button class="recents-close" onclick={() => (showRecents = false)}>✕</button>
+      </div>
+      {#if recentEntries.length === 0}
+        <p class="recents-empty">No recent analyses</p>
+      {:else}
+        <div class="recents-list">
+          {#each recentEntries as entry}
+            <button
+              class="recents-entry"
+              onclick={() => loadRecentEntry(entry)}
+            >
+              <span class="recents-files mono">
+                {entry.ref_path.split("/").pop()} vs {entry.dist_path.split("/").pop()}
+              </span>
+              <span class="recents-meta">
+                {entry.mode} · {entry.frame_count.toLocaleString()} frames · {new Date(entry.timestamp * 1000).toLocaleDateString()}
+              </span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
 
 <style>
   .app {
@@ -774,6 +895,7 @@
   }
   .file-btn {
     min-width: 200px;
+    max-width: 300px;
     text-align: left;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -928,5 +1050,81 @@
     gap: var(--gap-sm);
     align-items: center;
     flex-wrap: wrap;
+  }
+  .recents-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .recents-panel {
+    background: var(--bg-surface, #1e1e1e);
+    border: 1px solid var(--border, rgba(255,255,255,0.1));
+    border-radius: 8px;
+    width: min(600px, 90vw);
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .recents-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border, rgba(255,255,255,0.1));
+  }
+  .recents-header h3 {
+    margin: 0;
+    font-size: 14px;
+  }
+  .recents-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 4px 8px;
+  }
+  .recents-close:hover {
+    color: var(--text);
+  }
+  .recents-empty {
+    padding: 24px;
+    text-align: center;
+    color: var(--text-muted);
+  }
+  .recents-list {
+    overflow-y: auto;
+    padding: 4px;
+  }
+  .recents-entry {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    padding: 10px 12px;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .recents-entry:hover {
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .recents-files {
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .recents-meta {
+    font-size: 11px;
+    color: var(--text-muted);
   }
 </style>

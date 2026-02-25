@@ -52,6 +52,10 @@
     diff_y: { color: "#e8b830", label: "RMS Diff (Y)" },
     diff_u: { color: "#6bc4e8", label: "RMS Diff (U)" },
     diff_v: { color: "#e86b9e", label: "RMS Diff (V)" },
+    ssim:   { color: "#4ec9b0", label: "SSIM (All)" },
+    ssim_y: { color: "#7be870", label: "SSIM (Y)" },
+    ssim_u: { color: "#70b8e8", label: "SSIM (U)" },
+    ssim_v: { color: "#d870e8", label: "SSIM (V)" },
   };
 
   function getColor(): string {
@@ -208,6 +212,11 @@
       if (metric.startsWith("diff")) {
         const pad = max * 0.05 || 0.5;
         return [0, max + pad];
+      }
+      if (metric.startsWith("ssim")) {
+        // SSIM: 0-1 range, zoom into the data range for detail
+        const pad = (max - min) * 0.1 || 0.001;
+        return [Math.max(0, min - pad), Math.min(1, max + pad)];
       }
       const pad = (max - min) * 0.05 || 1;
       return [min - pad, max + pad];
@@ -589,7 +598,7 @@
                 ctx.fillStyle = THRESHOLD_COLOR;
                 ctx.font = "10px 'JetBrains Mono', monospace";
                 ctx.textAlign = "left";
-                ctx.fillText(`${threshold.toFixed(1)}`, u.bbox.left + 4, y - 4);
+                ctx.fillText(`${threshold.toFixed(metric.startsWith("ssim") ? 4 : 1)}`, u.bbox.left + 4, y - 4);
                 ctx.restore();
               },
             ],

@@ -71,6 +71,10 @@ export interface AnalysisSummary {
   diff_v_stats?: MetricStats;
   vmaf_stats?: MetricStats;
   psnr_stats?: MetricStats;
+  ssim_stats?: MetricStats;
+  ssim_y_stats?: MetricStats;
+  ssim_u_stats?: MetricStats;
+  ssim_v_stats?: MetricStats;
   diff_distribution?: DiffDistribution;
   timeline?: TimelineInfo;
 }
@@ -83,6 +87,11 @@ export interface FrameData {
   diff_y?: number | null;
   diff_u?: number | null;
   diff_v?: number | null;
+  // ssim (addon to diff mode)
+  ssim?: number | null;
+  ssim_y?: number | null;
+  ssim_u?: number | null;
+  ssim_v?: number | null;
   // vmaf mode
   vmaf?: number | null;
   psnr?: number | null;
@@ -131,6 +140,7 @@ export interface AnalyzeParams {
   offset?: number;
   subsample?: number;
   psnr?: boolean;
+  ssim?: boolean;
   log_path?: string;
   force?: boolean;
 }
@@ -151,6 +161,7 @@ export interface CacheCheck {
   frame_count: number | null;
   mode?: string;
   sync_mode?: string;
+  with_ssim?: boolean;
 }
 
 // ─── Commands (frontend → Rust → Python) ────────────────────────────────────
@@ -231,6 +242,29 @@ export async function diffviewKill(): Promise<{ status: string }> {
 
 export async function exportCsv(path?: string): Promise<{ path: string; rows: number }> {
   return invoke("export_csv", { path: path ?? null });
+}
+
+// ─── Recents ──────────────────────────────────────────────────────────────
+
+export interface RecentEntry {
+  ref_path: string;
+  dist_path: string;
+  cache_path: string;
+  mode: string;
+  frame_count: number;
+  timestamp: number;
+}
+
+export async function getRecents(): Promise<RecentEntry[]> {
+  return invoke("get_recents");
+}
+
+export async function addRecent(entry: RecentEntry): Promise<void> {
+  return invoke("add_recent", { entry });
+}
+
+export async function clearRecents(): Promise<void> {
+  return invoke("clear_recents");
 }
 
 // ─── Event listeners (Python → Rust → Frontend) ────────────────────────────

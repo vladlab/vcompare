@@ -18,6 +18,11 @@ pub struct MpvContext {
     pub tc_format: TimecodeFormat,
     pub ref_file_start_tc: i64,
     pub timeline: Option<TimelineInfo>,
+    /// If dist needs scaling to match ref. 0 = no scaling needed.
+    pub scale_w: u32,
+    pub scale_h: u32,
+    /// true = scale ref, false = scale dist
+    pub scale_ref: bool,
 }
 
 /// Mutable inner state, protected by Mutex.
@@ -48,6 +53,11 @@ struct AnalysisMeta {
     bit_depth: Option<u32>,
     tc_format: Option<TimecodeFormat>,
     timeline: Option<TimelineInfo>,
+    /// If dist was scaled to match ref, these hold target dimensions. 0 = no scaling.
+    scale_w: u32,
+    scale_h: u32,
+    /// true = ref was scaled, false = dist was scaled
+    scale_ref: bool,
 }
 
 /// Thread-safe engine state, managed as Tauri state.
@@ -79,11 +89,25 @@ impl EngineState {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        state.metrics_available = vec![
+
+        let mut metrics = vec![
             "diff_y".into(),
             "diff_u".into(),
             "diff_v".into(),
         ];
+
+        // Check if SSIM data is present in frames
+        let has_ssim = state.frames.iter().any(|f| {
+            f.get("ssim").and_then(|v| v.as_f64()).is_some()
+        });
+        if has_ssim {
+            metrics.push("ssim".into());
+            metrics.push("ssim_y".into());
+            metrics.push("ssim_u".into());
+            metrics.push("ssim_v".into());
+        }
+
+        state.metrics_available = metrics;
         state.analysis_mode = Some("diff".into());
         state.meta = AnalysisMeta {
             ref_path: str_field(result, "ref_path"),
@@ -102,6 +126,9 @@ impl EngineState {
             timeline: result
                 .get("timeline")
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            scale_w: result.get("scale_w").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            scale_h: result.get("scale_h").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            scale_ref: result.get("scale_ref").and_then(|v| v.as_bool()).unwrap_or(false),
         };
         state.mpv_context = build_mpv_context(&state.meta);
     }
@@ -117,6 +144,9 @@ impl EngineState {
         sync_mode: &str,
         tc_format: Option<TimecodeFormat>,
         timeline: Option<TimelineInfo>,
+        scale_w: u32,
+        scale_h: u32,
+        scale_ref: bool,
     ) {
         let mut state = self.inner.lock().unwrap();
 
@@ -147,6 +177,9 @@ impl EngineState {
             bit_depth: None,
             tc_format: tc_format.clone(),
             timeline,
+            scale_w,
+            scale_h,
+            scale_ref,
         };
         state.mpv_context = build_mpv_context(&state.meta);
     }
@@ -493,5 +526,8 @@ fn build_mpv_context(meta: &AnalysisMeta) -> Option<MpvContext> {
         tc_format: tc,
         ref_file_start_tc: meta.ref_file_start_tc,
         timeline: meta.timeline.clone(),
+        scale_w: meta.scale_w,
+        scale_h: meta.scale_h,
+        scale_ref: meta.scale_ref,
     })
 }

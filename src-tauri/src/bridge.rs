@@ -38,6 +38,8 @@ pub struct AnalyzeParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub psnr: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssim: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
@@ -200,6 +202,7 @@ pub async fn load_saved_analysis(
             &loaded.sync_mode,
             loaded.tc_format,
             None, // timeline not stored in vmaf cache
+            0, 0, false, // scale not stored in vmaf cache
         );
     }
 
@@ -249,6 +252,7 @@ pub async fn analyze(
                         &loaded.sync_mode,
                         loaded.tc_format,
                         None, // timeline not in vmaf cache
+                        0, 0, false, // scale not in vmaf cache
                     );
                     engine_state.set_save_path(save_path);
                     return engine_state.build_summary();
@@ -266,9 +270,10 @@ pub async fn analyze(
         )
         .await
     } else {
+        let with_ssim = params.ssim.unwrap_or(false);
         _run_diff_analysis(
             app, &ref_path, &dist_path, &sync_mode, offset,
-            save_path, &engine_state, process_handle,
+            with_ssim, save_path, &engine_state, process_handle,
         )
         .await
     }
@@ -280,6 +285,7 @@ async fn _run_diff_analysis(
     dist_path: &str,
     sync_mode: &str,
     offset: i64,
+    with_ssim: bool,
     save_path: Option<String>,
     engine_state: &State<'_, EngineState>,
     process_handle: ProcessHandle,
@@ -290,7 +296,11 @@ async fn _run_diff_analysis(
     let app_clone = app.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut diagnostics = vec!["mode: pixel difference (psnr filter)".into()];
+        let mut diagnostics = if with_ssim {
+            vec!["mode: pixel difference + SSIM (psnr+ssim filters)".into()]
+        } else {
+            vec!["mode: pixel difference (psnr filter)".into()]
+        };
 
         let (config, tc_fmt, timeline) = engine::analysis::prepare_comparison(
             &ref_path, &dist_path, &sync_mode,
@@ -330,7 +340,7 @@ async fn _run_diff_analysis(
 
         let frames = engine::analysis::run_diff_analysis(
             &ref_path, &dist_path, &config, &tc_fmt,
-            &target_fmt, bit_depth, Some(progress), process_handle,
+            &target_fmt, bit_depth, with_ssim, Some(progress), process_handle,
         )?;
 
         eprintln!("[vcompare] Parsed {} diff frames", frames.len());
@@ -344,6 +354,10 @@ async fn _run_diff_analysis(
             "ref_file_start_tc": config.ref_file_start_tc,
             "sync_mode": sync_mode,
             "bit_depth": bit_depth,
+            "with_ssim": with_ssim,
+            "scale_w": config.scale_w,
+            "scale_h": config.scale_h,
+            "scale_ref": config.scale_ref,
             "tc_format": {
                 "fps_num": tc_fmt.fps_num,
                 "fps_den": tc_fmt.fps_den,
@@ -429,12 +443,13 @@ async fn _run_vmaf_analysis(
             frames, ref_path, dist_path,
             config.ref_start_frame, config.ref_file_start_tc,
             sync_mode, tc_fmt, save_path, timeline,
+            config.scale_w, config.scale_h, config.scale_ref,
         ))
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))??;
 
-    let (frames, ref_path, dist_path, ref_start_frame, ref_file_start_tc, sync_mode, tc_fmt, save_path, timeline) = result;
+    let (frames, ref_path, dist_path, ref_start_frame, ref_file_start_tc, sync_mode, tc_fmt, save_path, timeline, scale_w, scale_h, scale_ref) = result;
 
     if let Some(ref sp) = save_path {
         cache::save_vmaf_analysis(
@@ -449,6 +464,7 @@ async fn _run_vmaf_analysis(
         frames, &ref_path, &dist_path,
         ref_start_frame, ref_file_start_tc,
         &sync_mode, Some(tc_fmt), Some(timeline),
+        scale_w, scale_h, scale_ref,
     );
     engine_state.set_save_path(save_path);
     engine_state.build_summary()
@@ -498,6 +514,9 @@ pub async fn mpv_launch(
         ctx.ref_file_start_tc,
         ctx.timeline,
         ViewMode::SideBySide,
+        ctx.scale_w,
+        ctx.scale_h,
+        ctx.scale_ref,
     ));
 
     if let Some(err) = mpv.launch() {
@@ -604,6 +623,9 @@ pub async fn diffview_launch(
         ctx.ref_file_start_tc,
         ctx.timeline,
         ViewMode::Difference,
+        ctx.scale_w,
+        ctx.scale_h,
+        ctx.scale_ref,
     ));
 
     if let Some(err) = mpv.launch() {
