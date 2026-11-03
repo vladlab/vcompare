@@ -441,8 +441,10 @@ async fn _run_levels_analysis(
     let result = tokio::task::spawn_blocking(move || {
         let mut diagnostics = vec!["mode: levels (signalstats)".into()];
 
-        let (tc_fmt, start_frame, total_frames, bit_depth) =
-            engine::analysis::prepare_single_file(&file_path, &mut diagnostics)?;
+        let info = engine::analysis::prepare_single_file(&file_path, &mut diagnostics)?;
+        let engine::analysis::SingleFileInfo {
+            ref tc_fmt, start_frame, total_frames, bit_depth, ..
+        } = info;
 
         let _ = app_clone.emit("rpc:diagnostics", json!({"lines": diagnostics}));
 
@@ -453,7 +455,7 @@ async fn _run_levels_analysis(
 
         let frames = engine::analysis::run_levels_analysis(
             &file_path,
-            &tc_fmt,
+            tc_fmt,
             start_frame,
             total_frames,
             Some(progress),

@@ -586,22 +586,44 @@ pub fn run_levels_analysis(
     Ok(frames)
 }
 
+/// What a single-file (levels) analysis needs to know about its input.
+#[derive(Debug, Clone)]
+pub struct SingleFileInfo {
+    pub tc_fmt: TimecodeFormat,
+    /// First frame in TC space (display frame of the file's first frame).
+    pub start_frame: i64,
+    /// Frame count from the container, if it reports one.
+    pub total_frames: Option<u64>,
+    /// Bit depth of the source pixel format.
+    pub bit_depth: u32,
+    pub pix_fmt: String,
+    pub width: u32,
+    pub height: u32,
+    /// ffprobe `codec_name` of the video stream, e.g. "prores", "hevc".
+    pub codec_name: String,
+}
+
 /// Prepare a single file for levels analysis.
 ///
-/// Probes the file and returns timecode format, start frame, total frames,
-/// and the bit depth of the file's pixel format (which is what signalstats
-/// reports its code values in).
+/// Probes the file and returns everything the levels pass needs: timecode
+/// format, start frame, frame count, and the source pixel format / geometry
+/// / codec (which decide the raw pipe format and whether to hw-decode).
 pub fn prepare_single_file(
     file_path: &str,
     diagnostics: &mut Vec<String>,
-) -> Result<(TimecodeFormat, i64, Option<u64>, u32), String> {
+) -> Result<SingleFileInfo, String> {
     let probe = ffprobe_json(file_path)?;
     let tc_fmt = detect_timecode_format(&probe)?;
     let info = get_video_info(&probe, &tc_fmt)?;
+    let codec_name = crate::engine::timecode::find_video_stream(&probe)
+        .and_then(|v| v.get("codec_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     diagnostics.push(format!(
-        "file: {}x{} {} {}/{}",
-        info.width, info.height, info.pix_fmt, info.fps_num, info.fps_den
+        "file: {}x{} {} {} {}/{}",
+        info.width, info.height, codec_name, info.pix_fmt, info.fps_num, info.fps_den
     ));
     if let Some(ref tc) = info.start_tc {
         diagnostics.push(format!("timecode: {tc}"));
@@ -615,7 +637,16 @@ pub fn prepare_single_file(
     let bit_depth = parse_pix_fmt(&info.pix_fmt).bit_depth;
     diagnostics.push(format!("bit depth: {bit_depth}"));
 
-    Ok((tc_fmt, info.start_tc_frames, total, bit_depth))
+    Ok(SingleFileInfo {
+        tc_fmt,
+        start_frame: info.start_tc_frames,
+        total_frames: total,
+        bit_depth,
+        pix_fmt: info.pix_fmt,
+        width: info.width,
+        height: info.height,
+        codec_name,
+    })
 }
 
 /// Parse signalstats metadata output.
