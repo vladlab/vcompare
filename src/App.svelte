@@ -507,6 +507,9 @@
 
   // ── Keyboard shortcuts ──
 
+  /** Levels metrics where a bigger value is the problem (for the `t` key). */
+  const HIGHER_IS_WORSE = new Set(["y_dif", "u_dif", "v_dif", "y_oor_lo", "y_oor_hi", "c_oor"]);
+
   /** True when the keystroke belongs to a text field, not to our shortcuts. */
   function isTextEntry(target: EventTarget | null): boolean {
     const el = target as HTMLElement | null;
@@ -551,7 +554,8 @@
           const statsKey = `${activeMetric}_stats` as keyof AnalysisSummary;
           const stats = summary[statsKey] as any;
           if (stats) {
-            const higherIsWorse = activeMetric.startsWith("diff");
+            const higherIsWorse =
+              activeMetric.startsWith("diff") || HIGHER_IS_WORSE.has(activeMetric);
             if (higherIsWorse) {
               threshold = Math.round((stats.mean + (stats.stddev ?? 0)) * 100) / 100;
             } else {
