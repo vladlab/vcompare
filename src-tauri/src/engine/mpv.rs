@@ -24,6 +24,18 @@ pub enum ViewMode {
     SideBySide,
     /// Pixel difference: `[ref][dist]blend=all_mode=difference[vo]`
     Difference,
+    /// Just the reference file, no second input (levels mode).
+    Single,
+}
+
+impl ViewMode {
+    fn suffix(self) -> &'static str {
+        match self {
+            ViewMode::SideBySide => "sbs",
+            ViewMode::Difference => "diff",
+            ViewMode::Single => "single",
+        }
+    }
 }
 
 /// mpv process controller with IPC.
@@ -61,10 +73,7 @@ impl MpvController {
         scale_ref: bool,
     ) -> Self {
         let pid = std::process::id();
-        let suffix = match view_mode {
-            ViewMode::SideBySide => "sbs",
-            ViewMode::Difference => "diff",
-        };
+        let suffix = view_mode.suffix();
         let sock_path = std::env::temp_dir().join(format!("vcompare_mpv_{pid}_{suffix}.sock"));
         Self {
             ref_path,
@@ -126,26 +135,36 @@ impl MpvController {
 
         let sock_str = self.sock_path.to_string_lossy().to_string();
 
-        // Determine alignment: which file is primary (at time 0) and which
-        // needs an EDL wrapper to skip to the overlap start.
-        let (primary, external, lavfi) = self.build_inputs();
+        let mut cmd = Command::new("mpv");
 
-        eprintln!(
-            "[vcompare] mpv: primary={}, external={}, lavfi={}",
-            Path::new(&primary).file_name().unwrap_or_default().to_string_lossy(),
-            Path::new(&external).file_name().unwrap_or_default().to_string_lossy(),
-            lavfi
-        );
+        let title = if self.view_mode == ViewMode::Single {
+            eprintln!("[vcompare] mpv: single file {ref_name}");
+            cmd.arg(&self.ref_path);
+            format!("--title=vcompare: {ref_name}")
+        } else {
+            // Determine alignment: which file is primary (at time 0) and which
+            // needs an EDL wrapper to skip to the overlap start.
+            let (primary, external, lavfi) = self.build_inputs();
 
-        let mode_label = match self.view_mode {
-            ViewMode::SideBySide => "SBS",
-            ViewMode::Difference => "DIFF",
+            eprintln!(
+                "[vcompare] mpv: primary={}, external={}, lavfi={}",
+                Path::new(&primary).file_name().unwrap_or_default().to_string_lossy(),
+                Path::new(&external).file_name().unwrap_or_default().to_string_lossy(),
+                lavfi
+            );
+
+            let mode_label = match self.view_mode {
+                ViewMode::SideBySide => "SBS",
+                ViewMode::Difference => "DIFF",
+                ViewMode::Single => unreachable!(),
+            };
+            cmd.arg(&primary)
+                .arg(format!("--external-file={}", external))
+                .arg(format!("--lavfi-complex={lavfi}"));
+            format!("--title=vcompare [{mode_label}]: {ref_name} | {dist_name}")
         };
 
-        let cmd_result = Command::new("mpv")
-            .arg(&primary)
-            .arg(format!("--external-file={}", external))
-            .arg(format!("--lavfi-complex={lavfi}"))
+        let cmd_result = cmd
             .arg(format!("--input-ipc-server={sock_str}"))
             .arg("--pause")
             .arg("--hr-seek=yes")
@@ -154,7 +173,7 @@ impl MpvController {
             .arg("--autofit=25%x25%")
             .arg("--osd-level=2")
             .arg("--osd-fractions")
-            .arg(format!("--title=vcompare [{mode_label}]: {ref_name} | {dist_name}"))
+            .arg(title)
             .arg("--no-terminal")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -266,6 +285,7 @@ impl MpvController {
             ViewMode::Difference => format!(
                 "{ref_expr}{dist_expr}{ref_out}format=gbrp[_r];{dist_out}format=gbrp[_d];[_r][_d]blend=all_mode=difference[vo]"
             ),
+            ViewMode::Single => String::new(),
         }
     }
 
@@ -277,10 +297,7 @@ impl MpvController {
     /// /path/to/file.mov,56.48
     /// ```
     fn write_edl(&self, file_path: &str, start_sec: f64) -> PathBuf {
-        let suffix = match self.view_mode {
-            ViewMode::SideBySide => "sbs",
-            ViewMode::Difference => "diff",
-        };
+        let suffix = self.view_mode.suffix();
         let edl_path = std::env::temp_dir().join(format!(
             "vcompare_mpv_{}_{}.edl",
             std::process::id(), suffix
