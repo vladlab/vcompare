@@ -602,6 +602,52 @@ impl EngineState {
         }))
     }
 
+    /// Export the current events as a DaVinci Resolve marker EDL.
+    pub fn export_events_edl(&self, path: Option<&str>) -> Result<Value, String> {
+        let state = self.inner.lock().unwrap();
+        if state.frames.is_empty() {
+            return Err("No analysis loaded".into());
+        }
+        let tc_fmt = state
+            .meta
+            .tc_format
+            .clone()
+            .ok_or("This analysis has no timecode format")?;
+
+        let stem = PathBuf::from(&state.meta.ref_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ref".into());
+        let output_path = match path {
+            Some(p) => p.to_string(),
+            None => {
+                let dir = PathBuf::from(&state.meta.ref_path)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+                dir.join(format!("{stem}_flash_markers.edl"))
+                    .to_string_lossy()
+                    .to_string()
+            }
+        };
+
+        let edl = events::events_to_resolve_edl(&state.events, &tc_fmt, &stem);
+        std::fs::write(&output_path, edl.as_bytes())
+            .map_err(|e| format!("Failed to write EDL: {e}"))?;
+
+        Ok(serde_json::json!({
+            "path": output_path,
+            "rows": state.events.len(),
+        }))
+    }
+
+    /// Timecode string for a display frame, in the analysis's own format.
+    pub fn frame_to_tc(&self, frame: i64) -> Result<String, String> {
+        let state = self.inner.lock().unwrap();
+        let tc = state.meta.tc_format.as_ref().ok_or("No timecode format")?;
+        Ok(tc.frame_to_tc(frame))
+    }
+
     /// Get the mpv context (paths + TC info) from the current analysis.
     pub fn mpv_context(&self) -> Result<MpvContext, String> {
         self.inner

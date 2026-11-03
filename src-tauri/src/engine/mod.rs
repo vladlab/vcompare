@@ -8,6 +8,7 @@ pub mod pixfmt;
 pub mod process;
 pub mod probe;
 pub mod rawstats;
+pub mod resolve;
 pub mod state;
 pub mod timecode;
 pub mod types;

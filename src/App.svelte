@@ -38,6 +38,7 @@
     exportCsv,
     detectEvents,
     exportEventsCsv,
+    exportEventsEdl,
     getRecents,
     addRecent,
     type RecentEntry,
@@ -51,6 +52,11 @@
     diffviewStep,
     diffviewPause,
     diffviewKill,
+    resolveConnect,
+    resolveSeek,
+    resolveDisconnect,
+    onResolveStatus,
+    type ResolveStatus,
     onProgress,
     onDiagnostics,
     onMpvPosition,
@@ -120,6 +126,45 @@
   let chartComponent: MetricChart | undefined = $state();
   let mpvFrame: number = $state(-1);
 
+  // DaVinci Resolve playhead sync
+  let resolveOn: boolean = $state(false);
+  let resolveStatus: ResolveStatus = $state({ state: "disconnected" });
+  let resolveBusy: boolean = $state(false);
+
+  async function toggleResolveSync() {
+    if (resolveBusy) return;
+    if (resolveOn) {
+      resolveOn = false;
+      resolveDisconnect().catch(() => {});
+      resolveStatus = { state: "disconnected" };
+      return;
+    }
+    resolveBusy = true;
+    resolveStatus = { state: "connecting" };
+    try {
+      resolveStatus = await resolveConnect();
+      resolveOn = resolveStatus.state === "connected";
+      if (resolveOn && cursorFrame >= 0) resolveSeek(cursorFrame).catch(() => {});
+    } catch (e) {
+      resolveOn = false;
+      resolveStatus = { state: "failed", message: String(e) };
+      showStatus(`Resolve: ${e}`, 12000);
+    } finally {
+      resolveBusy = false;
+    }
+  }
+
+  function resolveStatusText(): string {
+    const s = resolveStatus;
+    switch (s.state) {
+      case "connecting": return "connecting…";
+      case "connected": return s.target;
+      case "seek_failed": return `⚠ ${s.message}`;
+      case "failed": return `✕ ${s.message}`;
+      default: return "";
+    }
+  }
+
   // Difference view state
   let diffviewRunning: boolean = $state(false);
   let diffviewFrame: number = $state(-1);
@@ -129,6 +174,17 @@
   let detectResult: DetectResult | null = $state(null);
   let detectError: string | null = $state(null);
   let detectTimer: ReturnType<typeof setTimeout> | null = null;
+  // The event picked last (panel click, strip click, n/N). Stays put while
+  // the cursor shuttles around it, so you don't lose your place.
+  let selectedEventFrame: number | null = $state(null);
+  // Events already visited this session.
+  let seenEvents: Set<number> = $state(new Set());
+
+  function selectEvent(frame: number) {
+    selectedEventFrame = frame;
+    seenEvents = new Set(seenEvents).add(frame);
+    handleCursorChange(frame);
+  }
 
   // Debounced seek — sends to both mpv instances if running
   let seekTimer: ReturnType<typeof setTimeout> | null = null;
@@ -209,6 +265,16 @@
     );
 
     unlisteners.push(
+      await onResolveStatus((s) => {
+        resolveStatus = s;
+        if (s.state === "failed") {
+          resolveOn = false;
+          showStatus(`Resolve: ${s.message}`, 12000);
+        }
+      })
+    );
+
+    unlisteners.push(
       await listen("menu-event", (event) => {
         const id = event.payload as string;
         if (id === "new-analysis") {
@@ -226,6 +292,8 @@
           metricSeries = {};
           detectResult = null;
           detectError = null;
+          selectedEventFrame = null;
+          seenEvents = new Set();
           progressCurrent = 0;
           progressTotal = 0;
           diagnosticLines = [];
@@ -311,13 +379,29 @@
   function jumpToEvent(dir: 1 | -1) {
     const events = detectResult?.events ?? [];
     if (events.length === 0) return;
+    // Step from the picked event if there is one, so shuttling around it
+    // with mpv doesn't change where n/N go next.
+    const from = selectedEventFrame ?? cursorFrame;
     let target;
     if (dir === 1) {
-      target = events.find((e) => e.frame > cursorFrame) ?? events[0];
+      target = events.find((e) => e.frame > from) ?? events[0];
     } else {
-      target = [...events].reverse().find((e) => e.frame < cursorFrame) ?? events[events.length - 1];
+      target = [...events].reverse().find((e) => e.frame < from) ?? events[events.length - 1];
     }
-    handleCursorChange(target.frame);
+    selectEvent(target.frame);
+  }
+
+  async function handleExportEdl() {
+    const stem = refPath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "vcompare";
+    const result = await save({
+      title: "Export flash frames as Resolve marker EDL",
+      defaultPath: `${stem}_flash_markers.edl`,
+      filters: [{ name: "EDL", extensions: ["edl"] }],
+    });
+    if (result) {
+      const r = await exportEventsEdl(result as string);
+      showStatus(`${r.rows} markers written — in Resolve: Timeline › Import › Timeline Markers from EDL`, 10000);
+    }
   }
 
   async function handleExportEvents() {
@@ -507,6 +591,8 @@
     if (token !== jobToken) return;
     summary = result;
     metricSeries = {};
+    selectedEventFrame = null;
+    seenEvents = new Set();
 
     // Fetch series for each available metric
     for (const m of result.metrics_available) {
@@ -670,6 +756,9 @@
     if (mpvRunning || diffviewRunning) {
       debouncedMpvSeek(frame);
     }
+    // No debounce needed: the engine sends only the newest frame once the
+    // previous seek has been answered.
+    if (resolveOn) resolveSeek(frame).catch(() => {});
   }
 
   // ── Keyboard shortcuts ──
@@ -773,6 +862,9 @@
         break;
       case "a":
         mpvAutoSeek = !mpvAutoSeek;
+        break;
+      case "r":
+        toggleResolveSync();
         break;
       case ".":
         if (mpvRunning) mpvStep("forward");
@@ -941,6 +1033,22 @@
       <span class="header-meta mono">
         sync={mpvAutoSeek ? "bidi" : "fwd"}
       </span>
+    {/if}
+    {#if state === "ready"}
+      <span class="header-spacer"></span>
+      <button
+        class="resolve-btn"
+        class:on={resolveOn}
+        class:warn={resolveStatus.state === "seek_failed"}
+        onclick={toggleResolveSync}
+        disabled={resolveBusy}
+        title="Follow the cursor in DaVinci Resolve's open timeline (r). Needs Resolve running with external scripting enabled: Preferences › System › General › External scripting using: Local."
+      >
+        Resolve sync {resolveOn ? "on" : "off"}
+      </button>
+      {#if resolveStatusText()}
+        <span class="header-meta mono resolve-status">{resolveStatusText()}</span>
+      {/if}
     {/if}
   </header>
 
@@ -1166,9 +1274,12 @@
               error={detectError}
               bind:params={detectParams}
               {cursorFrame}
+              selectedFrame={selectedEventFrame}
+              seen={seenEvents}
               frameRange={analysedRange}
-              onSelect={handleCursorChange}
+              onSelect={selectEvent}
               onExport={handleExportEvents}
+              onExportEdl={handleExportEdl}
             />
           </div>
         {/if}
@@ -1200,6 +1311,7 @@
         <kbd>d</kbd> diff
         <kbd>s</kbd> seek
         <kbd>a</kbd> sync {mpvAutoSeek ? "↔ bidi" : "→ fwd"}
+        <kbd>r</kbd> resolve
         <kbd>.</kbd><kbd>,</kbd> step
         <kbd>space</kbd> pause
       </span>
@@ -1267,6 +1379,25 @@
   .header-meta {
     color: var(--text-secondary);
     font-size: 11px;
+  }
+  .header-spacer { flex: 1; }
+  .resolve-btn {
+    font-size: 11px;
+    padding: 2px 8px;
+  }
+  .resolve-btn.on {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .resolve-btn.warn {
+    border-color: var(--warning);
+  }
+  .resolve-status {
+    max-width: 360px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .header-badge {
     font-size: 10px;

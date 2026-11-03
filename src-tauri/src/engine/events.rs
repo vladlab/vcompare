@@ -30,6 +30,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::engine::timecode::TimecodeFormat;
+
 /// A detected multi-frame event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
@@ -343,6 +345,70 @@ pub fn detect_flashes_diff(
     })
 }
 
+// ─── Resolve marker EDL ─────────────────────────────────────────────────────
+
+/// Render events as a DaVinci Resolve timeline-marker EDL (what Resolve
+/// itself writes from Timeline › Export › Timeline Markers to EDL, and reads
+/// back with Timeline › Import › Timeline Markers from EDL):
+///
+/// ```text
+/// TITLE: <title>
+/// FCM: NON-DROP FRAME
+///
+/// 001  001      V     C        01:00:05:00 01:00:05:01 01:00:05:00 01:00:05:01
+///  |C:ResolveColorRed |M:flash: content 1 fr x13.5 |D:1
+/// ```
+///
+/// Timecodes are the events' own (the file's embedded TC), so this lines up
+/// when the file was exported from the timeline it's going back into.
+/// Marker colour: content → Red, white → Yellow, black → Purple; events
+/// sitting on a cut get Cyan so they're easy to tell apart.
+pub fn events_to_resolve_edl(events: &[Event], tc_fmt: &TimecodeFormat, title: &str) -> String {
+    use crate::engine::timecode::TcType;
+    let mut out = String::new();
+    out.push_str(&format!("TITLE: {}
+", title.trim()));
+    out.push_str(match tc_fmt.tc_type {
+        TcType::DropFrame => "FCM: DROP FRAME
+
+",
+        _ => "FCM: NON-DROP FRAME
+
+",
+    });
+    // Resolve numbers edits with at least three digits.
+    let width = events.len().to_string().len().max(3);
+    for (i, e) in events.iter().enumerate() {
+        let n = i + 1;
+        let tc_in = tc_fmt.frame_to_tc(e.frame);
+        let tc_out = tc_fmt.frame_to_tc(e.frame + e.length as i64);
+        let color = if e.at_cut {
+            "ResolveColorCyan"
+        } else {
+            match e.subkind.as_str() {
+                "white" => "ResolveColorYellow",
+                "black" => "ResolveColorPurple",
+                _ => "ResolveColorRed",
+            }
+        };
+        let name = format!(
+            "flash: {} {} fr x{:.1}{}",
+            e.subkind,
+            e.length,
+            e.score,
+            if e.at_cut { " (at cut)" } else { "" }
+        );
+        out.push_str(&format!(
+            "{n:0width$}  001      V     C        {tc_in} {tc_out} {tc_in} {tc_out}
+"
+        ));
+        out.push_str(&format!(" |C:{color} |M:{name} |D:{}
+
+", e.length));
+    }
+    out
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Pick the threshold: explicit, or robust auto from the change series.
@@ -640,6 +706,35 @@ mod tests {
             .enumerate()
             .map(|(i, &v)| json!({"frame": i as i64, "tc": "", "diff_y": v}))
             .collect()
+    }
+
+    #[test]
+    fn resolve_edl_format() {
+        use crate::engine::timecode::{TcType, TimecodeFormat};
+        let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: TcType::NonDrop };
+        let ev = |frame: i64, length: u32, subkind: &str, at_cut: bool| Event {
+            frame, tc: tc.frame_to_tc(frame), length, kind: "flash".into(),
+            subkind: subkind.into(), at_cut, score: 13.452,
+        };
+        let edl = events_to_resolve_edl(
+            &[ev(86400 + 120, 1, "white", false), ev(86400 + 300, 2, "content", true)],
+            &tc, "clip",
+        );
+        let lines: Vec<&str> = edl.lines().collect();
+        assert_eq!(lines[0], "TITLE: clip");
+        assert_eq!(lines[1], "FCM: NON-DROP FRAME");
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[3], "001  001      V     C        01:00:05:00 01:00:05:01 01:00:05:00 01:00:05:01");
+        assert_eq!(lines[4], " |C:ResolveColorYellow |M:flash: white 1 fr x13.5 |D:1");
+        assert_eq!(lines[5], "");
+        assert_eq!(lines[6], "002  001      V     C        01:00:12:12 01:00:12:14 01:00:12:12 01:00:12:14");
+        assert_eq!(lines[7], " |C:ResolveColorCyan |M:flash: content 2 fr x13.5 (at cut) |D:2");
+
+        let df = TimecodeFormat { fps_num: 30000, fps_den: 1001, tc_type: TcType::DropFrame };
+        assert!(events_to_resolve_edl(&[], &df, "x").contains("FCM: DROP FRAME"));
+        // 1000+ events widen the edit number
+        let many: Vec<Event> = (0..1000).map(|i| ev(i * 10, 1, "black", false)).collect();
+        assert!(events_to_resolve_edl(&many, &tc, "x").contains("\n1000  001      V"));
     }
 
     #[test]

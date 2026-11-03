@@ -11,8 +11,12 @@
     params: DetectParams          — bindable; App re-runs detection on change
     cursorFrame: number
     frameRange: [start, end]      — for the overview strip
+    selectedFrame                 — the event picked last (stays highlighted
+                                    while the cursor shuttles around it)
+    seen                          — first frames of events already visited
     onSelect(frame)               — jump the cursor (and mpv) to a frame
     onExport()                    — export events CSV
+    onExportEdl()                 — export events as a Resolve marker EDL
 -->
 <script lang="ts">
   import type { DetectParams, DetectResult, FlashEvent } from "../lib/rpc";
@@ -22,9 +26,12 @@
     error: string | null;
     params: DetectParams;
     cursorFrame: number;
+    selectedFrame: number | null;
+    seen: Set<number>;
     frameRange: [number, number] | null;
     onSelect: (frame: number) => void;
     onExport: () => void;
+    onExportEdl: () => void;
   }
 
   let {
@@ -32,9 +39,12 @@
     error,
     params = $bindable(),
     cursorFrame,
+    selectedFrame,
+    seen,
     frameRange,
     onSelect,
     onExport,
+    onExportEdl,
   }: Props = $props();
 
   // ── Threshold control ──
@@ -87,6 +97,10 @@
   let activeIndex = $derived(
     events.findIndex((e) => cursorFrame >= e.frame && cursorFrame < e.frame + e.length)
   );
+  /** Index of the last-picked event (kept while shuttling around it). */
+  let selectedIndex = $derived(
+    selectedFrame == null ? -1 : events.findIndex((e) => e.frame === selectedFrame)
+  );
 
   function stripPct(frame: number): number {
     if (!frameRange) return 0;
@@ -100,11 +114,11 @@
     return `${e.subkind} · ${len}${e.at_cut ? " · at cut" : ""}`;
   }
 
-  // Keep the active row in view when navigating with the keyboard
+  // Keep the picked row in view when navigating with the keyboard
   let listEl: HTMLDivElement | undefined = $state();
   $effect(() => {
-    if (activeIndex < 0 || !listEl) return;
-    const row = listEl.children[activeIndex] as HTMLElement | undefined;
+    if (selectedIndex < 0 || !listEl) return;
+    const row = listEl.children[selectedIndex] as HTMLElement | undefined;
     row?.scrollIntoView({ block: "nearest" });
   });
 </script>
@@ -116,6 +130,9 @@
       <span class="count mono">{events.length}</span>
     {/if}
     <span class="spacer"></span>
+    <button class="small" onclick={onExportEdl} disabled={events.length === 0} title="Export events as a DaVinci Resolve marker EDL (Timeline › Import › Timeline Markers from EDL)">
+      EDL
+    </button>
     <button class="small" onclick={onExport} disabled={events.length === 0} title="Export events as CSV">
       CSV
     </button>
@@ -173,6 +190,7 @@
             class="strip-tick {e.subkind}"
             class:at-cut={e.at_cut}
             class:active={i === activeIndex}
+            class:selected={i === selectedIndex}
             style="left: {stripPct(e.frame)}%"
             onclick={() => onSelect(e.frame)}
           ></span>
@@ -197,10 +215,13 @@
         <button
           class="row"
           class:active={i === activeIndex}
+          class:selected={i === selectedIndex}
+          class:seen={seen.has(e.frame)}
           onclick={(ev) => { onSelect(e.frame); (ev.currentTarget as HTMLElement).blur(); }}
         >
           <span class="dot {e.subkind}" class:at-cut={e.at_cut}></span>
           <span class="tc mono">{e.tc || e.frame}</span>
+          {#if seen.has(e.frame)}<span class="seen-mark" title="visited">✓</span>{/if}
           <span class="desc">{label(e)}</span>
           <span class="score mono" title="strength relative to threshold">×{e.score.toFixed(1)}</span>
         </button>
@@ -313,6 +334,11 @@
     margin-left: -1px;
     cursor: pointer;
   }
+  .strip-tick.selected {
+    width: 4px;
+    margin-left: -2px;
+    outline: 1px solid var(--text-secondary);
+  }
   .strip-tick.active {
     width: 4px;
     margin-left: -2px;
@@ -346,7 +372,16 @@
     cursor: pointer;
   }
   .row:hover { background: var(--bg-hover); }
+  /* selected = the event you picked; it stays grey while you shuttle
+     around it, and turns accent again whenever the cursor is on it */
+  .row.selected { background: var(--bg-active); }
   .row.active { background: var(--accent-dim); }
+  .row.seen .tc { color: var(--text-secondary); }
+  .seen-mark {
+    color: var(--text-muted);
+    font-size: 11px;
+    flex-shrink: 0;
+  }
   .tc { flex-shrink: 0; }
   .desc {
     flex: 1;

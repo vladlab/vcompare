@@ -106,6 +106,17 @@ impl FfmpegHandle {
     }
 }
 
+/// The DaVinci Resolve playhead-sync connection, if enabled.
+pub struct ResolveState {
+    pub sync: Mutex<Option<Arc<engine::resolve::ResolveSync>>>,
+}
+
+impl ResolveState {
+    pub fn new() -> Self {
+        Self { sync: Mutex::new(None) }
+    }
+}
+
 /// Error returned by `analyze` when the job was cancelled.
 pub const CANCELLED: &str = "Analysis cancelled";
 
@@ -664,11 +675,76 @@ pub async fn detect_events(
 }
 
 #[tauri::command]
+pub async fn export_events_edl(
+    path: Option<String>,
+    engine_state: State<'_, EngineState>,
+) -> Result<Value, String> {
+    engine_state.export_events_edl(path.as_deref())
+}
+
+#[tauri::command]
 pub async fn export_events_csv(
     path: Option<String>,
     engine_state: State<'_, EngineState>,
 ) -> Result<Value, String> {
     engine_state.export_events_csv(path.as_deref())
+}
+
+// ─── DaVinci Resolve sync ───────────────────────────────────────────────────
+
+/// Connect to the running Resolve. Status changes are emitted as
+/// `rpc:resolve-status` events (see `engine::resolve::ResolveStatus`).
+#[tauri::command]
+pub async fn resolve_connect(
+    app: AppHandle,
+    resolve_state: State<'_, ResolveState>,
+) -> Result<engine::resolve::ResolveStatus, String> {
+    {
+        let existing = resolve_state.sync.lock().unwrap();
+        if let Some(ref s) = *existing {
+            if s.is_running() {
+                return Ok(s.status());
+            }
+        }
+    }
+    let app_status = app.clone();
+    let sync = tokio::task::spawn_blocking(move || {
+        engine::resolve::ResolveSync::connect(Box::new(move |st| {
+            let _ = app_status.emit("rpc:resolve-status", &st);
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+    let status = sync.status();
+    *resolve_state.sync.lock().unwrap() = Some(sync);
+    Ok(status)
+}
+
+/// Move Resolve's playhead to a display frame of the current analysis
+/// (converted to timecode here so drop-frame is handled in one place).
+/// Newest wins while one seek is in flight.
+#[tauri::command]
+pub async fn resolve_seek(
+    frame: i64,
+    resolve_state: State<'_, ResolveState>,
+    engine_state: State<'_, EngineState>,
+) -> Result<Value, String> {
+    let timecode = engine_state.frame_to_tc(frame)?;
+    let g = resolve_state.sync.lock().unwrap();
+    let s = g.as_ref().ok_or("Resolve sync is not connected")?;
+    s.seek(&timecode);
+    Ok(json!({"ok": true, "timecode": timecode}))
+}
+
+#[tauri::command]
+pub async fn resolve_disconnect(resolve_state: State<'_, ResolveState>) -> Result<Value, String> {
+    let taken = resolve_state.sync.lock().unwrap().take();
+    if let Some(s) = taken {
+        tokio::task::spawn_blocking(move || s.disconnect())
+            .await
+            .map_err(|e| format!("Task join error: {e}"))?;
+    }
+    Ok(json!({"status": "disconnected"}))
 }
 
 // ─── mpv commands ───────────────────────────────────────────────────────────

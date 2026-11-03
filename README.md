@@ -53,7 +53,19 @@ of the frames on either side; older caches fall back to average luma and
 chroma. Detection runs over
 the cached per-frame stats, so sensitivity can be tuned live without
 re-running ffmpeg. Events are shown as markers on the timeline and chart,
-listed in a panel, and navigable with `n` / `N` (which also seeks mpv).
+listed in a panel, and navigable with `n` / `N` (which also seeks mpv). The
+event you picked stays highlighted while you shuttle around it, and visited
+events get a tick. Events export as CSV or as a DaVinci Resolve marker EDL
+(Timeline › Import › Timeline Markers from EDL; colour by kind, cyan for
+at-cut).
+
+### DaVinci Resolve sync
+
+With **Resolve sync** on (`r`), the cursor drives the playhead of the timeline
+open in Resolve, via Resolve's scripting API. Needs Resolve running with
+*Preferences › System › General › External scripting using: Local*, and a
+Python 3 on the PATH (set `VCOMPARE_PYTHON` to pick one). Timecodes are the
+file's own, so this lines up when the file was exported from that timeline.
 
 ## Architecture
 
@@ -142,6 +154,7 @@ the usual WebKitGTK workaround env vars automatically.
 | `m` | cycle active metric |
 | `t` / `T` | auto-threshold from active metric / clear threshold |
 | `n` / `N` | next / previous flash event |
+| `r` | toggle DaVinci Resolve playhead sync |
 | `Esc` | cancel the running analysis (nothing is saved) |
 | `p` / `P` | launch / close mpv side-by-side |
 | `d` / `D` | launch / close mpv difference view |

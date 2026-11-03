@@ -336,6 +336,37 @@ export async function exportEventsCsv(path?: string): Promise<{ path: string; ro
   return invoke("export_events_csv", { path: path ?? null });
 }
 
+/** Export events as a DaVinci Resolve timeline-marker EDL. */
+export async function exportEventsEdl(path?: string): Promise<{ path: string; rows: number }> {
+  return invoke("export_events_edl", { path: path ?? null });
+}
+
+// ─── DaVinci Resolve sync ──────────────────────────────────────────────────
+
+export type ResolveStatus =
+  | { state: "connecting" }
+  | { state: "connected"; target: string }
+  | { state: "seek_failed"; message: string }
+  | { state: "failed"; message: string }
+  | { state: "disconnected" };
+
+export async function resolveConnect(): Promise<ResolveStatus> {
+  return invoke("resolve_connect");
+}
+
+/** Move Resolve's playhead to a display frame of the current analysis. */
+export async function resolveSeek(frame: number): Promise<{ ok: boolean; timecode: string }> {
+  return invoke("resolve_seek", { frame });
+}
+
+export async function resolveDisconnect(): Promise<{ status: string }> {
+  return invoke("resolve_disconnect");
+}
+
+export function onResolveStatus(callback: (s: ResolveStatus) => void): Promise<UnlistenFn> {
+  return listen<ResolveStatus>("rpc:resolve-status", (event) => callback(event.payload));
+}
+
 // ─── Recents ──────────────────────────────────────────────────────────────
 
 export interface RecentEntry {
