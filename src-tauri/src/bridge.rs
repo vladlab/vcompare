@@ -45,6 +45,9 @@ pub struct AnalyzeParams {
     pub log_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
+    /// Levels: parallel ffmpeg decodes. None or 0 = auto.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -310,8 +313,9 @@ pub async fn analyze(
     let job = process_handle.clone();
 
     let result = if mode == "levels" {
+        let chunks = params.chunks.filter(|&n| n > 0);
         _run_levels_analysis(
-            app, &ref_path, save_path, &engine_state, process_handle,
+            app, &ref_path, chunks, save_path, &engine_state, process_handle,
         )
         .await
     } else if mode == "vmaf" {
@@ -459,6 +463,7 @@ async fn _run_diff_analysis(
 async fn _run_levels_analysis(
     app: AppHandle,
     file_path: &str,
+    chunks: Option<u32>,
     save_path: Option<String>,
     engine_state: &State<'_, EngineState>,
     process_handle: ProcessHandle,
@@ -488,6 +493,7 @@ async fn _run_levels_analysis(
             &file_path,
             &info,
             hwaccel.as_deref(),
+            chunks,
             Some(progress),
             process_handle,
             &mut diagnostics,

@@ -563,6 +563,10 @@ pub fn run_vmaf_analysis(
 /// and `rawstats` computes per-frame statistics on a worker pool (see
 /// `engine/rawstats.rs`). Returns frame JSON objects in display frame space.
 ///
+/// `requested_chunks`: `None` = auto, `Some(n)` = the user's choice of
+/// parallel ffmpeg decodes. Sources that can't be split exactly (see
+/// `rawstats::chunk_count`) run as one process regardless.
+///
 /// `hwaccel_available` is what `probe::detect_hwaccel()` found; it is only
 /// used for codecs with hardware decoders. A listed hwaccel doesn't mean a
 /// device exists (an NVIDIA-enabled ffmpeg on a machine without the driver
@@ -576,21 +580,33 @@ pub fn run_levels_analysis(
     file_path: &str,
     info: &SingleFileInfo,
     hwaccel_available: Option<&str>,
+    requested_chunks: Option<u32>,
     progress: Option<ProgressFn>,
     process_handle: ProcessHandle,
     diagnostics: &mut Vec<String>,
     publish: &dyn Fn(&[String]),
 ) -> Result<(Vec<Value>, String), String> {
-    use crate::engine::rawstats::{choose_hwaccel, run_raw_stats, RawFormat};
+    use crate::engine::rawstats::{chunk_count, choose_hwaccel, ChunkSource, RawFormat};
 
     let fmt = RawFormat::for_source(&info.pix_fmt, info.width, info.height)
         .with_full_range(info.full_range);
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let hw = choose_hwaccel(&info.codec_name, file_path, hwaccel_available);
+    let (n_chunks, chunk_note) = chunk_count(
+        requested_chunks,
+        &ChunkSource {
+            codec_name: &info.codec_name,
+            total_frames: info.total_frames.or(info.estimated_frames),
+            cfr: info.cfr,
+            concat: is_concat_manifest(file_path),
+            hwaccel: hw.is_some(),
+        },
+        cores,
+    );
 
-    diagnostics.push(format!("stats: native ({workers} workers)"));
+    diagnostics.push(format!("stats: native ({cores} threads)"));
     diagnostics.push(format!(
-        "decode: {}{}",
+        "decode: {}{} — {chunk_note}",
         if info.codec_name.is_empty() { "?" } else { &info.codec_name },
         hw.as_deref().map(|h| format!(" [{h}]")).unwrap_or_default()
     ));
@@ -604,44 +620,29 @@ pub fn run_levels_analysis(
     });
     publish(diagnostics);
 
-    // The progress callback may be needed twice (hw attempt + software
-    // retry); share it behind a mutex and hand each attempt a thin wrapper.
-    let shared_progress = progress.map(|p| std::sync::Arc::new(Mutex::new(p)));
-    let attempt_progress = || -> Option<ProgressFn> {
-        shared_progress.as_ref().map(|p| {
-            let p = p.clone();
-            Box::new(move |c: u64, t: u64| (p.lock().unwrap())(c, t)) as ProgressFn
-        })
-    };
+    // The progress callback may be needed more than once (hw attempt +
+    // software retry, chunks, chunk fallback); share it behind a mutex.
+    let shared_progress: Option<Arc<Mutex<ProgressFn>>> = progress.map(|p| Arc::new(Mutex::new(p)));
 
-    let (stats, report) = match run_raw_stats(
-        file_path,
-        &fmt,
-        hw.as_deref(),
-        info.total_frames,
-        info.estimated_frames,
-        attempt_progress(),
-        process_handle.clone(),
-    ) {
-        Ok(s) => s,
-        Err(e) if hw.is_some() && !e.killed && e.frames_read == 0 => {
-            eprintln!("[vcompare] hw decode failed, retrying in software: {}", e.message);
-            diagnostics.push(format!(
-                "decode: {} unavailable — software decode",
-                hw.as_deref().unwrap_or("")
-            ));
-            publish(diagnostics);
-            run_raw_stats(
-                file_path,
-                &fmt,
-                None,
-                info.total_frames,
-                info.estimated_frames,
-                attempt_progress(),
-                process_handle,
-            )?
+    let mut ran_chunks = 1;
+    let (stats, report) = if n_chunks > 1 {
+        match run_chunked(file_path, &fmt, info, n_chunks, cores, &shared_progress, &process_handle) {
+            Ok(r) => {
+                ran_chunks = n_chunks;
+                r
+            }
+            Err(ChunkedError::Fatal(e)) => return Err(e),
+            Err(ChunkedError::Inexact(why)) => {
+                eprintln!("[vcompare] chunked decode inexact, rerunning as one process: {why}");
+                diagnostics.push(format!("decode: chunks didn't line up ({why}) — rerunning as one process"));
+                publish(diagnostics);
+                run_single(file_path, &fmt, info, None, cores, &shared_progress, &process_handle,
+                           diagnostics, publish)?
+            }
         }
-        Err(e) => return Err(e.into()),
+    } else {
+        run_single(file_path, &fmt, info, hw.as_deref(), cores, &shared_progress, &process_handle,
+                   diagnostics, publish)?
     };
 
     let tc = &info.tc_fmt;
@@ -650,7 +651,191 @@ pub fn run_levels_analysis(
         .enumerate()
         .map(|(i, s)| s.to_json(info.start_frame + i as i64, tc))
         .collect();
-    Ok((frames, report.summary()))
+    let summary = if ran_chunks > 1 {
+        format!("{ran_chunks} parallel decodes: {}", report.summary())
+    } else {
+        report.summary()
+    };
+    Ok((frames, summary))
+}
+
+/// Do `warmup` (a chunk's first frames) repeat the end of `stitched`?
+fn seam_matches(
+    stitched: &[crate::engine::rawstats::FrameStats],
+    warmup: &[crate::engine::rawstats::FrameStats],
+) -> bool {
+    warmup.len() <= stitched.len()
+        && stitched[stitched.len() - warmup.len()..]
+            .iter()
+            .zip(warmup)
+            .all(|(a, b)| a.same_picture(b))
+}
+
+fn progress_wrapper(shared: &Option<Arc<Mutex<ProgressFn>>>) -> Option<ProgressFn> {
+    shared.as_ref().map(|p| {
+        let p = p.clone();
+        Box::new(move |c: u64, t: u64| (p.lock().unwrap())(c, t)) as ProgressFn
+    })
+}
+
+/// One ffmpeg for the whole file, with the software retry for a hw decode
+/// that fails before its first frame.
+#[allow(clippy::too_many_arguments)]
+fn run_single(
+    file_path: &str,
+    fmt: &crate::engine::rawstats::RawFormat,
+    info: &SingleFileInfo,
+    hw: Option<&str>,
+    cores: usize,
+    shared_progress: &Option<Arc<Mutex<ProgressFn>>>,
+    process_handle: &ProcessHandle,
+    diagnostics: &mut Vec<String>,
+    publish: &dyn Fn(&[String]),
+) -> Result<(Vec<crate::engine::rawstats::FrameStats>, crate::engine::rawstats::RunReport), String> {
+    use crate::engine::rawstats::{run_raw_stats, RawRunOptions};
+    let opts = RawRunOptions {
+        hwaccel: hw.map(String::from),
+        fps: info.fps,
+        frame_limit: info.total_frames,
+        progress_total: info.estimated_frames,
+        workers: Some(cores),
+        ..Default::default()
+    };
+    match run_raw_stats(file_path, fmt, &opts, progress_wrapper(shared_progress), process_handle.clone()) {
+        Ok(r) => Ok(r),
+        Err(e) if hw.is_some() && !e.killed && e.frames_read == 0 => {
+            eprintln!("[vcompare] hw decode failed, retrying in software: {}", e.message);
+            diagnostics.push(format!("decode: {} unavailable — software decode", hw.unwrap_or("")));
+            publish(diagnostics);
+            let sw = RawRunOptions { hwaccel: None, ..opts };
+            run_raw_stats(file_path, fmt, &sw, progress_wrapper(shared_progress), process_handle.clone())
+                .map_err(String::from)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+enum ChunkedError {
+    /// Report to the user (includes cancellation).
+    Fatal(String),
+    /// Seeking wasn't exact for this file; rerun as one process.
+    Inexact(String),
+}
+
+/// Decode `n` chunks in parallel ffmpeg processes and stitch the results.
+fn run_chunked(
+    file_path: &str,
+    fmt: &crate::engine::rawstats::RawFormat,
+    info: &SingleFileInfo,
+    n: u32,
+    cores: usize,
+    shared_progress: &Option<Arc<Mutex<ProgressFn>>>,
+    process_handle: &ProcessHandle,
+) -> Result<(Vec<crate::engine::rawstats::FrameStats>, crate::engine::rawstats::RunReport), ChunkedError> {
+    use crate::engine::rawstats::{plan_chunks, run_raw_stats, RawRunOptions, RunReport};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // With only an estimated length, the last chunk runs to the end of the
+    // file instead of stopping at the estimate.
+    let exact = info.total_frames.is_some();
+    let total = info.total_frames.or(info.estimated_frames).unwrap_or(0);
+    let chunks = plan_chunks(total, n);
+    let last = chunks.len() - 1;
+    let per = (cores / chunks.len()).max(1);
+    // Overall frames done, summed over chunks (warm-up frames included —
+    // a handful per chunk).
+    let done = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let opts = RawRunOptions {
+                    hwaccel: None,
+                    start_frame: chunk.decode_start,
+                    fps: info.fps,
+                    frame_limit: if i == last && !exact { None } else { Some(chunk.decode_count()) },
+                    progress_total: Some(chunk.decode_count()),
+                    workers: Some(per),
+                    decoder_threads: Some(per.max(2)),
+                    buffer_bytes: Some((1usize << 30) / chunks.len()),
+                };
+                // Each chunk reports its own count; turn that into increments
+                // of the shared total and report against the whole file.
+                let progress: Option<ProgressFn> = shared_progress.as_ref().map(|p| {
+                    let (p, done) = (p.clone(), done.clone());
+                    let last = AtomicU64::new(0);
+                    Box::new(move |c: u64, _t: u64| {
+                        let prev = last.swap(c, Ordering::Relaxed);
+                        if c > prev {
+                            let sum = done.fetch_add(c - prev, Ordering::Relaxed) + (c - prev);
+                            (p.lock().unwrap())(sum.min(total), total.max(sum));
+                        }
+                    }) as ProgressFn
+                });
+                let job = process_handle.clone();
+                scope.spawn(move || {
+                    let r = run_raw_stats(file_path, fmt, &opts, progress, job.clone());
+                    if r.is_err() {
+                        // No point finishing the other chunks.
+                        job.kill_all_attached();
+                    }
+                    r
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join()).collect()
+    });
+
+    if process_handle.is_cancelled() {
+        return Err(ChunkedError::Fatal("Analysis cancelled".into()));
+    }
+
+    let mut stitched = Vec::with_capacity(total as usize);
+    let mut reports: Vec<RunReport> = Vec::new();
+    for (i, (chunk, r)) in chunks.iter().zip(results).enumerate() {
+        let (stats, report) = match r {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(ChunkedError::Fatal(format!("chunk {} of {}: {}", i + 1, chunks.len(), e.message))),
+            Err(_) => return Err(ChunkedError::Fatal(format!("chunk {} of {} panicked", i + 1, chunks.len()))),
+        };
+        let got = stats.len() as u64;
+        let want = chunk.decode_count();
+        // Middle chunks must line up exactly or there'd be a gap/overlap at a
+        // seam. The last one may come up short (like a single-process run
+        // whose container overstated its length) or, when the length was
+        // only estimated, long.
+        let last_ok = got > chunk.warmup() && (!exact || got <= want);
+        if (i < last && got != want) || (i == last && !last_ok) {
+            return Err(ChunkedError::Inexact(format!(
+                "chunk {} returned {got} frames, expected {want}",
+                i + 1
+            )));
+        }
+        // The warm-up frames are the previous chunk's last kept frames, decoded
+        // again. If the seek landed anywhere else they won't match, and the
+        // stitched result would be shifted at this seam.
+        let w = chunk.warmup() as usize;
+        if i > 0 && !seam_matches(&stitched, &stats[..w]) {
+            return Err(ChunkedError::Inexact(format!(
+                "chunk {} didn't start on the expected frame",
+                i + 1
+            )));
+        }
+        stitched.extend(stats.into_iter().skip(w));
+        reports.push(report);
+    }
+
+    if let Some(p) = shared_progress {
+        let n = stitched.len() as u64;
+        (p.lock().unwrap())(n, n);
+    }
+    let mut report = RunReport::combine(&reports, t0.elapsed().as_secs_f64());
+    report.frames = stitched.len() as u64; // not counting warm-up frames
+    eprintln!("[vcompare] chunked ({}): {}", chunks.len(), report.summary());
+    Ok((stitched, report))
 }
 
 /// What a single-file (levels) analysis needs to know about its input.
@@ -674,6 +859,11 @@ pub struct SingleFileInfo {
     /// ffprobe `color_range` is "pc" (full range). Unknown counts as limited,
     /// which is what an untagged YUV file is assumed to be.
     pub full_range: bool,
+    /// Stream frame rate (r_frame_rate).
+    pub fps: (u32, u32),
+    /// avg_frame_rate agrees with r_frame_rate (within 0.1%): constant rate,
+    /// so frame index ↔ time is exact.
+    pub cfr: bool,
 }
 
 /// Prepare a single file for levels analysis.
@@ -697,6 +887,14 @@ pub fn prepare_single_file(
     };
     let codec_name = stream_str("codec_name");
     let full_range = stream_str("color_range") == "pc";
+    let cfr = match crate::engine::timecode::parse_rational(&stream_str("avg_frame_rate")) {
+        Some((an, ad)) if an > 0 && ad > 0 && info.fps_den > 0 => {
+            let avg = an as f64 / ad as f64;
+            let nominal = info.fps_num as f64 / info.fps_den as f64;
+            ((avg - nominal) / nominal).abs() < 1e-3
+        }
+        _ => false,
+    };
 
     diagnostics.push(format!(
         "file: {}x{} {} {} {}/{}",
@@ -737,6 +935,8 @@ pub fn prepare_single_file(
         height: info.height,
         codec_name,
         full_range,
+        fps: (info.fps_num, info.fps_den),
+        cfr,
     })
 }
 
@@ -783,9 +983,9 @@ fn run_ffmpeg_with_progress(
 
     // Store child in handle for external cancellation; a job cancelled
     // before we got here gets its ffmpeg killed straight away.
-    if !process_handle.attach(child) {
+    let Some(child_id) = process_handle.attach(child) else {
         return Err("Analysis cancelled".into());
-    }
+    };
 
     let frame_re = Regex::new(r"frame=\s*(\d+)").unwrap();
     let mut last_reported: i64 = -1;
@@ -842,7 +1042,7 @@ fn run_ffmpeg_with_progress(
     }
 
     // Wait for process to finish
-    let mut child_opt = process_handle.detach();
+    let mut child_opt = process_handle.detach(child_id);
     let status = match child_opt.as_mut() {
         Some(c) => c.wait().map_err(|e| format!("Failed to wait for ffmpeg: {e}"))?,
         None => return Err("ffmpeg process was killed externally".into()),
@@ -1054,4 +1254,76 @@ fn round4(v: f64) -> f64 {
 
 fn round6(v: f64) -> f64 {
     (v * 1000000.0).round() / 1000000.0
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chunked decoding must give exactly the single-process result: every
+    /// field of every frame, including the frame / thumbnail differences
+    /// that straddle chunk seams. Covers 23.976 MOV, a MOV with a non-zero
+    /// start time, MXF and MKV without container frame counts. Needs ffmpeg
+    /// and ffprobe; skipped otherwise.
+    #[test]
+    fn chunked_levels_match_single_process() {
+        let dir = std::env::temp_dir().join(format!("vcompare_chunk_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "testsrc2=s=320x180:r=24000/1001,noise=alls=6:allf=t+u";
+        let clips: Vec<(&str, Vec<&str>)> = vec![
+            ("p.mov", vec!["-f", "lavfi", "-i", src, "-frames:v", "1500", "-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"]),
+            ("p_off.mov", vec!["-f", "lavfi", "-i", src, "-frames:v", "1500", "-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le", "-output_ts_offset", "7.3"]),
+            ("d.mxf", vec!["-f", "lavfi", "-i", "testsrc2=s=640x360:r=25,noise=alls=6:allf=t+u", "-frames:v", "1000", "-c:v", "dnxhd", "-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"]),
+            ("f.mkv", vec!["-f", "lavfi", "-i", src, "-frames:v", "1500", "-c:v", "ffv1", "-pix_fmt", "yuv420p"]),
+        ];
+        for (name, args) in clips {
+            let path = dir.join(name);
+            let ok = Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(&args)
+                .arg(&path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                eprintln!("ffmpeg unavailable or can't make {name}; skipping");
+                continue;
+            }
+            let p = path.to_string_lossy().to_string();
+            let mut d = Vec::new();
+            let info = prepare_single_file(&p, &mut d).unwrap();
+            let run = |n: u32| {
+                let mut d = Vec::new();
+                run_levels_analysis(&p, &info, None, Some(n), None,
+                                    crate::engine::process::standalone_job(), &mut d, &|_| {})
+                    .unwrap()
+            };
+            let (single, s1) = run(1);
+            let (chunked, s4) = run(4);
+            assert!(!s1.contains("parallel"), "{name}: {s1}");
+            assert!(s4.starts_with("4 parallel decodes"), "{name} didn't chunk: {s4}");
+            assert_eq!(single.len(), chunked.len(), "{name}: frame count");
+            for (i, (a, b)) in single.iter().zip(&chunked).enumerate() {
+                assert_eq!(a, b, "{name}: frame {i} differs");
+            }
+            eprintln!("{name}: {} frames identical (single vs 4 chunks)", single.len());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The seam check must reject a chunk that starts one frame off.
+    #[test]
+    fn seam_check_catches_off_by_one() {
+        use crate::engine::rawstats::{bench_compute, RawFormat};
+        let f = RawFormat::for_source("yuv420p", 64, 36);
+        // Distinct frames: frame k is a flat field at level 20 + 10k.
+        let frames: Vec<_> = (0..12u8)
+            .map(|k| bench_compute(&f, &vec![20 + 10 * k; f.frame_bytes()], None).0)
+            .collect();
+        let stitched = &frames[..8]; // previous chunk kept 0..8
+        assert!(seam_matches(stitched, &frames[4..8]), "correct seek: warm-up = frames 4..8");
+        assert!(!seam_matches(stitched, &frames[5..9]), "one frame late");
+        assert!(!seam_matches(stitched, &frames[3..7]), "one frame early");
+    }
 }

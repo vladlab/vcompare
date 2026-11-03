@@ -24,6 +24,15 @@ makes the pass decode-bound. Sources with hardware decoders (H.264, HEVC,
 AV1, …) use `-hwaccel` when ffmpeg offers one, falling back to software if
 no device is available. ProRes / DNxHR always decode in software.
 
+A single ffmpeg can only push raw UHD 10-bit frames out at ~60 fps, well
+below what a many-core machine decodes, so intra-frame constant-rate files
+(ProRes, DNxHR, FFV1, …) are split into chunks decoded by several ffmpeg
+processes in parallel and stitched back together; the result is identical
+to a single-process run (each seam is verified, with a fallback to one
+process if a seek ever lands off-frame). **Parallel decodes** in the levels
+options picks how many — Auto is about one per 10 hardware threads; lower it
+for slow disks or network shares, where parallel reads just compete.
+
 Files can be chosen with the file dialog or dropped onto the window: onto
 the Reference / Distorted rows individually, or two at once to fill both.
 A running analysis can be cancelled (button or `Esc`); a cancelled job

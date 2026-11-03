@@ -228,6 +228,17 @@ pub struct OutOfRange {
 }
 
 impl FrameStats {
+    /// Same decoded picture, judged from everything that depends only on the
+    /// frame itself (not on its neighbours). Used to check chunk seams.
+    pub fn same_picture(&self, o: &FrameStats) -> bool {
+        (self.y_min, self.y_max, self.u_min, self.u_max, self.v_min, self.v_max)
+            == (o.y_min, o.y_max, o.u_min, o.u_max, o.v_min, o.v_max)
+            && (self.y_low, self.y_high, self.oor) == (o.y_low, o.y_high, o.oor)
+            && self.y_avg == o.y_avg
+            && self.u_avg == o.u_avg
+            && self.v_avg == o.v_avg
+    }
+
     /// Convert to the JSON shape the rest of the engine consumes.
     pub fn to_json(&self, display_frame: i64, tc_fmt: &TimecodeFormat) -> Value {
         let mut v = self.to_json_base(display_frame, tc_fmt);
@@ -668,7 +679,7 @@ impl RunReport {
         if self.wait_buffer_s > 0.4 * e {
             "stats workers"
         } else if self.wait_ffmpeg_s > 0.5 * e {
-            "ffmpeg decode / file read"
+            "ffmpeg (decode, file read or raw output)"
         } else {
             "balanced"
         }
@@ -688,6 +699,142 @@ impl RunReport {
             100.0 * self.worker_busy,
         )
     }
+}
+
+impl RunReport {
+    /// Merge the reports of chunks that ran side by side over `elapsed_s`.
+    pub fn combine(reports: &[RunReport], elapsed_s: f64) -> RunReport {
+        let n = reports.len().max(1) as f64;
+        let frac = |f: &dyn Fn(&RunReport) -> f64| {
+            reports.iter().map(|r| f(r) / r.elapsed_s.max(1e-9)).sum::<f64>() / n
+        };
+        RunReport {
+            frames: reports.iter().map(|r| r.frames).sum(),
+            elapsed_s,
+            wait_ffmpeg_s: frac(&|r| r.wait_ffmpeg_s) * elapsed_s,
+            wait_buffer_s: frac(&|r| r.wait_buffer_s) * elapsed_s,
+            workers: reports.iter().map(|r| r.workers).sum(),
+            worker_busy: reports.iter().map(|r| r.worker_busy).sum::<f64>() / n,
+        }
+    }
+}
+
+// ─── Chunked decoding ───────────────────────────────────────────────────────
+//
+// One ffmpeg writing raw frames to a pipe tops out at ~60 fps for UHD 10-bit
+// 4:2:2 (≈2 GB/s through a single process's output path), far below what a
+// many-core machine decodes. Splitting the file into chunks decoded by
+// separate ffmpeg processes in parallel lifts that ceiling. Only sources
+// where a seek lands exactly on a frame are chunked: intra-only codecs at a
+// constant frame rate. The frame count may be the container's or an estimate
+// from the duration (MXF and MKV often report none); with an estimate the
+// last chunk simply decodes to the end of the file.
+
+/// Codecs whose every frame is a keyframe, so a seek is exact and cheap.
+pub const INTRA_ONLY_CODECS: &[&str] = &[
+    "prores", "dnxhd", "ffv1", "jpeg2000", "mjpeg", "cfhd", "v210", "v410",
+    "r210", "rawvideo", "utvideo", "huffyuv", "ffvhuff", "magicyuv",
+    "dvvideo", "hqx", "hq_hqa",
+];
+
+/// Chunks shorter than this aren't worth a separate ffmpeg.
+pub const MIN_CHUNK_FRAMES: u64 = 240;
+/// Extra frames decoded before each chunk (and dropped) so frame and
+/// thumbnail differences are continuous across chunk seams.
+pub const CHUNK_WARMUP: u64 = TDIF_DEPTH as u64;
+/// Upper bound for the chunk count, from the UI or auto.
+pub const MAX_CHUNKS: u32 = 16;
+
+/// Default chunk count for a machine: about one ffmpeg per 10 hardware
+/// threads, at most 8 (64 threads → 6).
+pub fn auto_chunks(cores: usize) -> u32 {
+    ((cores / 10) as u32).clamp(1, 8)
+}
+
+/// What a source allows, for deciding the chunk count.
+#[derive(Debug, Clone)]
+pub struct ChunkSource<'a> {
+    pub codec_name: &'a str,
+    pub total_frames: Option<u64>,
+    pub cfr: bool,
+    pub concat: bool,
+    pub hwaccel: bool,
+}
+
+/// Decide how many chunks to use and say why, for the diagnostics line.
+/// `requested`: `None` = auto, `Some(n)` = what the user picked.
+pub fn chunk_count(requested: Option<u32>, src: &ChunkSource, cores: usize) -> (u32, String) {
+    let auto = requested.is_none();
+    let wanted = requested.unwrap_or_else(|| auto_chunks(cores)).clamp(1, MAX_CHUNKS);
+    if wanted == 1 {
+        let why = if auto { "auto: not enough cores to split" } else { "set to 1" };
+        return (1, format!("single process ({why})"));
+    }
+    let single = |why: String| (1, format!("single process — {why}"));
+    let codec = src.codec_name.to_ascii_lowercase();
+    if !INTRA_ONLY_CODECS.contains(&codec.as_str()) {
+        return single(format!("{} isn't intra-only, so chunks can't start on an exact frame",
+                              if codec.is_empty() { "unknown codec" } else { &codec }));
+    }
+    if src.concat {
+        return single("concat / IMF manifests aren't split".into());
+    }
+    if src.hwaccel {
+        return single("hardware decode".into());
+    }
+    if !src.cfr {
+        return single("variable frame rate".into());
+    }
+    let Some(total) = src.total_frames else {
+        return single("unknown length (no frame count or duration)".into());
+    };
+    let fit = (total / MIN_CHUNK_FRAMES).max(1) as u32;
+    let n = wanted.min(fit);
+    let how = if auto { "auto" } else { "set" };
+    if n == 1 {
+        return single(format!("file too short to split ({total} frames)"));
+    }
+    if n < wanted {
+        (n, format!("{n} parallel decodes ({how} {wanted}; file too short for more)"))
+    } else {
+        (n, format!("{n} parallel decodes ({how})"))
+    }
+}
+
+/// One chunk of a chunked pass, in frame indices from the start of the file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Chunk {
+    /// First frame decoded (includes warm-up frames).
+    pub decode_start: u64,
+    /// First frame kept.
+    pub keep_from: u64,
+    /// One past the last frame kept (and decoded).
+    pub keep_to: u64,
+}
+
+impl Chunk {
+    pub fn decode_count(&self) -> u64 {
+        self.keep_to - self.decode_start
+    }
+    pub fn warmup(&self) -> u64 {
+        self.keep_from - self.decode_start
+    }
+}
+
+/// Split `total` frames into `n` contiguous chunks of near-equal length.
+pub fn plan_chunks(total: u64, n: u32) -> Vec<Chunk> {
+    let n = (n.max(1) as u64).min(total.max(1));
+    (0..n)
+        .map(|i| {
+            let keep_from = total * i / n;
+            let keep_to = total * (i + 1) / n;
+            Chunk {
+                decode_start: keep_from.saturating_sub(CHUNK_WARMUP),
+                keep_from,
+                keep_to,
+            }
+        })
+        .collect()
 }
 
 /// Codecs for which passing `-hwaccel` to ffmpeg is worthwhile. Intra-only
@@ -711,23 +858,53 @@ pub fn choose_hwaccel(codec_name: &str, file_path: &str, available: Option<&str>
     }
 }
 
+/// How to run one raw stats pass (one ffmpeg process).
+#[derive(Debug, Clone, Default)]
+pub struct RawRunOptions {
+    /// Passed to ffmpeg's `-hwaccel` (callers decide; see `choose_hwaccel`).
+    pub hwaccel: Option<String>,
+    /// First frame to decode, counted from the start of the file. 0 = no
+    /// seek. Anything else seeks with `-ss` before `-i`, which ffmpeg makes
+    /// frame-accurate by decoding from the preceding keyframe and dropping
+    /// frames before the target; only intra-only CFR sources are chunked, so
+    /// that is exact and cheap.
+    pub start_frame: u64,
+    /// Frame rate (num, den) — needed to turn `start_frame` into a time.
+    pub fps: (u32, u32),
+    /// `-frames:v`
+    pub frame_limit: Option<u64>,
+    /// Denominator for progress callbacks; may be an estimate, never used to
+    /// stop decoding.
+    pub progress_total: Option<u64>,
+    /// Stats worker threads (default: all cores).
+    pub workers: Option<usize>,
+    /// ffmpeg decoder threads (default: ffmpeg's own choice).
+    pub decoder_threads: Option<usize>,
+    /// Bytes of decoded frames allowed in flight (default 1 GiB).
+    pub buffer_bytes: Option<usize>,
+}
+
+/// Seek target for `start_frame`: half a frame before its nominal time, so
+/// timestamp rounding can't drop the frame itself or let the one before in.
+pub fn seek_seconds(start_frame: u64, fps: (u32, u32)) -> f64 {
+    let (num, den) = (fps.0.max(1) as f64, fps.1.max(1) as f64);
+    (start_frame as f64 - 0.5).max(0.0) * den / num
+}
+
 /// Decode `file_path` with ffmpeg and compute per-frame statistics.
 ///
-/// `hwaccel` is passed through to ffmpeg's `-hwaccel` for the input (only
-/// useful for codecs the GPU can decode; callers decide). `frame_limit`
-/// becomes `-frames:v`; `progress_total` is the denominator for progress
-/// callbacks and may be an estimate (it is never used to stop decoding).
 /// The ffmpeg child is attached to `process_handle` so the app can cancel it
 /// or kill it on exit (see `engine::process` for the conventions).
 pub fn run_raw_stats(
     file_path: &str,
     fmt: &RawFormat,
-    hwaccel: Option<&str>,
-    frame_limit: Option<u64>,
-    progress_total: Option<u64>,
+    opts: &RawRunOptions,
     progress: Option<ProgressFn>,
     process_handle: crate::engine::analysis::ProcessHandle,
 ) -> Result<(Vec<FrameStats>, RunReport), RawStatsError> {
+    let hwaccel = opts.hwaccel.as_deref();
+    let frame_limit = opts.frame_limit;
+    let progress_total = opts.progress_total;
     // A zero-sized frame would make the reader "read" empty frames forever
     // without touching the pipe (ffprobe reports 0×0 when it can't work out
     // the stream's parameters).
@@ -754,6 +931,15 @@ pub fn run_raw_stats(
         if !is_concat_manifest(file_path) {
             args.extend(["-hwaccel".into(), hw.to_string()]);
         }
+    }
+    if let Some(t) = opts.decoder_threads {
+        args.extend(["-threads".into(), t.max(1).to_string()]);
+    }
+    if opts.start_frame > 0 {
+        args.extend([
+            "-ss".into(),
+            format!("{:.6}", seek_seconds(opts.start_frame, opts.fps)),
+        ]);
     }
     // Keep the stored orientation: the frame geometry comes from ffprobe's
     // (unrotated) width/height, so auto-rotating would transpose the planes
@@ -800,13 +986,28 @@ pub fn run_raw_stats(
         .stderr
         .take()
         .ok_or_else(|| RawStatsError::new("Failed to get ffmpeg stderr", 0))?;
-    if !process_handle.attach(child) {
+    // Larger pipe buffer: a UHD 10-bit frame is 33 MB, i.e. ~500 handoffs
+    // between ffmpeg and us through the default 64 KB pipe. 1 MB (the usual
+    // unprivileged maximum) measured ~7% faster for UHD raw output. Linux
+    // only; elsewhere the default stays.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stdout.as_raw_fd();
+        for size in [1 << 20, 256 << 10] {
+            if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size as libc::c_int) } > 0 {
+                break;
+            }
+        }
+    }
+
+    let Some(child_id) = process_handle.attach(child) else {
         return Err(RawStatsError {
             message: "Analysis cancelled".into(),
             frames_read: 0,
             killed: true,
         });
-    }
+    };
 
     // ── stderr: keep a tail for error reporting ──
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -838,14 +1039,15 @@ pub fn run_raw_stats(
 
     // ── worker pool ──
     let frame_bytes = fmt.frame_bytes();
-    let n_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    let n_workers = opts
+        .workers
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .max(1);
     // Frames in flight: enough to keep every worker busy plus a little
     // read-ahead, bounded by the memory budget. Each job also pins its
     // predecessor, so the pool needs one extra.
-    let max_buffers = (IN_FLIGHT_BYTES / frame_bytes.max(1)).clamp(3, 2 * n_workers + 2);
+    let budget = opts.buffer_bytes.unwrap_or(IN_FLIGHT_BYTES);
+    let max_buffers = (budget / frame_bytes.max(1)).clamp(3, (2 * n_workers + 2).max(3));
 
     let (job_tx, job_rx) = mpsc::sync_channel::<Job>(max_buffers);
     let job_rx = Arc::new(Mutex::new(job_rx));
@@ -989,7 +1191,7 @@ pub fn run_raw_stats(
     // end, or the wait() below would block forever. The child stays in the
     // handle so this isn't mistaken for an external kill.
     if read_err.is_some() {
-        process_handle.kill_attached();
+        process_handle.kill_attached(child_id);
     }
     drop(reader);
 
@@ -1004,7 +1206,7 @@ pub fn run_raw_stats(
     let mut out = match collected {
         Ok(out) if !worker_failed && out.len() as u64 == frames_read => out,
         Ok(out) => {
-            process_handle.kill_attached();
+            process_handle.kill_attached(child_id);
             if read_err.is_none() {
                 read_err = Some(format!(
                     "stats worker failed: computed {} of {} frames",
@@ -1015,7 +1217,7 @@ pub fn run_raw_stats(
             Vec::new()
         }
         Err(_) => {
-            process_handle.kill_attached();
+            process_handle.kill_attached(child_id);
             if read_err.is_none() {
                 read_err = Some("stats collector thread panicked".into());
             }
@@ -1024,7 +1226,7 @@ pub fn run_raw_stats(
     };
 
     // ── ffmpeg exit status ──
-    let mut child_opt = process_handle.detach();
+    let mut child_opt = process_handle.detach(child_id);
     let status = match child_opt.as_mut() {
         Some(c) => c.wait().map_err(|e| {
             RawStatsError::new(format!("Failed to wait for ffmpeg: {e}"), frames_read)
@@ -1281,6 +1483,45 @@ mod tests {
     }
 
     #[test]
+    fn chunk_plan_is_contiguous_with_warmup() {
+        let c = plan_chunks(1000, 3);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0], Chunk { decode_start: 0, keep_from: 0, keep_to: 333 });
+        assert_eq!(c[1], Chunk { decode_start: 329, keep_from: 333, keep_to: 666 });
+        assert_eq!(c[2], Chunk { decode_start: 662, keep_from: 666, keep_to: 1000 });
+        for w in c.windows(2) {
+            assert_eq!(w[0].keep_to, w[1].keep_from, "no gap or overlap in kept frames");
+        }
+        assert_eq!(c.iter().map(|k| k.keep_to - k.keep_from).sum::<u64>(), 1000);
+        assert_eq!(c[1].warmup(), CHUNK_WARMUP);
+        assert_eq!(plan_chunks(5, 8).len(), 5);
+    }
+
+    #[test]
+    fn chunk_count_rules() {
+        let prores = ChunkSource { codec_name: "prores", total_frames: Some(24 * 3600), cfr: true, concat: false, hwaccel: false };
+        assert_eq!(chunk_count(None, &prores, 64).0, 6);
+        assert_eq!(chunk_count(None, &prores, 8).0, 1);
+        assert_eq!(chunk_count(Some(3), &prores, 8).0, 3, "user choice wins over cores");
+        assert_eq!(chunk_count(Some(1), &prores, 64).0, 1);
+        assert_eq!(chunk_count(Some(99), &prores, 64).0, MAX_CHUNKS);
+        let short = ChunkSource { total_frames: Some(600), ..prores.clone() };
+        assert_eq!(chunk_count(Some(8), &short, 64).0, 2, "≥240 frames per chunk");
+        for (src, why) in [
+            (ChunkSource { codec_name: "hevc", ..prores.clone() }, "intra-only"),
+            (ChunkSource { cfr: false, ..prores.clone() }, "variable"),
+            (ChunkSource { total_frames: None, ..prores.clone() }, "unknown length"),
+            (ChunkSource { concat: true, ..prores.clone() }, "concat"),
+        ] {
+            let (n, reason) = chunk_count(Some(6), &src, 64);
+            assert_eq!(n, 1);
+            assert!(reason.contains(why), "{reason}");
+        }
+        assert!((seek_seconds(48, (24, 1)) - 47.5 / 24.0).abs() < 1e-12);
+        assert_eq!(seek_seconds(0, (24, 1)), 0.0);
+    }
+
+    #[test]
     fn hwaccel_policy() {
         assert_eq!(choose_hwaccel("hevc", "/a.mov", Some("cuda")), Some("cuda".into()));
         assert_eq!(choose_hwaccel("H264", "/a.mp4", Some("videotoolbox")), Some("videotoolbox".into()));
@@ -1294,7 +1535,7 @@ mod tests {
         let f = fmt("yuv420p", 0, 0);
         let t = std::time::Instant::now();
         let r = run_raw_stats(
-            "/nonexistent.mov", &f, None, None, None, None,
+            "/nonexistent.mov", &f, &RawRunOptions::default(), None,
             crate::engine::process::standalone_job(),
         );
         let e = r.unwrap_err();
@@ -1326,7 +1567,7 @@ mod tests {
         let clip_s = clip.to_string_lossy().to_string();
 
         // Sanity: the clean run returns every frame.
-        let (ok, report) = run_raw_stats(&clip_s, &f, None, None, None, None,
+        let (ok, report) = run_raw_stats(&clip_s, &f, &RawRunOptions::default(), None,
                                crate::engine::process::standalone_job()).unwrap();
         assert_eq!(ok.len(), 400);
         assert_eq!(report.frames, 400);
@@ -1334,7 +1575,7 @@ mod tests {
 
         PANIC_AT_FRAME.store(5, std::sync::atomic::Ordering::Relaxed);
         let t = std::time::Instant::now();
-        let r = run_raw_stats(&clip_s, &f, None, None, None, None,
+        let r = run_raw_stats(&clip_s, &f, &RawRunOptions::default(), None,
                               crate::engine::process::standalone_job());
         PANIC_AT_FRAME.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&dir);

@@ -92,6 +92,13 @@
   let wantPsnr: boolean = $state(false);
   let wantSsim: boolean = $state(false);
   let subsample: number = $state(1);
+  // Levels: parallel ffmpeg decodes (0 = auto). Lower it for slow disks or
+  // network shares, where parallel reads just compete.
+  let parallelDecodes: number = $state(0);
+  const PARALLEL_OPTIONS = [1, 2, 3, 4, 6, 8, 12, 16];
+  // Mirrors rawstats::auto_chunks (the engine still falls back to one
+  // process for sources that can't be split exactly).
+  const autoParallel = Math.min(8, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 10)));
 
   // Analysis results
   let summary: AnalysisSummary | null = $state(null);
@@ -565,6 +572,7 @@
         psnr: wantPsnr,
         ssim: wantSsim,
         subsample,
+        chunks: analysisMode === "levels" && parallelDecodes > 0 ? parallelDecodes : undefined,
         log_path: cacheInfo?.path,
         force: true,
       });
@@ -999,6 +1007,17 @@
         {/if}
 
         {#if analysisMode === "levels" && refProbe}
+          <div class="options-row">
+            <label title="How many ffmpeg processes decode the file side by side. One ffmpeg tops out around 60 fps for UHD 10-bit; more lift that on fast local storage. Lower it for slow disks or network shares. Only intra-frame, constant-rate files (ProRes, DNxHR, …) can be split.">
+              Parallel decodes
+              <select bind:value={parallelDecodes}>
+                <option value={0}>Auto ({autoParallel})</option>
+                {#each PARALLEL_OPTIONS as n}
+                  <option value={n}>{n}{n === 1 ? " (no split)" : ""}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
           <button class="primary analyze-btn" onclick={startAnalysis}>
             {cacheInfo?.exists ? "Re-analyze" : "Analyze"}
           </button>

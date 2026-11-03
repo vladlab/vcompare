@@ -214,6 +214,8 @@ export interface AnalyzeParams {
   ssim?: boolean;
   log_path?: string;
   force?: boolean;
+  /** Levels: parallel ffmpeg decodes; omit (or 0) for auto */
+  chunks?: number;
 }
 
 export interface GetFramesParams {
