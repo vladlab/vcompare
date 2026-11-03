@@ -525,15 +525,19 @@
     flex-shrink: 0;
     cursor: pointer;
   }
+  /* Every tile is exactly the same box whether it holds an image, a dash or a
+     placeholder: fixed image height, fixed label line, no baseline gaps. */
+  .thumb { height: 76px; box-sizing: border-box; }
   .thumb img { height: 54px; display: block; border-radius: 2px; }
   .thumb-empty { height: 54px; width: 96px; display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
+  .thumb-tc { display: block; height: 14px; line-height: 14px; }
   .thumb.in-run { border-color: var(--warning); }
   .thumb.placeholder { cursor: default; }
   .thumb.placeholder .thumb-empty { width: 96px; background: var(--bg-raised); border-radius: 2px; }
   .thumb.placeholder.in-run { border-color: color-mix(in srgb, var(--warning) 40%, transparent); }
   .preview.loading .thumb { opacity: 0.6; }
   .thumb.at-cursor { outline: 1px solid var(--text-primary); }
-  .thumb-tc { font-size: 10px; color: var(--text-muted); }
+  .thumb-tc { font-size: 10px; color: var(--text-muted); white-space: nowrap; }
   .thumb.in-run .thumb-tc { color: var(--warning); }
   .preview-loading { font-size: 11px; }
   .row:hover { background: var(--bg-hover); }
