@@ -33,6 +33,8 @@
     onReview: (frame: number, review: EventReview | null) => void;
     /** Thumbnails around the picked event (null while loading / none) */
     preview: PreviewRow[] | null;
+    /** How many files the analysis has (rows to reserve before any preview) */
+    previewRows: number;
     onExport: () => void;
     onExportEdl: () => void;
   }
@@ -48,6 +50,7 @@
     onSelect,
     onReview,
     preview,
+    previewRows,
     onExport,
     onExportEdl,
   }: Props = $props();
@@ -219,15 +222,20 @@
       </label>
     </div>
 
-    <!-- Preview of the picked event: frame before, the run, frame after -->
-    {#if selectedIndex >= 0}
-      <div class="preview">
-        {#if preview}
-          {#each preview as row (row.label)}
-            <div class="preview-row">
-              {#if preview.length > 1}<span class="preview-label">{row.label}</span>{/if}
+    <!-- Preview of the picked event: frame before, the run, frame after.
+         The strip always takes the same space once there are events, and
+         shows placeholder tiles while frames load, so the panel doesn't
+         jump as previews come and go. -->
+    {#if events.length > 0 || selectedIndex >= 0}
+      {@const ev = selectedIndex >= 0 ? events[selectedIndex] : null}
+      {@const rowCount = preview?.length ?? previewRows}
+      <div class="preview" class:loading={ev != null && !preview}>
+        {#each Array.from({ length: rowCount }, (_, r) => r) as r (r)}
+          {@const row = preview?.[r] ?? null}
+          <div class="preview-row">
+            {#if rowCount > 1}<span class="preview-label">{row?.label ?? (r === 0 ? "REF" : "DIST")}</span>{/if}
+            {#if row && ev}
               {#each row.frames as f, k (f.frame)}
-                {@const ev = events[selectedIndex]}
                 {@const inRun = f.frame >= ev.frame && f.frame < ev.frame + ev.length}
                 <button
                   class="thumb"
@@ -244,11 +252,17 @@
                   <span class="thumb-tc mono">{k === 0 ? "prev" : inRun ? (ev.length > 1 ? `flash ${f.frame - ev.frame + 1}` : "flash") : "next"}</span>
                 </button>
               {/each}
-            </div>
-          {/each}
-        {:else}
-          <span class="preview-loading text-muted">loading frames…</span>
-        {/if}
+            {:else}
+              <!-- placeholders: same footprint as the real tiles -->
+              {#each Array.from({ length: (ev?.length ?? 1) + 2 }, (_, k) => k) as k (k)}
+                <div class="thumb placeholder" class:in-run={ev != null && k > 0 && k <= ev.length}>
+                  <span class="thumb-empty"></span>
+                  <span class="thumb-tc mono">{ev ? (k === 0 ? "prev" : k <= ev.length ? "flash" : "next") : "\u00a0"}</span>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        {/each}
       </div>
     {/if}
 
@@ -514,6 +528,10 @@
   .thumb img { height: 54px; display: block; border-radius: 2px; }
   .thumb-empty { height: 54px; width: 96px; display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
   .thumb.in-run { border-color: var(--warning); }
+  .thumb.placeholder { cursor: default; }
+  .thumb.placeholder .thumb-empty { width: 96px; background: var(--bg-raised); border-radius: 2px; }
+  .thumb.placeholder.in-run { border-color: color-mix(in srgb, var(--warning) 40%, transparent); }
+  .preview.loading .thumb { opacity: 0.6; }
   .thumb.at-cursor { outline: 1px solid var(--text-primary); }
   .thumb-tc { font-size: 10px; color: var(--text-muted); }
   .thumb.in-run .thumb-tc { color: var(--warning); }

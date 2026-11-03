@@ -209,6 +209,7 @@
       eventPreview = cached;
       return;
     }
+    // Not cached: show placeholders (keeping the strip's size) until it lands.
     eventPreview = null;
     const req = ++previewRequest;
     previewFrames(frame - 1, ev.length + 2, PREVIEW_HEIGHT)
@@ -1350,6 +1351,7 @@
               onSelect={selectEvent}
               onReview={handleReview}
               preview={eventPreview}
+              previewRows={summary?.mode === "levels" ? 1 : 2}
               onExport={handleExportEvents}
               onExportEdl={handleExportEdl}
             />
