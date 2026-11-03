@@ -110,6 +110,13 @@ export interface FrameData {
   v_min?: number | null;
   v_max?: number | null;
   y_avg?: number | null;
+  u_avg?: number | null;
+  v_avg?: number | null;
+  /** Thumbnail difference vs 1..4 frames back (0..1) — native engine only */
+  tdif_1?: number | null;
+  tdif_2?: number | null;
+  tdif_3?: number | null;
+  tdif_4?: number | null;
   y_dif?: number | null;
   u_dif?: number | null;
   v_dif?: number | null;

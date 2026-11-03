@@ -543,47 +543,88 @@ pub fn run_vmaf_analysis(
 
 // ─── Levels analysis (single file) ─────────────────────────────────────────
 
-/// Run single-file levels analysis using FFmpeg's signalstats filter.
+/// Run a single-file levels analysis with the native stats engine.
 ///
-/// Extracts per-frame min/max/avg YUV values and temporal differences, in
-/// native code values of the file's pixel format.
+/// ffmpeg decodes to a rawvideo pipe in the source's own depth/subsampling
+/// and `rawstats` computes per-frame statistics on a worker pool (see
+/// `engine/rawstats.rs`). Returns frame JSON objects in display frame space.
+///
+/// `hwaccel_available` is what `probe::detect_hwaccel()` found; it is only
+/// used for codecs with hardware decoders. A listed hwaccel doesn't mean a
+/// device exists (an NVIDIA-enabled ffmpeg on a machine without the driver
+/// fails before the first frame), so a hw attempt that dies having read no
+/// frames is retried in software.
+///
+/// `publish` is called with the diagnostics lines whenever they change so
+/// the progress screen can show them.
 pub fn run_levels_analysis(
     file_path: &str,
-    tc_fmt: &TimecodeFormat,
-    start_frame: i64,
-    total_frames: Option<u64>,
+    info: &SingleFileInfo,
+    hwaccel_available: Option<&str>,
     progress: Option<ProgressFn>,
     process_handle: ProcessHandle,
+    diagnostics: &mut Vec<String>,
+    publish: &dyn Fn(&[String]),
 ) -> Result<Vec<Value>, String> {
-    let stats_dir = std::env::temp_dir().join(format!("vcompare_levels_{}", std::process::id()));
-    std::fs::create_dir_all(&stats_dir)
-        .map_err(|e| format!("Failed to create temp dir: {e}"))?;
-    let stats_path = stats_dir.join("signalstats.txt");
-    let stats_path_str = stats_path.to_string_lossy().to_string();
+    use crate::engine::rawstats::{choose_hwaccel, run_raw_stats, RawFormat};
 
-    let filter = format!("signalstats,metadata=mode=print:file={stats_path_str}");
+    let fmt = RawFormat::for_source(&info.pix_fmt, info.width, info.height);
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let hw = choose_hwaccel(&info.codec_name, file_path, hwaccel_available);
 
-    let mut args: Vec<String> = vec!["-y".into()];
-    if is_concat_manifest(file_path) {
-        args.extend(["-f".into(), "concat".into(), "-safe".into(), "0".into()]);
-    }
-    args.extend(["-i".into(), file_path.into()]);
-    args.extend(["-vf".into(), filter]);
-    if let Some(total) = total_frames {
-        args.extend(["-frames:v".into(), total.to_string()]);
-    }
-    args.extend(["-f".into(), "null".into(), "-".into()]);
+    diagnostics.push(format!("stats: native ({workers} workers)"));
+    diagnostics.push(format!(
+        "decode: {}{}",
+        if info.codec_name.is_empty() { "?" } else { &info.codec_name },
+        hw.as_deref().map(|h| format!(" [{h}]")).unwrap_or_default()
+    ));
+    diagnostics.push(format!("raw: {} {}x{}", fmt.pix_fmt, fmt.width, fmt.height));
+    publish(diagnostics);
 
-    eprintln!("[vcompare] cmd: ffmpeg {}", args.join(" "));
+    // The progress callback may be needed twice (hw attempt + software
+    // retry); share it behind a mutex and hand each attempt a thin wrapper.
+    let shared_progress = progress.map(|p| std::sync::Arc::new(Mutex::new(p)));
+    let attempt_progress = || -> Option<ProgressFn> {
+        shared_progress.as_ref().map(|p| {
+            let p = p.clone();
+            Box::new(move |c: u64, t: u64| (p.lock().unwrap())(c, t)) as ProgressFn
+        })
+    };
 
-    run_ffmpeg_with_progress(&args, total_frames, progress, process_handle)?;
+    let stats = match run_raw_stats(
+        file_path,
+        &fmt,
+        hw.as_deref(),
+        info.total_frames,
+        attempt_progress(),
+        process_handle.clone(),
+    ) {
+        Ok(s) => s,
+        Err(e) if hw.is_some() && !e.killed && e.frames_read == 0 => {
+            eprintln!("[vcompare] hw decode failed, retrying in software: {}", e.message);
+            diagnostics.push(format!(
+                "decode: {} unavailable — software decode",
+                hw.as_deref().unwrap_or("")
+            ));
+            publish(diagnostics);
+            run_raw_stats(
+                file_path,
+                &fmt,
+                None,
+                info.total_frames,
+                attempt_progress(),
+                process_handle,
+            )?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
-    let frames = parse_signalstats_metadata(&stats_path_str, tc_fmt, start_frame)?;
-
-    let _ = std::fs::remove_file(&stats_path);
-    let _ = std::fs::remove_dir(&stats_dir);
-
-    Ok(frames)
+    let tc = &info.tc_fmt;
+    Ok(stats
+        .iter()
+        .enumerate()
+        .map(|(i, s)| s.to_json(info.start_frame + i as i64, tc))
+        .collect())
 }
 
 /// What a single-file (levels) analysis needs to know about its input.
@@ -647,102 +688,6 @@ pub fn prepare_single_file(
         height: info.height,
         codec_name,
     })
-}
-
-/// Parse signalstats metadata output.
-///
-/// Format:
-/// ```text
-/// frame:0          pts:0        pts_time:0
-/// lavfi.signalstats.YMIN=16
-/// lavfi.signalstats.YMAX=235
-/// lavfi.signalstats.UMIN=110
-/// lavfi.signalstats.UMAX=140
-/// lavfi.signalstats.VMIN=115
-/// lavfi.signalstats.VMAX=145
-/// ...
-/// ```
-///
-/// Note: `YBITDEPTH` in this output is the number of significant bits the
-/// frame actually uses, not the pixel format's depth, so it is ignored.
-fn parse_signalstats_metadata(
-    stats_path: &str,
-    tc_fmt: &TimecodeFormat,
-    start_frame: i64,
-) -> Result<Vec<Value>, String> {
-    let content = std::fs::read_to_string(stats_path)
-        .map_err(|e| format!("Failed to read signalstats: {e}"))?;
-    parse_signalstats_text(&content, tc_fmt, start_frame)
-}
-
-/// Parse signalstats `metadata=print` text into per-frame JSON values.
-pub fn parse_signalstats_text(
-    content: &str,
-    tc_fmt: &TimecodeFormat,
-    start_frame: i64,
-) -> Result<Vec<Value>, String> {
-    let frame_re = Regex::new(r"^frame:(\d+)").unwrap();
-    let kv_re = Regex::new(r"^lavfi\.signalstats\.(\w+)=([\d.]+)").unwrap();
-
-    let mut frames = Vec::new();
-    let mut current_frame: Option<i64> = None;
-    let mut current_vals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-
-    // All values are in native code values of the decoded pixel format
-    // (signalstats runs at the file's own bit depth). `bit_depth` is
-    // reported alongside so consumers can normalize.
-    let flush = |frame_num: i64,
-                 vals: &std::collections::HashMap<String, f64>,
-                 tc_fmt: &TimecodeFormat,
-                 start_frame: i64,
-                 frames: &mut Vec<Value>| {
-        let display_frame = frame_num + start_frame;
-        let g = |k: &str| vals.get(k).copied().unwrap_or(0.0);
-        frames.push(serde_json::json!({
-            "frame": display_frame,
-            "tc": tc_fmt.frame_to_tc(display_frame),
-            "y_min": g("YMIN"),
-            "y_max": g("YMAX"),
-            "u_min": g("UMIN"),
-            "u_max": g("UMAX"),
-            "v_min": g("VMIN"),
-            "v_max": g("VMAX"),
-            // Temporal / average stats used by the event detector
-            "y_avg": round4(g("YAVG")),
-            "y_dif": round4(g("YDIF")),
-            "u_dif": round4(g("UDIF")),
-            "v_dif": round4(g("VDIF")),
-            "sat_avg": round4(g("SATAVG")),
-        }));
-    };
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if let Some(caps) = frame_re.captures(line) {
-            // Flush previous frame
-            if let Some(fn_) = current_frame {
-                flush(fn_, &current_vals, tc_fmt, start_frame, &mut frames);
-            }
-            current_frame = caps[1].parse::<i64>().ok();
-            current_vals.clear();
-        } else if let Some(caps) = kv_re.captures(line) {
-            let key = caps[1].to_string();
-            if let Ok(val) = caps[2].parse::<f64>() {
-                current_vals.insert(key, val);
-            }
-        }
-    }
-
-    // Flush last frame
-    if let Some(fn_) = current_frame {
-        flush(fn_, &current_vals, tc_fmt, start_frame, &mut frames);
-    }
-
-    Ok(frames)
 }
 
 // ─── FFmpeg process management ──────────────────────────────────────────────

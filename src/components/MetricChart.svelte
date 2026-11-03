@@ -65,6 +65,8 @@
     v_min:  { color: "#c04070", label: "V Min (Cr)" },
     v_max:  { color: "#f070a0", label: "V Max (Cr)" },
     y_avg:  { color: "#d8b848", label: "Y Avg" },
+    u_avg:  { color: "#58a8d8", label: "U Avg (Cb)" },
+    v_avg:  { color: "#d85888", label: "V Avg (Cr)" },
     y_dif:  { color: "#e8e8e8", label: "Y Dif (vs prev)" },
     u_dif:  { color: "#70c0f0", label: "U Dif (vs prev)" },
     v_dif:  { color: "#f070a0", label: "V Dif (vs prev)" },

@@ -439,14 +439,16 @@ async fn _run_levels_analysis(
     let app_clone = app.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut diagnostics = vec!["mode: levels (signalstats)".into()];
+        let mut diagnostics = vec!["mode: levels".into()];
 
         let info = engine::analysis::prepare_single_file(&file_path, &mut diagnostics)?;
-        let engine::analysis::SingleFileInfo {
-            ref tc_fmt, start_frame, total_frames, bit_depth, ..
-        } = info;
+        let hwaccel = engine::probe::detect_hwaccel();
 
-        let _ = app_clone.emit("rpc:diagnostics", json!({"lines": diagnostics}));
+        let app_diag = app_clone.clone();
+        let publish = move |lines: &[String]| {
+            let _ = app_diag.emit("rpc:diagnostics", json!({"lines": lines}));
+        };
+        publish(&diagnostics);
 
         let app_progress = app_clone.clone();
         let progress: engine::analysis::ProgressFn = Box::new(move |current, total| {
@@ -455,22 +457,25 @@ async fn _run_levels_analysis(
 
         let frames = engine::analysis::run_levels_analysis(
             &file_path,
-            tc_fmt,
-            start_frame,
-            total_frames,
+            &info,
+            hwaccel.as_deref(),
             Some(progress),
             process_handle,
+            &mut diagnostics,
+            &publish,
         )?;
 
-        eprintln!("[vcompare] Parsed {} levels frames ({bit_depth}-bit)", frames.len());
+        eprintln!("[vcompare] {} levels frames ({}-bit)", frames.len(), info.bit_depth);
 
+        let tc_fmt = &info.tc_fmt;
         let result = json!({
             "mode": "levels",
+            "stats_engine": "native",
             "frames": frames,
             "ref_path": file_path,
-            "ref_start_frame": start_frame,
-            "ref_file_start_tc": start_frame,
-            "bit_depth": bit_depth,
+            "ref_start_frame": info.start_frame,
+            "ref_file_start_tc": info.start_frame,
+            "bit_depth": info.bit_depth,
             "tc_format": {
                 "fps_num": tc_fmt.fps_num,
                 "fps_den": tc_fmt.fps_den,

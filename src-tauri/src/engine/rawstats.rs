@@ -405,6 +405,57 @@ fn compute_frame(fmt: &RawFormat, frame: &[u8], prev: Option<&[u8]>) -> (FrameSt
 
 // ─── Driver ─────────────────────────────────────────────────────────────────
 
+/// Why a raw stats pass failed, with enough context for the caller to decide
+/// whether a retry makes sense.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawStatsError {
+    pub message: String,
+    /// Complete frames read from ffmpeg before the failure.
+    pub frames_read: u64,
+    /// The ffmpeg child was taken out of the process handle by someone else
+    /// (app quit / cancel) — never retry this.
+    pub killed: bool,
+}
+
+impl RawStatsError {
+    fn new(message: impl Into<String>, frames_read: u64) -> Self {
+        Self { message: message.into(), frames_read, killed: false }
+    }
+}
+
+impl std::fmt::Display for RawStatsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<RawStatsError> for String {
+    fn from(e: RawStatsError) -> String {
+        e.message
+    }
+}
+
+/// Codecs for which passing `-hwaccel` to ffmpeg is worthwhile. Intra-only
+/// mastering codecs (ProRes, DNxHR, FFV1, …) have no hardware decoders.
+pub const HW_DECODE_CODECS: &[&str] =
+    &["h264", "hevc", "av1", "vp9", "mpeg2video", "mpeg4", "vc1"];
+
+/// Decide whether to hw-decode this input. `available` is what
+/// `probe::detect_hwaccel()` found in this ffmpeg build — which says nothing
+/// about whether a device actually exists, so callers must be ready to fall
+/// back (see `analysis::run_levels_analysis`).
+pub fn choose_hwaccel(codec_name: &str, file_path: &str, available: Option<&str>) -> Option<String> {
+    let hw = available?;
+    if is_concat_manifest(file_path) {
+        return None;
+    }
+    if HW_DECODE_CODECS.contains(&codec_name.to_ascii_lowercase().as_str()) {
+        Some(hw.to_string())
+    } else {
+        None
+    }
+}
+
 /// Decode `file_path` with ffmpeg and compute per-frame statistics.
 ///
 /// `hwaccel` is passed through to ffmpeg's `-hwaccel` for the input (only
@@ -418,7 +469,7 @@ pub fn run_raw_stats(
     total_frames: Option<u64>,
     progress: Option<ProgressFn>,
     process_handle: crate::engine::analysis::ProcessHandle,
-) -> Result<Vec<FrameStats>, String> {
+) -> Result<Vec<FrameStats>, RawStatsError> {
     // ── ffmpeg command ──
     let mut args: Vec<String> = vec!["-nostdin".into(), "-hide_banner".into()];
     if let Some(hw) = hwaccel {
@@ -452,25 +503,17 @@ pub fn run_raw_stats(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn ffmpeg: {e}"))?;
+        .map_err(|e| RawStatsError::new(format!("Failed to spawn ffmpeg: {e}"), 0))?;
 
-    let stdout = child.stdout.take().ok_or("Failed to get ffmpeg stdout")?;
-    let stderr = child.stderr.take().ok_or("Failed to get ffmpeg stderr")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RawStatsError::new("Failed to get ffmpeg stdout", 0))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RawStatsError::new("Failed to get ffmpeg stderr", 0))?;
     *process_handle.lock().unwrap() = Some(child);
-
-    // A UHD 10-bit frame is ~33 MB; with the default 64 KB pipe that is
-    // hundreds of read/write syscalls per frame. Ask for the largest pipe
-    // the kernel allows an unprivileged process (usually 1 MB).
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = stdout.as_raw_fd();
-        for size in [4 << 20, 1 << 20] {
-            if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size as libc::c_int) } > 0 {
-                break;
-            }
-        }
-    }
 
     // ── stderr: keep a tail for error reporting ──
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -629,7 +672,10 @@ pub fn run_raw_stats(
     drop(prev);
     drop(job_tx);
 
-    let mut out = collector.join().map_err(|_| "collector thread panicked")?;
+    let frames_read = index;
+    let mut out = collector
+        .join()
+        .map_err(|_| RawStatsError::new("collector thread panicked", frames_read))?;
     for w in workers {
         let _ = w.join();
     }
@@ -637,20 +683,31 @@ pub fn run_raw_stats(
     // ── ffmpeg exit status ──
     let mut child_opt = process_handle.lock().unwrap().take();
     let status = match child_opt.as_mut() {
-        Some(c) => c.wait().map_err(|e| format!("Failed to wait for ffmpeg: {e}"))?,
-        None => return Err("ffmpeg process was killed externally".into()),
+        Some(c) => c.wait().map_err(|e| {
+            RawStatsError::new(format!("Failed to wait for ffmpeg: {e}"), frames_read)
+        })?,
+        None => {
+            return Err(RawStatsError {
+                message: "ffmpeg process was killed externally".into(),
+                frames_read,
+                killed: true,
+            })
+        }
     };
     let _ = stderr_thread.join();
 
     if let Some(e) = read_err {
-        return Err(e);
+        return Err(RawStatsError::new(e, frames_read));
     }
     if !status.success() {
         let tail: Vec<String> = stderr_tail.lock().unwrap().iter().cloned().collect();
-        return Err(format!(
-            "FFmpeg exited with code {}\n\n{}",
-            status.code().unwrap_or(-1),
-            tail.join("\n")
+        return Err(RawStatsError::new(
+            format!(
+                "FFmpeg exited with code {}\n\n{}",
+                status.code().unwrap_or(-1),
+                tail.join("\n")
+            ),
+            frames_read,
         ));
     }
 
@@ -683,6 +740,7 @@ fn read_frame<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<bool, String> {
 
 /// Exposed for benchmarking only.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn bench_compute(fmt: &RawFormat, frame: &[u8], prev: Option<&[u8]>) -> (FrameStats, Vec<f32>) {
     compute_frame(fmt, frame, prev)
 }
@@ -784,6 +842,15 @@ mod tests {
         let (sb, tb) = compute_frame(&f, &b, None);
         assert_eq!(sa.y_avg, sb.y_avg);
         assert!((thumb_distance(&ta, &tb) - 144.0 / 255.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn hwaccel_policy() {
+        assert_eq!(choose_hwaccel("hevc", "/a.mov", Some("cuda")), Some("cuda".into()));
+        assert_eq!(choose_hwaccel("H264", "/a.mp4", Some("videotoolbox")), Some("videotoolbox".into()));
+        assert_eq!(choose_hwaccel("prores", "/a.mov", Some("cuda")), None);
+        assert_eq!(choose_hwaccel("dnxhd", "/a.mxf", Some("cuda")), None);
+        assert_eq!(choose_hwaccel("hevc", "/a.mov", None), None);
     }
 
     #[test]

@@ -42,6 +42,8 @@
     v_min:     { label: "V Min",    width: "70px", precision: 0 },
     v_max:     { label: "V Max",    width: "70px", precision: 0 },
     y_avg:     { label: "Y Avg",    width: "70px", precision: 1 },
+    u_avg:     { label: "U Avg",    width: "70px", precision: 1 },
+    v_avg:     { label: "V Avg",    width: "70px", precision: 1 },
     y_dif:     { label: "Y Dif",    width: "70px", precision: 2 },
     u_dif:     { label: "U Dif",    width: "70px", precision: 2 },
     v_dif:     { label: "V Dif",    width: "70px", precision: 2 },

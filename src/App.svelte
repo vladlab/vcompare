@@ -714,6 +714,8 @@
       v_min: "V Min",
       v_max: "V Max",
       y_avg: "Y Avg",
+      u_avg: "U Avg",
+      v_avg: "V Avg",
       y_dif: "Y Dif",
       u_dif: "U Dif",
       v_dif: "V Dif",

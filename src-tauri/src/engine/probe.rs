@@ -215,6 +215,8 @@ pub fn probe_file(path: &str) -> Result<ProbeResult, String> {
 pub fn detect_hwaccel() -> Option<String> {
     let candidates = if cfg!(target_os = "macos") {
         vec!["videotoolbox"]
+    } else if cfg!(target_os = "windows") {
+        vec!["cuda", "d3d11va"]
     } else {
         // Linux and others
         vec!["cuda", "vaapi"]

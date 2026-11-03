@@ -63,6 +63,15 @@ struct AnalysisMeta {
     scale_ref: bool,
 }
 
+/// Every per-frame metric a levels analysis can carry, in display order.
+const LEVELS_METRICS: &[&str] = &[
+    "y_min", "y_max", "u_min", "u_max", "v_min", "v_max",
+    "y_avg", "u_avg", "v_avg",
+    "y_dif", "u_dif", "v_dif",
+    // signalstats-era caches only
+    "sat_avg",
+];
+
 /// Thread-safe engine state, managed as Tauri state.
 pub struct EngineState {
     inner: Mutex<Inner>,
@@ -200,24 +209,20 @@ impl EngineState {
             .cloned()
             .unwrap_or_default();
 
-        let mut metrics: Vec<String> = vec![
-            "y_min".into(),
-            "y_max".into(),
-            "u_min".into(),
-            "u_max".into(),
-            "v_min".into(),
-            "v_max".into(),
-        ];
-        // Newer caches carry average / temporal-difference stats; older
-        // levels caches don't, so only advertise what is actually present.
-        let has_temporal = state
-            .frames
+        // Levels caches come in several generations (signalstats min/max
+        // only; signalstats + temporal/sat; native engine with u/v averages
+        // and later histogram stats), so advertise exactly what is present.
+        // `tdif_*` are detector inputs, not chart metrics.
+        state.metrics_available = LEVELS_METRICS
             .iter()
-            .any(|f| f.get("y_dif").and_then(|v| v.as_f64()).is_some());
-        if has_temporal {
-            metrics.extend(["y_avg", "y_dif", "u_dif", "v_dif", "sat_avg"].map(String::from));
-        }
-        state.metrics_available = metrics;
+            .filter(|m| {
+                state
+                    .frames
+                    .iter()
+                    .any(|f| f.get(**m).and_then(|v| v.as_f64()).is_some())
+            })
+            .map(|m| m.to_string())
+            .collect();
         state.analysis_mode = Some("levels".into());
         state.meta = AnalysisMeta {
             ref_path: str_field(result, "ref_path"),
