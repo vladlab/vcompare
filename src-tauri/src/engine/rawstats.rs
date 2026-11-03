@@ -549,6 +549,10 @@ struct WorkerOut {
     thumb: Vec<f32>,
 }
 
+/// Test-only fault injection: panic in the worker computing this frame.
+#[cfg(test)]
+static PANIC_AT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 fn compute_frame(fmt: &RawFormat, frame: &[u8], prev: Option<&[u8]>) -> (FrameStats, Vec<f32>) {
     let two = fmt.bytes_per_sample() == 2;
     let bins = 1usize << fmt.bit_depth;
@@ -676,6 +680,19 @@ pub fn run_raw_stats(
     progress: Option<ProgressFn>,
     process_handle: crate::engine::analysis::ProcessHandle,
 ) -> Result<Vec<FrameStats>, RawStatsError> {
+    // A zero-sized frame would make the reader "read" empty frames forever
+    // without touching the pipe (ffprobe reports 0×0 when it can't work out
+    // the stream's parameters).
+    if fmt.width == 0 || fmt.height == 0 || fmt.frame_bytes() == 0 {
+        return Err(RawStatsError::new(
+            format!(
+                "Can't analyse this file: ffprobe reported a {}x{} video stream",
+                fmt.width, fmt.height
+            ),
+            0,
+        ));
+    }
+
     // ── ffmpeg command ──
     // -loglevel error: stderr is only kept for error reports (progress comes
     // from the collector), so keep the banner and stream dump out of them.
@@ -690,13 +707,22 @@ pub fn run_raw_stats(
             args.extend(["-hwaccel".into(), hw.to_string()]);
         }
     }
+    // Keep the stored orientation: the frame geometry comes from ffprobe's
+    // (unrotated) width/height, so auto-rotating would transpose the planes
+    // relative to what we think the row width is.
+    args.push("-noautorotate".into());
     if is_concat_manifest(file_path) {
         args.extend(["-f".into(), "concat".into(), "-safe".into(), "0".into()]);
     }
     args.extend(["-i".into(), file_path.into()]);
     args.extend(["-map".into(), "0:v:0".into(), "-an".into(), "-sn".into()]);
     // Emit exactly the decoded frames: no duplication/dropping to a fixed rate.
-    args.extend(["-fps_mode".into(), "passthrough".into()]);
+    // (-fps_mode arrived in ffmpeg 5.1; older builds only know -vsync.)
+    if ffmpeg_has_fps_mode() {
+        args.extend(["-fps_mode".into(), "passthrough".into()]);
+    } else {
+        args.extend(["-vsync".into(), "passthrough".into()]);
+    }
     if let Some(limit) = frame_limit {
         args.extend(["-frames:v".into(), limit.to_string()]);
     }
@@ -783,6 +809,10 @@ pub fn run_raw_stats(
                 Err(_) => break,
             };
             let prev = job.prev.as_ref().map(|p| p.data.as_slice());
+            #[cfg(test)]
+            if job.index == PANIC_AT_FRAME.load(std::sync::atomic::Ordering::Relaxed) {
+                panic!("injected worker failure at frame {}", job.index);
+            }
             let (stats, thumb) = compute_frame(&fmt, &job.frame.data, prev);
             if tx.send(WorkerOut { index: job.index, stats, thumb }).is_err() {
                 break;
@@ -886,13 +916,50 @@ pub fn run_raw_stats(
     drop(prev);
     drop(job_tx);
 
-    let frames_read = index;
-    let mut out = collector
-        .join()
-        .map_err(|_| RawStatsError::new("collector thread panicked", frames_read))?;
-    for w in workers {
-        let _ = w.join();
+    // If the reader stopped before EOF (read error, worker pool gone),
+    // ffmpeg may still be blocked writing to the pipe: kill it and close our
+    // end, or the wait() below would block forever. The child stays in the
+    // handle so this isn't mistaken for an external kill.
+    if read_err.is_some() {
+        if let Some(c) = process_handle.lock().unwrap().as_mut() {
+            let _ = c.kill();
+        }
     }
+    drop(reader);
+
+    let frames_read = index;
+    let collected = collector.join();
+    let mut worker_failed = false;
+    for w in workers {
+        worker_failed |= w.join().is_err();
+    }
+    // A failed worker loses its frame; the collector then stops at that
+    // index and would return a silently truncated list.
+    let mut out = match collected {
+        Ok(out) if !worker_failed && out.len() as u64 == frames_read => out,
+        Ok(out) => {
+            if let Some(c) = process_handle.lock().unwrap().as_mut() {
+                let _ = c.kill();
+            }
+            if read_err.is_none() {
+                read_err = Some(format!(
+                    "stats worker failed: computed {} of {} frames",
+                    out.len(),
+                    frames_read
+                ));
+            }
+            Vec::new()
+        }
+        Err(_) => {
+            if let Some(c) = process_handle.lock().unwrap().as_mut() {
+                let _ = c.kill();
+            }
+            if read_err.is_none() {
+                read_err = Some("stats collector thread panicked".into());
+            }
+            Vec::new()
+        }
+    };
 
     // ── ffmpeg exit status ──
     let mut child_opt = process_handle.lock().unwrap().take();
@@ -927,6 +994,21 @@ pub fn run_raw_stats(
 
     out.shrink_to_fit();
     Ok(out)
+}
+
+/// Whether this ffmpeg understands `-fps_mode` (5.1+). Checked once.
+fn ffmpeg_has_fps_mode() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-h", "long"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("-fps_mode"))
+            // If we can't tell, assume a current ffmpeg.
+            .unwrap_or(true)
+    })
 }
 
 /// Fill `buf` with exactly one frame. Ok(false) on clean EOF before any
@@ -1142,6 +1224,60 @@ mod tests {
         assert_eq!(choose_hwaccel("prores", "/a.mov", Some("cuda")), None);
         assert_eq!(choose_hwaccel("dnxhd", "/a.mxf", Some("cuda")), None);
         assert_eq!(choose_hwaccel("hevc", "/a.mov", None), None);
+    }
+
+    #[test]
+    fn zero_sized_stream_is_rejected_before_spawning() {
+        let f = fmt("yuv420p", 0, 0);
+        let t = std::time::Instant::now();
+        let r = run_raw_stats(
+            "/nonexistent.mov", &f, None, None, None, None,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
+        let e = r.unwrap_err();
+        assert!(e.message.contains("0x0"), "{}", e.message);
+        assert!(t.elapsed().as_secs() < 1);
+    }
+
+    /// A worker dying mid-run must produce a prompt error — not a hang
+    /// waiting on an ffmpeg blocked on a full pipe, and not a silently
+    /// truncated Ok. Needs ffmpeg on PATH; skipped otherwise.
+    #[test]
+    fn worker_failure_fails_cleanly_and_promptly() {
+        let dir = std::env::temp_dir().join(format!("vcompare_rawstats_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("t.mkv");
+        let made = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                   "-i", "testsrc2=s=640x360:r=24", "-frames:v", "400",
+                   "-c:v", "ffv1", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("ffmpeg not available; skipping");
+            return;
+        }
+        let f = fmt("yuv420p", 640, 360);
+        let clip_s = clip.to_string_lossy().to_string();
+
+        // Sanity: the clean run returns every frame.
+        let ok = run_raw_stats(&clip_s, &f, None, None, None, None,
+                               std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        assert_eq!(ok.len(), 400);
+
+        PANIC_AT_FRAME.store(5, std::sync::atomic::Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        let r = run_raw_stats(&clip_s, &f, None, None, None, None,
+                              std::sync::Arc::new(std::sync::Mutex::new(None)));
+        PANIC_AT_FRAME.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let e = r.expect_err("a worker failure must not return Ok");
+        assert!(!e.killed);
+        assert!(t.elapsed().as_secs() < 10, "took {:?}", t.elapsed());
+        eprintln!("worker failure reported as: {}", e.message);
     }
 
     #[test]

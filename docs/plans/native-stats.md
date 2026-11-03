@@ -1,9 +1,25 @@
 # Plan: native stats engine for levels (raw pipe, pure Rust)
 
-Branch: `native-stats` (off `flash-frames`). Status: the engine is
-implemented and validated in `src-tauri/src/engine/rawstats.rs` but not yet
-wired into the app. This document is the plan for wiring it in and for the
-follow-ups. Read it top to bottom before touching code.
+Branch: `native-stats` (off `flash-frames`). **Status: steps 1–7 done**
+(Nov 2026). Levels mode runs on the native engine; the "Later, separate
+plans" items in §4 are not started.
+
+Additions beyond the plan, found while implementing:
+- hw decode that fails before the first frame (ffmpeg built with cuda/vaapi
+  but no device) retries in software; `RawStatsError` carries
+  `frames_read` / `killed` to make that decision.
+- App exit now `take()`s the ffmpeg child out of the handle (it used to
+  kill in place, which the runners couldn't tell from a failure).
+- Full-range `yuvj*` sources are piped as themselves; asking for `yuv*p`
+  made ffmpeg rescale them to limited range.
+- Legal-range counts only for limited-range YUV (absent for full-range /
+  RGB). Luma is histogrammed; chroma uses a vectorized scan (~5 ms/UHD
+  frame total over the previous engine).
+- Progress estimate from duration when the container has no frame count;
+  `-noautorotate`; `-vsync passthrough` on ffmpeg < 5.1.
+- Failure paths: zero-size streams rejected up front; ffmpeg is killed
+  before `wait()` if the reader stops early; a lost worker result is an
+  error, not a truncated `Ok`.
 
 Design principle: **ffmpeg decodes, Rust counts.** ffmpeg stays the only
 media dependency, used through its most stable interface (`-f rawvideo`
