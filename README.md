@@ -1,166 +1,120 @@
-# vcompare-tauri
+# vcompare
 
-Video quality comparison tool — Tauri desktop app with Python analysis backend.
+Video comparison and QC tool — Tauri desktop app with a native Rust analysis
+engine driving ffmpeg.
+
+## Modes
+
+| Mode | Inputs | ffmpeg filters | Metrics |
+|------|--------|----------------|---------|
+| `diff` | reference + distorted | `psnr` (+ optional `ssim`) | `diff_y/u/v` (RMS pixel difference), `ssim*` |
+| `vmaf` | reference + distorted | `libvmaf` / `libvmaf_cuda` | `vmaf`, `psnr` |
+| `levels` | single file | `signalstats` | `y/u/v_min/max`, `y_avg`, `y/u/v_dif`, `sat_avg` |
+
+Both comparison modes sync the two files by start-of-file or by embedded
+timecode, handle resolution and pixel-format mismatches (compare at the
+smaller resolution, upconvert to the higher bit depth), and accept IMF /
+concat manifests as inputs.
+
+Results are cached as `.vcompare.json` next to the reference file and can be
+reopened from the Recent Analyses list, exported to CSV, and scrubbed in mpv
+(side-by-side or difference view).
+
+### Flash-frame detection
+
+`levels` and `diff` analyses feed an event detector that finds flash frames:
+runs of 1–3 frames that differ sharply from *both* neighbours while the
+neighbours agree with each other (which is what separates a flash from a cut).
+Flashes are sub-classified as black, white, or content. Detection runs over
+the cached per-frame stats, so sensitivity can be tuned live without
+re-running ffmpeg. Events are shown as markers on the timeline and chart,
+listed in a panel, and navigable with `n` / `N` (which also seeks mpv).
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Svelte Frontend (webview)                      │
-│  uPlot charts · virtual-scroll table · controls │
+│  Svelte 5 frontend (webview)                    │
+│  uPlot charts · virtual-scroll table · timeline │
 └──────────────┬──────────────────────────────────┘
-               │ invoke() / listen()
-               │ Tauri IPC
+               │ invoke() / listen()   (Tauri IPC)
 ┌──────────────┴──────────────────────────────────┐
 │  Rust core (Tauri v2)                           │
-│  Sidecar lifecycle · JSON-RPC mux · file dialog │
+│  bridge.rs   Tauri commands                     │
+│  engine/     ffmpeg pipeline, parsing, state,   │
+│              event detection, mpv IPC, timecode │
 └──────────────┬──────────────────────────────────┘
-               │ stdin/stdout JSON-RPC 2.0
-               │ (newline-delimited JSON)
-┌──────────────┴──────────────────────────────────┐
-│  Python sidecar (vcompare_engine.py)            │
-│  FFmpeg/VMAF pipeline · mpv IPC · timecode math │
-└─────────────────────────────────────────────────┘
+               │ subprocess
+         ffmpeg / ffprobe / mpv
 ```
 
-Communication: **JSON-RPC 2.0 over stdio**. Requests have IDs and get
-routed to the caller. Notifications (progress, mpv position) are broadcast
-as Tauri events to the frontend.
+Progress and diagnostics are streamed to the frontend as Tauri events
+(`rpc:progress`, `rpc:diagnostics`, `rpc:mpv-position`, …).
 
-## Project Structure
+## Project structure
 
 ```
-vcompare-tauri/
-├── src-tauri/                    # Rust / Tauri backend
-│   ├── src/
-│   │   ├── main.rs              # Entry point
-│   │   ├── lib.rs               # App setup, sidecar spawn
-│   │   ├── sidecar.rs           # JSON-RPC stdio multiplexer
-│   │   └── bridge.rs            # Tauri commands (typed passthrough)
-│   ├── Cargo.toml
-│   └── tauri.conf.json
-├── src/                          # Svelte frontend
-│   ├── main.ts
-│   ├── App.svelte               # State machine: pick → analyze → view
-│   ├── lib/
-│   │   └── rpc.ts               # Typed Tauri invoke wrappers + events
-│   ├── components/
-│   │   ├── MetricChart.svelte   # uPlot detail + overview minimap
-│   │   └── FrameTable.svelte    # Virtual-scrolled data table
-│   └── styles/
-│       └── global.css           # Dark theme
-├── sidecar/                      # Python analysis engine
-│   ├── vcompare_engine.py       # RPC method handlers (entry point)
-│   ├── rpc_server.py            # JSON-RPC 2.0 stdio server
-│   └── vcompare.py              # ← copy your existing file here
-├── package.json
-├── vite.config.ts
-└── README.md
+src-tauri/
+├── src/
+│   ├── lib.rs                 App setup, menu, managed state
+│   ├── bridge.rs              #[tauri::command] handlers
+│   └── engine/
+│       ├── analysis.rs        ffmpeg command construction + stats parsing
+│       ├── events.rs          Flash-frame / spike detection over series
+│       ├── state.rs           In-memory analysis results, queries, CSV export
+│       ├── cache.rs           .vcompare.json load/save
+│       ├── probe.rs           ffprobe, capability detection
+│       ├── pixfmt.rs          Pixel-format negotiation
+│       ├── timecode.rs        TC ⇄ frame arithmetic (incl. drop-frame)
+│       ├── mpv.rs             mpv IPC controller
+│       └── types.rs           Shared structs
+└── tauri.conf.json
+src/
+├── App.svelte                 State machine: pick → analyze → view
+├── lib/rpc.ts                 Typed invoke() wrappers + event listeners
+└── components/
+    ├── MetricChart.svelte     uPlot detail + overview minimap
+    ├── TimelineBar.svelte     Ref/dist overlap + event markers
+    ├── FrameTable.svelte      Virtual-scrolled frame table
+    └── EventPanel.svelte      Flash-frame detector controls + event list
 ```
 
 ## Prerequisites
 
-- **Rust** (via rustup): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-- **Node.js** ≥ 18: for Svelte/Vite frontend
-- **Python** ≥ 3.10: analysis engine
-- **ffmpeg/ffprobe** built with libvmaf (and optionally libvmaf_cuda)
-- **mpv** for side-by-side preview (optional)
-- **System libs** (Fedora):
+- **Rust** (via rustup) and the Tauri CLI: `cargo install tauri-cli --version "^2.0"`
+- **Node.js** ≥ 18
+- **ffmpeg / ffprobe** built with `libvmaf` (and optionally `libvmaf_cuda`)
+- **mpv** for side-by-side / difference preview (optional)
+- WebKitGTK and friends — Fedora:
   ```bash
-  sudo dnf install webkit2gtk4.1-devel \
-    openssl-devel curl-devel \
-    librsvg2-devel gtk3-devel \
-    libsoup3-devel javascriptcoregtk4.1-devel
+  sudo dnf install webkit2gtk4.1-devel openssl-devel curl-devel \
+    librsvg2-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel
   ```
 
-## Setup
+## Development
 
 ```bash
-# 1. Clone/copy the project
-cd vcompare-tauri
-
-# 2. Copy your existing vcompare.py into the sidecar directory
-cp /path/to/vcompare.py sidecar/vcompare.py
-
-# 3. Install frontend dependencies
 npm install
-
-# 4. Install Tauri CLI
-cargo install tauri-cli --version "^2.0"
-
-# 5. Run in dev mode (hot-reload frontend + Rust rebuild)
-cargo tauri dev
+cargo tauri dev        # Vite dev server + Rust binary, hot-reloading frontend
+npm run dev            # frontend only (no engine) — useful for layout work
+cargo test --manifest-path src-tauri/Cargo.toml   # engine unit tests
 ```
 
-## Development Workflow
+Set `RUST_LOG=debug` for verbose logging. On NVIDIA / Wayland the app sets
+the usual WebKitGTK workaround env vars automatically.
 
-### Frontend only (fast iteration on UI)
-```bash
-npm run dev
-# Opens at http://localhost:5173
-# Won't connect to sidecar — use for layout/styling
-```
-
-### Full stack
-```bash
-cargo tauri dev
-# Spawns: Vite dev server + Rust binary + Python sidecar
-# Frontend hot-reloads. Rust rebuilds on save. Python restarts on app relaunch.
-```
-
-### Test Python sidecar standalone
-```bash
-# Pipe JSON-RPC messages manually to test the engine
-echo '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}' | python3 sidecar/vcompare_engine.py
-```
-
-## Key Decisions
-
-| Decision | Choice | Why |
-|----------|--------|-----|
-| IPC transport | stdio JSON-RPC | Zero-config, no ports, sidecar lifecycle tied to app |
-| Chart library | uPlot | Canvas-based, handles 500k+ points natively, 35KB |
-| Frontend framework | Svelte 5 | Lightest option for Tauri, smallest bundle |
-| Python packaging | PATH | Simplest for personal tool; PyInstaller later if needed |
-| mpv management | Python | Existing code works, Unix socket IPC stays in one place |
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VCOMPARE_PYTHON` | `python3` | Python interpreter path |
-| `VCOMPARE_SIDECAR` | auto-detected | Path to `vcompare_engine.py` |
-| `RUST_LOG` | — | Set to `debug` for verbose Rust logging |
-
-## Building for Distribution
+## Building
 
 ```bash
-cargo tauri build
-# Output: src-tauri/target/release/bundle/
-#   - .deb (Debian/Ubuntu)
-#   - .AppImage (universal Linux)
-#   - .rpm (Fedora) — may need tauri-plugin-bundler-rpm
+./scripts/build.sh     # → src-tauri/target/release/bundle/{appimage,deb}/
 ```
 
-For distribution, bundle the sidecar as a standalone binary:
-```bash
-pip install pyinstaller
-pyinstaller --onefile sidecar/vcompare_engine.py
-# Then update tauri.conf.json externalBin to point to the binary
-```
+## Keyboard
 
-## What's Not Wired Yet (TODO)
-
-The scaffold provides all the plumbing. What remains is connecting
-specific UI interactions to the existing RPC methods:
-
-- [ ] Threshold input field (currently only set via keyboard shortcut)
-- [ ] Filter controls panel (metric + threshold below)
-- [ ] "Jump to worst/best" buttons
-- [ ] Timecode display + copy-to-clipboard
-- [ ] mpv status indicator (paused/playing, current TC)
-- [ ] IMF CPL support in file picker (detect .xml, resolve dialog)
-- [ ] Manual frame offset input
-- [ ] Saved analysis auto-detection (check for existing .vcompare.json)
-- [ ] Window title update with file names
-- [ ] Drag-and-drop file import
+| Key | Action |
+|-----|--------|
+| `m` | cycle active metric |
+| `t` / `T` | auto-threshold from active metric / clear threshold |
+| `n` / `N` | next / previous flash event |
+| `p` / `P` | launch / close mpv side-by-side |
+| `d` / `D` | launch / close mpv difference view |

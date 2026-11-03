@@ -272,7 +272,7 @@ impl MpvController {
     /// Write a temporary mpv EDL file that starts playback at the given offset.
     ///
     /// EDL format:
-    /// ```
+    /// ```text
     /// # mpv EDL v0
     /// /path/to/file.mov,56.48
     /// ```

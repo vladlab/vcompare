@@ -2,8 +2,11 @@
   vcompare — main application shell.
 
   Analysis modes:
-    - diff (default): fast pixel difference (blend + signalstats)
+    - diff (default): fast pixel difference (psnr/ssim filters)
     - vmaf: perceptual quality (libvmaf)
+    - levels: single-file signal levels (signalstats)
+
+  Flash-frame detection runs over diff and levels results (EventPanel).
 -->
 
 <script lang="ts">
@@ -19,6 +22,8 @@
     type ProgressEvent,
     type DiagnosticsEvent,
     type UnlistenFn,
+    type DetectParams,
+    type DetectResult,
     ping,
     detectCapabilities,
     probeFile,
@@ -29,6 +34,8 @@
     getMetricSeries,
     getFrames,
     exportCsv,
+    detectEvents,
+    exportEventsCsv,
     getRecents,
     addRecent,
     type RecentEntry,
@@ -50,6 +57,7 @@
   import MetricChart from "./components/MetricChart.svelte";
   import FrameTable from "./components/FrameTable.svelte";
   import TimelineBar from "./components/TimelineBar.svelte";
+  import EventPanel from "./components/EventPanel.svelte";
 
   // ── App state ──
 
@@ -106,6 +114,12 @@
   // Difference view state
   let diffviewRunning: boolean = $state(false);
   let diffviewFrame: number = $state(-1);
+
+  // Flash-frame detection
+  let detectParams: DetectParams = $state({ threshold: null, max_run: 3, exclude_at_cut: false });
+  let detectResult: DetectResult | null = $state(null);
+  let detectError: string | null = $state(null);
+  let detectTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Debounced seek — sends to both mpv instances if running
   let seekTimer: ReturnType<typeof setTimeout> | null = null;
@@ -175,6 +189,8 @@
           cacheInfo = null;
           summary = null;
           metricSeries = {};
+          detectResult = null;
+          detectError = null;
           progressCurrent = 0;
           progressTotal = 0;
           diagnosticLines = [];
@@ -213,6 +229,73 @@
       cursorFrame = mpvFrame;
     }
   });
+
+  // ── Flash-frame detection ──
+
+  let detectAvailable = $derived(
+    summary?.mode === "levels" || summary?.mode === "diff"
+  );
+
+  async function runDetection() {
+    if (!detectAvailable) {
+      detectResult = null;
+      detectError = null;
+      return;
+    }
+    try {
+      detectResult = await detectEvents({ ...detectParams });
+      detectError = null;
+    } catch (e) {
+      detectResult = null;
+      detectError = String(e);
+    }
+  }
+
+  // Re-run whenever the parameters change (the engine scan is cheap, but
+  // slider drags fire fast, so coalesce).
+  $effect(() => {
+    void detectParams;
+    if (state !== "ready" || !detectAvailable) return;
+    if (detectTimer) clearTimeout(detectTimer);
+    detectTimer = setTimeout(runDetection, 60);
+  });
+
+  /** Frame range of the analysed data, for the event overview strip. */
+  let analysedRange = $derived.by((): [number, number] | null => {
+    if (summary?.timeline) {
+      return [summary.timeline.overlap_start, summary.timeline.overlap_end];
+    }
+    const first = Object.values(metricSeries)[0];
+    if (first && first.frames.length > 0) {
+      return [first.frames[0], first.frames[first.frames.length - 1] + 1];
+    }
+    return null;
+  });
+
+  /** Jump to the next (dir=1) or previous (dir=-1) event from the cursor. */
+  function jumpToEvent(dir: 1 | -1) {
+    const events = detectResult?.events ?? [];
+    if (events.length === 0) return;
+    let target;
+    if (dir === 1) {
+      target = events.find((e) => e.frame > cursorFrame) ?? events[0];
+    } else {
+      target = [...events].reverse().find((e) => e.frame < cursorFrame) ?? events[events.length - 1];
+    }
+    handleCursorChange(target.frame);
+  }
+
+  async function handleExportEvents() {
+    const stem = refPath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "vcompare";
+    const result = await save({
+      title: "Export flash frames CSV",
+      defaultPath: `${stem}_flash_frames.csv`,
+      filters: [{ name: "CSV", extensions: ["csv"] }],
+    });
+    if (result) {
+      await exportEventsCsv(result as string);
+    }
+  }
 
   // ── File picking ──
 
@@ -330,6 +413,9 @@
     }
 
     state = "ready";
+
+    // Flash-frame detection (levels / diff only)
+    await runDetection();
 
     // Record in recents
     if (cacheInfo?.path && refPath) {
@@ -453,6 +539,12 @@
         break;
       case "T":
         threshold = null;
+        break;
+      case "n":
+        jumpToEvent(1);
+        break;
+      case "N":
+        jumpToEvent(-1);
         break;
       case "p":
         if (!mpvRunning) {
@@ -594,6 +686,11 @@
       u_max: "U Max",
       v_min: "V Min",
       v_max: "V Max",
+      y_avg: "Y Avg",
+      y_dif: "Y Dif",
+      u_dif: "U Dif",
+      v_dif: "V Dif",
+      sat_avg: "Sat Avg",
     };
     return labels[m] ?? m;
   }
@@ -787,31 +884,49 @@
     {:else if state === "ready" && activeSeries}
       <!-- Results view -->
       <div class="results-layout">
-        {#if summary?.timeline}
-          <TimelineBar
-            timeline={summary.timeline}
-            tcFormat={summary.tc_format}
-          />
+        <div class="results-main">
+          {#if summary?.timeline}
+            <TimelineBar
+              timeline={summary.timeline}
+              tcFormat={summary.tc_format}
+              events={detectResult?.events ?? []}
+              onSeek={handleCursorChange}
+            />
+          {/if}
+          <div class="chart-area">
+            <MetricChart
+              bind:this={chartComponent}
+              series={displaySeries}
+              metric={activeMetric}
+              {threshold}
+              {cursorFrame}
+              onCursorChange={handleCursorChange}
+              timeline={summary?.timeline}
+              events={detectResult?.events ?? []}
+            />
+          </div>
+          <div class="table-area">
+            <FrameTable
+              {cursorFrame}
+              metrics={summary?.metrics_available ?? []}
+              mode={summary?.mode ?? "diff"}
+              onFrameSelect={handleCursorChange}
+            />
+          </div>
+        </div>
+        {#if detectAvailable}
+          <div class="events-area">
+            <EventPanel
+              result={detectResult}
+              error={detectError}
+              bind:params={detectParams}
+              {cursorFrame}
+              frameRange={analysedRange}
+              onSelect={handleCursorChange}
+              onExport={handleExportEvents}
+            />
+          </div>
         {/if}
-        <div class="chart-area">
-          <MetricChart
-            bind:this={chartComponent}
-            series={displaySeries}
-            metric={activeMetric}
-            {threshold}
-            {cursorFrame}
-            onCursorChange={handleCursorChange}
-            timeline={summary?.timeline}
-          />
-        </div>
-        <div class="table-area">
-          <FrameTable
-            {cursorFrame}
-            metrics={summary?.metrics_available ?? []}
-            mode={summary?.mode ?? "diff"}
-            onFrameSelect={handleCursorChange}
-          />
-        </div>
       </div>
 
     {:else if state === "error"}
@@ -829,6 +944,9 @@
       <span class="footer-shortcuts">
         <kbd>m</kbd> metric
         <kbd>t</kbd> threshold
+        {#if detectAvailable}
+          <kbd>n</kbd><kbd>N</kbd> flash
+        {/if}
         <kbd>f</kbd> smooth{smoothWindow > 0 ? ` (${smoothWindow})` : ""}
         <kbd>e</kbd> export
         <kbd>+</kbd><kbd>-</kbd> zoom
@@ -1053,7 +1171,18 @@
   .results-layout {
     flex: 1;
     display: flex;
+    flex-direction: row;
+    overflow: hidden;
+  }
+  .results-main {
+    flex: 1;
+    display: flex;
     flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
+  }
+  .events-area {
+    flex: 0 0 300px;
     overflow: hidden;
   }
   .chart-area {

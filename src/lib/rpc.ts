@@ -109,6 +109,47 @@ export interface FrameData {
   u_max?: number | null;
   v_min?: number | null;
   v_max?: number | null;
+  y_avg?: number | null;
+  y_dif?: number | null;
+  u_dif?: number | null;
+  v_dif?: number | null;
+  sat_avg?: number | null;
+}
+
+// ─── Events (flash frames) ─────────────────────────────────────────────────
+
+export type EventSubkind = "black" | "white" | "content";
+
+export interface FlashEvent {
+  /** First frame of the run (display frame number) */
+  frame: number;
+  tc: string;
+  /** Run length in frames */
+  length: number;
+  kind: "flash";
+  subkind: EventSubkind;
+  /** True when the run sits on a cut (neighbours disagree) */
+  at_cut: boolean;
+  /** Strength relative to threshold, >= 1 */
+  score: number;
+}
+
+/** All values normalized 0..1 of signal peak. Omitted fields use engine defaults. */
+export interface DetectParams {
+  /** null/undefined = auto (robust estimate from the data) */
+  threshold?: number | null;
+  max_run?: number;
+  min_threshold?: number;
+  auto_k?: number;
+  neighbour_tol?: number;
+  exclude_at_cut?: boolean;
+}
+
+export interface DetectResult {
+  events: FlashEvent[];
+  /** Threshold actually used */
+  threshold: number;
+  source: "levels" | "diff_y";
 }
 
 export interface FrameResult {
@@ -262,6 +303,16 @@ export async function exportCsv(path?: string): Promise<{ path: string; rows: nu
   return invoke("export_csv", { path: path ?? null });
 }
 
+// ─── Events ────────────────────────────────────────────────────────────────
+
+export async function detectEvents(params?: DetectParams): Promise<DetectResult> {
+  return invoke("detect_events", { params: params ?? null });
+}
+
+export async function exportEventsCsv(path?: string): Promise<{ path: string; rows: number }> {
+  return invoke("export_events_csv", { path: path ?? null });
+}
+
 // ─── Recents ──────────────────────────────────────────────────────────────
 
 export interface RecentEntry {
@@ -285,7 +336,7 @@ export async function clearRecents(): Promise<void> {
   return invoke("clear_recents");
 }
 
-// ─── Event listeners (Python → Rust → Frontend) ────────────────────────────
+// ─── Event listeners (Rust → Frontend) ─────────────────────────────────────
 
 export function onProgress(callback: (e: ProgressEvent) => void): Promise<UnlistenFn> {
   return listen<ProgressEvent>("rpc:progress", (event) => callback(event.payload));

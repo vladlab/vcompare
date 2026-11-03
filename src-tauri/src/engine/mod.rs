@@ -2,6 +2,7 @@
 
 pub mod analysis;
 pub mod cache;
+pub mod events;
 pub mod mpv;
 pub mod pixfmt;
 pub mod probe;

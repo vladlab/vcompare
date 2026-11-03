@@ -114,6 +114,8 @@ pub fn run() {
             bridge::analyze,
             bridge::get_frames,
             bridge::get_metric_series,
+            bridge::detect_events,
+            bridge::export_events_csv,
             bridge::mpv_launch,
             bridge::mpv_seek,
             bridge::mpv_step,

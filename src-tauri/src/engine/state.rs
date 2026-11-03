@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::engine::events::{self, DetectParams, DetectResult, Event};
 use crate::engine::timecode::TimecodeFormat;
 use crate::engine::types::TimelineInfo;
 
@@ -40,6 +41,8 @@ struct Inner {
     save_path: Option<String>,
     /// Context for mpv (set after analysis completes)
     mpv_context: Option<MpvContext>,
+    /// Events from the last `detect_events` run on these frames.
+    events: Vec<Event>,
 }
 
 /// Metadata about the current analysis.
@@ -75,6 +78,7 @@ impl EngineState {
                 meta: AnalysisMeta::default(),
                 save_path: None,
                 mpv_context: None,
+                events: Vec::new(),
             }),
         }
     }
@@ -84,6 +88,7 @@ impl EngineState {
     /// Store diff analysis results.
     pub fn apply_diff_result(&self, result: &Value) {
         let mut state = self.inner.lock().unwrap();
+        state.events.clear();
         state.frames = result
             .get("frames")
             .and_then(|v| v.as_array())
@@ -149,6 +154,7 @@ impl EngineState {
         scale_ref: bool,
     ) {
         let mut state = self.inner.lock().unwrap();
+        state.events.clear();
 
         let has_vmaf = frames
             .iter()
@@ -187,13 +193,14 @@ impl EngineState {
     /// Store levels analysis results (single-file YUV min/max).
     pub fn apply_levels_result(&self, result: &Value) {
         let mut state = self.inner.lock().unwrap();
+        state.events.clear();
         state.frames = result
             .get("frames")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
 
-        state.metrics_available = vec![
+        let mut metrics: Vec<String> = vec![
             "y_min".into(),
             "y_max".into(),
             "u_min".into(),
@@ -201,6 +208,16 @@ impl EngineState {
             "v_min".into(),
             "v_max".into(),
         ];
+        // Newer caches carry average / temporal-difference stats; older
+        // levels caches don't, so only advertise what is actually present.
+        let has_temporal = state
+            .frames
+            .iter()
+            .any(|f| f.get("y_dif").and_then(|v| v.as_f64()).is_some());
+        if has_temporal {
+            metrics.extend(["y_avg", "y_dif", "u_dif", "v_dif", "sat_avg"].map(String::from));
+        }
+        state.metrics_available = metrics;
         state.analysis_mode = Some("levels".into());
         state.meta = AnalysisMeta {
             ref_path: str_field(result, "ref_path"),
@@ -214,7 +231,7 @@ impl EngineState {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0),
             sync_mode: "start".into(),
-            bit_depth: None,
+            bit_depth: result.get("bit_depth").and_then(|v| v.as_u64()).map(|v| v as u32),
             tc_format: parse_tc_format(result.get("tc_format")),
             timeline: None,
             scale_w: 0,
@@ -238,6 +255,7 @@ impl EngineState {
         state.meta = AnalysisMeta::default();
         state.save_path = None;
         state.mpv_context = None;
+        state.events.clear();
     }
 
     // ─── Queries (called by commands) ───────────────────────────────────
@@ -512,6 +530,67 @@ impl EngineState {
         Ok(serde_json::json!({
             "path": output_path,
             "rows": state.frames.len(),
+        }))
+    }
+
+    // ─── Events ─────────────────────────────────────────────────────────
+
+    /// Run flash detection over the loaded frames and remember the result.
+    pub fn detect_events(&self, params: &DetectParams) -> Result<DetectResult, String> {
+        let mut state = self.inner.lock().unwrap();
+        let mode = state
+            .analysis_mode
+            .clone()
+            .ok_or("No analysis loaded")?;
+        let bit_depth = state.meta.bit_depth.unwrap_or(8);
+        let result = events::detect_flashes(&mode, &state.frames, bit_depth, params)?;
+        eprintln!(
+            "[vcompare] detect_events({mode}): {} events, threshold={}",
+            result.events.len(),
+            result.threshold
+        );
+        state.events = result.events.clone();
+        Ok(result)
+    }
+
+    /// Export the current events to CSV.
+    pub fn export_events_csv(&self, path: Option<&str>) -> Result<Value, String> {
+        let state = self.inner.lock().unwrap();
+        if state.frames.is_empty() {
+            return Err("No analysis loaded".into());
+        }
+
+        let output_path = match path {
+            Some(p) => p.to_string(),
+            None => {
+                let stem = PathBuf::from(&state.meta.ref_path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "ref".into());
+                let dir = PathBuf::from(&state.meta.ref_path)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+                dir.join(format!("{stem}_flash_frames.csv"))
+                    .to_string_lossy()
+                    .to_string()
+            }
+        };
+
+        let mut csv = String::from("frame,timecode,length,kind,subkind,at_cut,score\n");
+        for e in &state.events {
+            csv.push_str(&format!(
+                "{},{},{},{},{},{},{:.3}\n",
+                e.frame, e.tc, e.length, e.kind, e.subkind, e.at_cut, e.score
+            ));
+        }
+
+        std::fs::write(&output_path, &csv)
+            .map_err(|e| format!("Failed to write CSV: {e}"))?;
+
+        Ok(serde_json::json!({
+            "path": output_path,
+            "rows": state.events.len(),
         }))
     }
 

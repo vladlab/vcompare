@@ -13,8 +13,7 @@
   import { onMount, onDestroy } from "svelte";
   import uPlot from "uplot";
   import "uplot/dist/uPlot.min.css";
-  import type { MetricSeries } from "../lib/rpc";
-  import type { TimelineInfo } from "../lib/rpc";
+  import type { MetricSeries, TimelineInfo, FlashEvent } from "../lib/rpc";
 
   // ── Props ──
 
@@ -25,6 +24,8 @@
     cursorFrame: number;
     onCursorChange: (frame: number) => void;
     timeline?: TimelineInfo | null;
+    /** Detected events to mark on the chart (flash frames). */
+    events?: FlashEvent[];
   }
 
   let {
@@ -34,6 +35,7 @@
     cursorFrame,
     onCursorChange,
     timeline = null,
+    events = [],
   }: Props = $props();
 
   // ── Refs ──
@@ -62,7 +64,20 @@
     u_max:  { color: "#70c0f0", label: "U Max (Cb)" },
     v_min:  { color: "#c04070", label: "V Min (Cr)" },
     v_max:  { color: "#f070a0", label: "V Max (Cr)" },
+    y_avg:  { color: "#d8b848", label: "Y Avg" },
+    y_dif:  { color: "#e8e8e8", label: "Y Dif (vs prev)" },
+    u_dif:  { color: "#70c0f0", label: "U Dif (vs prev)" },
+    v_dif:  { color: "#f070a0", label: "V Dif (vs prev)" },
+    sat_avg:{ color: "#c070e8", label: "Sat Avg" },
   };
+
+  // Event marker colours by subkind
+  const EVENT_COLORS: Record<string, string> = {
+    black: "#9a9a9a",
+    white: "#ffffff",
+    content: "#e8b830",
+  };
+  const EVENT_AT_CUT_ALPHA = 0.45;
 
   function getColor(): string {
     return METRIC_CONFIG[metric]?.color ?? "#e8b830";
@@ -416,6 +431,53 @@
     };
   }
 
+  // ── Event marker plugin (both charts) ──
+  //
+  // Draws a translucent band across the plot for every event's run of
+  // frames plus a solid tick at the top edge, so single-frame events stay
+  // visible when the x-scale is zoomed far out (a 1-frame band may be
+  // narrower than a pixel).
+
+  function eventMarkerPlugin(compact: boolean): uPlot.Plugin {
+    return {
+      hooks: {
+        draw: [
+          (u: uPlot) => {
+            if (!events || events.length === 0) return;
+            const ctx = u.ctx;
+            const dpr = devicePixelRatio;
+            const { left, top, width, height } = u.bbox;
+            const right = left + width;
+            const tickH = (compact ? 4 : 7) * dpr;
+
+            ctx.save();
+            for (const ev of events) {
+              const x1 = u.valToPos(ev.frame, "x", true);
+              const x2 = u.valToPos(ev.frame + ev.length, "x", true);
+              if (x2 < left || x1 > right) continue;
+
+              const color = EVENT_COLORS[ev.subkind] ?? EVENT_COLORS.content;
+              ctx.globalAlpha = ev.at_cut ? EVENT_AT_CUT_ALPHA : 1;
+
+              // Band over the run (min 1.5px so it never vanishes)
+              const bx1 = Math.max(x1, left);
+              const bx2 = Math.min(Math.max(x2, x1 + 1.5 * dpr), right);
+              ctx.fillStyle = color;
+              ctx.globalAlpha *= 0.18;
+              ctx.fillRect(bx1, top, bx2 - bx1, height);
+
+              // Tick at the top edge
+              ctx.globalAlpha = ev.at_cut ? EVENT_AT_CUT_ALPHA : 1;
+              ctx.fillStyle = color;
+              ctx.fillRect(bx1, top, Math.max(bx2 - bx1, 2 * dpr), tickH);
+            }
+            ctx.restore();
+          },
+        ],
+      },
+    };
+  }
+
   // ── Overview playhead plugin ──
 
   function overviewPlayheadPlugin(): uPlot.Plugin {
@@ -619,6 +681,7 @@
         },
         wheelZoomPlugin(),
         scrubPlugin(),
+        eventMarkerPlugin(false),
         playheadPlugin(),
         noDataZonePlugin(),
       ],
@@ -666,6 +729,7 @@
         },
       ],
       plugins: [
+        eventMarkerPlugin(true),
         overviewPlayheadPlugin(),
         noDataZonePlugin(),
       ],
@@ -730,6 +794,13 @@
     void metric;
     void threshold;
     requestAnimationFrame(createCharts);
+  });
+
+  // Events change without the series changing — a redraw is enough.
+  $effect(() => {
+    void events;
+    detailPlot?.redraw(false);
+    overviewPlot?.redraw(false);
   });
 </script>
 

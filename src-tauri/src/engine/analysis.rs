@@ -6,12 +6,12 @@
 use regex::Regex;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::io::{BufReader, Read};
+use std::io::BufReader;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::engine::pixfmt::choose_common_pixfmt;
+use crate::engine::pixfmt::{choose_common_pixfmt, parse_pix_fmt};
 use crate::engine::probe::{ffprobe_json, get_video_info, is_concat_manifest};
 use crate::engine::timecode::{detect_timecode_format, TimecodeFormat};
 use crate::engine::types::{ComparisonConfig, TimelineInfo};
@@ -545,8 +545,8 @@ pub fn run_vmaf_analysis(
 
 /// Run single-file levels analysis using FFmpeg's signalstats filter.
 ///
-/// Extracts per-frame min/max YUV values.
-/// Returns frame data with y_min, y_max, u_min, u_max, v_min, v_max.
+/// Extracts per-frame min/max/avg YUV values and temporal differences, in
+/// native code values of the file's pixel format.
 pub fn run_levels_analysis(
     file_path: &str,
     tc_fmt: &TimecodeFormat,
@@ -588,11 +588,13 @@ pub fn run_levels_analysis(
 
 /// Prepare a single file for levels analysis.
 ///
-/// Probes the file and returns timecode format, start frame, and total frames.
+/// Probes the file and returns timecode format, start frame, total frames,
+/// and the bit depth of the file's pixel format (which is what signalstats
+/// reports its code values in).
 pub fn prepare_single_file(
     file_path: &str,
     diagnostics: &mut Vec<String>,
-) -> Result<(TimecodeFormat, i64, Option<u64>), String> {
+) -> Result<(TimecodeFormat, i64, Option<u64>, u32), String> {
     let probe = ffprobe_json(file_path)?;
     let tc_fmt = detect_timecode_format(&probe)?;
     let info = get_video_info(&probe, &tc_fmt)?;
@@ -610,7 +612,10 @@ pub fn prepare_single_file(
         diagnostics.push(format!("frames: {n}"));
     }
 
-    Ok((tc_fmt, info.start_tc_frames, total))
+    let bit_depth = parse_pix_fmt(&info.pix_fmt).bit_depth;
+    diagnostics.push(format!("bit depth: {bit_depth}"));
+
+    Ok((tc_fmt, info.start_tc_frames, total, bit_depth))
 }
 
 /// Parse signalstats metadata output.
@@ -626,6 +631,9 @@ pub fn prepare_single_file(
 /// lavfi.signalstats.VMAX=145
 /// ...
 /// ```
+///
+/// Note: `YBITDEPTH` in this output is the number of significant bits the
+/// frame actually uses, not the pixel format's depth, so it is ignored.
 fn parse_signalstats_metadata(
     stats_path: &str,
     tc_fmt: &TimecodeFormat,
@@ -633,7 +641,15 @@ fn parse_signalstats_metadata(
 ) -> Result<Vec<Value>, String> {
     let content = std::fs::read_to_string(stats_path)
         .map_err(|e| format!("Failed to read signalstats: {e}"))?;
+    parse_signalstats_text(&content, tc_fmt, start_frame)
+}
 
+/// Parse signalstats `metadata=print` text into per-frame JSON values.
+pub fn parse_signalstats_text(
+    content: &str,
+    tc_fmt: &TimecodeFormat,
+    start_frame: i64,
+) -> Result<Vec<Value>, String> {
     let frame_re = Regex::new(r"^frame:(\d+)").unwrap();
     let kv_re = Regex::new(r"^lavfi\.signalstats\.(\w+)=([\d.]+)").unwrap();
 
@@ -641,21 +657,31 @@ fn parse_signalstats_metadata(
     let mut current_frame: Option<i64> = None;
     let mut current_vals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
+    // All values are in native code values of the decoded pixel format
+    // (signalstats runs at the file's own bit depth). `bit_depth` is
+    // reported alongside so consumers can normalize.
     let flush = |frame_num: i64,
                  vals: &std::collections::HashMap<String, f64>,
                  tc_fmt: &TimecodeFormat,
                  start_frame: i64,
                  frames: &mut Vec<Value>| {
         let display_frame = frame_num + start_frame;
+        let g = |k: &str| vals.get(k).copied().unwrap_or(0.0);
         frames.push(serde_json::json!({
             "frame": display_frame,
             "tc": tc_fmt.frame_to_tc(display_frame),
-            "y_min": vals.get("YMIN").copied().unwrap_or(0.0),
-            "y_max": vals.get("YMAX").copied().unwrap_or(0.0),
-            "u_min": vals.get("UMIN").copied().unwrap_or(0.0),
-            "u_max": vals.get("UMAX").copied().unwrap_or(0.0),
-            "v_min": vals.get("VMIN").copied().unwrap_or(0.0),
-            "v_max": vals.get("VMAX").copied().unwrap_or(0.0),
+            "y_min": g("YMIN"),
+            "y_max": g("YMAX"),
+            "u_min": g("UMIN"),
+            "u_max": g("UMAX"),
+            "v_min": g("VMIN"),
+            "v_max": g("VMAX"),
+            // Temporal / average stats used by the event detector
+            "y_avg": round4(g("YAVG")),
+            "y_dif": round4(g("YDIF")),
+            "u_dif": round4(g("UDIF")),
+            "v_dif": round4(g("VDIF")),
+            "sat_avg": round4(g("SATAVG")),
         }));
     };
 

@@ -6,6 +6,7 @@
 use crate::engine;
 use crate::engine::analysis::ProcessHandle;
 use crate::engine::cache;
+use crate::engine::events::{DetectParams, DetectResult};
 use crate::engine::mpv::{MpvController, ViewMode};
 use crate::engine::pixfmt::choose_diff_pixfmt;
 use serde::{Deserialize, Serialize};
@@ -440,7 +441,7 @@ async fn _run_levels_analysis(
     let result = tokio::task::spawn_blocking(move || {
         let mut diagnostics = vec!["mode: levels (signalstats)".into()];
 
-        let (tc_fmt, start_frame, total_frames) =
+        let (tc_fmt, start_frame, total_frames, bit_depth) =
             engine::analysis::prepare_single_file(&file_path, &mut diagnostics)?;
 
         let _ = app_clone.emit("rpc:diagnostics", json!({"lines": diagnostics}));
@@ -459,7 +460,7 @@ async fn _run_levels_analysis(
             process_handle,
         )?;
 
-        eprintln!("[vcompare] Parsed {} levels frames", frames.len());
+        eprintln!("[vcompare] Parsed {} levels frames ({bit_depth}-bit)", frames.len());
 
         let result = json!({
             "mode": "levels",
@@ -467,6 +468,7 @@ async fn _run_levels_analysis(
             "ref_path": file_path,
             "ref_start_frame": start_frame,
             "ref_file_start_tc": start_frame,
+            "bit_depth": bit_depth,
             "tc_format": {
                 "fps_num": tc_fmt.fps_num,
                 "fps_den": tc_fmt.fps_den,
@@ -594,6 +596,27 @@ pub async fn get_metric_series(
     engine_state: State<'_, EngineState>,
 ) -> Result<Value, String> {
     engine_state.get_metric_series(&metric)
+}
+
+// ─── Events ─────────────────────────────────────────────────────────────────
+
+/// Run flash-frame detection over the loaded analysis.
+///
+/// Pure in-memory scan; cheap enough to call on every slider change.
+#[tauri::command]
+pub async fn detect_events(
+    params: Option<DetectParams>,
+    engine_state: State<'_, EngineState>,
+) -> Result<DetectResult, String> {
+    engine_state.detect_events(&params.unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn export_events_csv(
+    path: Option<String>,
+    engine_state: State<'_, EngineState>,
+) -> Result<Value, String> {
+    engine_state.export_events_csv(path.as_deref())
 }
 
 // ─── mpv commands ───────────────────────────────────────────────────────────

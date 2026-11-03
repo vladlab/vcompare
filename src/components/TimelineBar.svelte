@@ -7,8 +7,11 @@
     timeline: TimelineInfo from the analysis summary
     tcFormat: { fps_num, fps_den, tc_type } for TC string formatting
     onSeek?: (frame: number) => void — called when user clicks a TC position
+    events?: FlashEvent[] — detected events, drawn as ticks across both bars
 -->
 <script lang="ts">
+  import type { FlashEvent } from "../lib/rpc";
+
   interface TimelineInfo {
     ref_start: number;
     ref_end: number;
@@ -32,10 +35,12 @@
     timeline,
     tcFormat,
     onSeek,
+    events = [],
   }: {
     timeline: TimelineInfo;
     tcFormat: TcFormat | null;
     onSeek?: (frame: number) => void;
+    events?: FlashEvent[];
   } = $props();
 
   let spanWidth = $derived(timeline.span_end - timeline.span_start);
@@ -188,6 +193,16 @@
       </div>
     </div>
 
+    <!-- Event markers (span both bars) -->
+    {#each events as e (e.frame)}
+      <span
+        class="event-tick {e.subkind}"
+        class:at-cut={e.at_cut}
+        style={barStyle(e.frame, e.frame + e.length)}
+        title="{e.tc} · {e.subkind} · {e.length} fr{e.at_cut ? ' · at cut' : ''}"
+      ></span>
+    {/each}
+
     <!-- Overlap bracket -->
     {#if hasOffset}
       <div class="overlap-bracket" style={barStyle(timeline.overlap_start, timeline.overlap_end)}>
@@ -209,6 +224,19 @@
 {/if}
 
 <style>
+  .event-tick {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    min-width: 2px;
+    pointer-events: none;
+    opacity: 0.9;
+  }
+  .event-tick.content { background: #e8b830; }
+  .event-tick.white   { background: #ffffff; }
+  .event-tick.black   { background: #9a9a9a; }
+  .event-tick.at-cut  { opacity: 0.4; }
+
   .timeline-bar {
     --ref-color: #4a9eff;
     --dist-color: #ff6b8a;
