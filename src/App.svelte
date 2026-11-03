@@ -507,9 +507,32 @@
 
   // ── Keyboard shortcuts ──
 
+  /** True when the keystroke belongs to a text field, not to our shortcuts. */
+  function isTextEntry(target: EventTarget | null): boolean {
+    const el = target as HTMLElement | null;
+    if (!el) return false;
+    if (el.isContentEditable || el.tagName === "TEXTAREA" || el.tagName === "SELECT") return true;
+    if (el.tagName === "INPUT") {
+      const type = (el as HTMLInputElement).type;
+      // Sliders, checkboxes and buttons keep focus after a click but don't
+      // take typed text — shortcuts should still work with those focused.
+      return !["range", "checkbox", "radio", "button", "submit"].includes(type);
+    }
+    return false;
+  }
+
+  // Transient status line (e.g. why mpv didn't launch)
+  let statusMessage: string | null = $state(null);
+  let statusTimer: ReturnType<typeof setTimeout> | null = null;
+  function showStatus(msg: string, ms = 6000) {
+    statusMessage = msg;
+    if (statusTimer) clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => (statusMessage = null), ms);
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (state !== "ready") return;
-    if ((e.target as HTMLElement)?.tagName === "INPUT") return;
+    if (isTextEntry(e.target)) return;
 
     switch (e.key) {
       case "m":
@@ -548,7 +571,9 @@
         break;
       case "p":
         if (!mpvRunning) {
-          mpvLaunch().then(() => (mpvRunning = true)).catch(() => {});
+          mpvLaunch()
+            .then(() => (mpvRunning = true))
+            .catch((err) => showStatus(`mpv: ${err}`));
         }
         break;
       case "P":
@@ -556,7 +581,9 @@
         break;
       case "d":
         if (!diffviewRunning) {
-          diffviewLaunch().then(() => (diffviewRunning = true)).catch((e) => console.error("diffview:", e));
+          diffviewLaunch()
+            .then(() => (diffviewRunning = true))
+            .catch((err) => showStatus(`difference view: ${err}`));
         }
         break;
       case "D":
@@ -958,6 +985,9 @@
         <kbd>.</kbd><kbd>,</kbd> step
         <kbd>space</kbd> pause
       </span>
+      {#if statusMessage}
+        <span class="footer-status">{statusMessage}</span>
+      {/if}
     </footer>
   {/if}
 </div>
@@ -1224,6 +1254,14 @@
     border-top: 1px solid var(--border-subtle);
     min-height: 28px;
     flex-shrink: 0;
+  }
+  .footer-status {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--warning);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .footer-shortcuts {
     font-size: 11px;

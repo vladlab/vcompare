@@ -638,13 +638,20 @@ pub async fn mpv_launch(
         }
     }
 
+    // Levels analyses have no second file: open the reference on its own.
+    let view_mode = if ctx.dist_path.is_empty() {
+        ViewMode::Single
+    } else {
+        ViewMode::SideBySide
+    };
+
     let mpv = Arc::new(MpvController::new(
         ctx.ref_path,
         ctx.dist_path,
         ctx.tc_format,
         ctx.ref_file_start_tc,
         ctx.timeline,
-        ViewMode::SideBySide,
+        view_mode,
         ctx.scale_w,
         ctx.scale_h,
         ctx.scale_ref,
@@ -737,6 +744,9 @@ pub async fn diffview_launch(
     diffview_state: State<'_, DiffViewState>,
 ) -> Result<Value, String> {
     let ctx = engine_state.mpv_context()?;
+    if ctx.dist_path.is_empty() {
+        return Err("Difference view needs two files (not available for a levels analysis)".into());
+    }
 
     {
         let existing = diffview_state.controller.lock().unwrap();

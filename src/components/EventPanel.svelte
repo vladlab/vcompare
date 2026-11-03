@@ -197,7 +197,7 @@
         <button
           class="row"
           class:active={i === activeIndex}
-          onclick={() => onSelect(e.frame)}
+          onclick={(ev) => { onSelect(e.frame); (ev.currentTarget as HTMLElement).blur(); }}
         >
           <span class="dot {e.subkind}" class:at-cut={e.at_cut}></span>
           <span class="tc mono">{e.tc || e.frame}</span>

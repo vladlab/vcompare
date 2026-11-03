@@ -238,7 +238,8 @@ impl EngineState {
             scale_h: 0,
             scale_ref: false,
         };
-        state.mpv_context = None; // No comparison mpv for levels
+        // Single-file mpv view (no comparison) — dist_path stays empty.
+        state.mpv_context = build_mpv_context(&state.meta);
     }
 
     pub fn set_save_path(&self, path: Option<String>) {
@@ -634,9 +635,11 @@ fn parse_tc_format(v: Option<&Value>) -> Option<TimecodeFormat> {
     })
 }
 
+/// `dist_path` may be empty (levels mode): the controller then opens the
+/// reference file alone.
 fn build_mpv_context(meta: &AnalysisMeta) -> Option<MpvContext> {
     let tc = meta.tc_format.clone()?;
-    if meta.ref_path.is_empty() || meta.dist_path.is_empty() {
+    if meta.ref_path.is_empty() {
         return None;
     }
     Some(MpvContext {
