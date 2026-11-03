@@ -596,6 +596,7 @@ pub fn run_levels_analysis(
         &fmt,
         hw.as_deref(),
         info.total_frames,
+        info.estimated_frames,
         attempt_progress(),
         process_handle.clone(),
     ) {
@@ -612,6 +613,7 @@ pub fn run_levels_analysis(
                 &fmt,
                 None,
                 info.total_frames,
+                info.estimated_frames,
                 attempt_progress(),
                 process_handle,
             )?
@@ -635,6 +637,9 @@ pub struct SingleFileInfo {
     pub start_frame: i64,
     /// Frame count from the container, if it reports one.
     pub total_frames: Option<u64>,
+    /// `total_frames`, or failing that duration × frame rate. For progress
+    /// display only — never used to stop decoding.
+    pub estimated_frames: Option<u64>,
     /// Bit depth of the source pixel format.
     pub bit_depth: u32,
     pub pix_fmt: String,
@@ -671,8 +676,20 @@ pub fn prepare_single_file(
     }
 
     let total = info.nb_frames.map(|n| n as u64);
-    if let Some(n) = total {
-        diagnostics.push(format!("frames: {n}"));
+    // Many containers (MKV, MXF, TS) don't report a frame count; estimate
+    // one from the duration so the progress bar still moves.
+    let estimated = total.or_else(|| {
+        let dur = probe
+            .get("format")
+            .and_then(|f| f.get("duration"))
+            .and_then(|d| d.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| d.as_f64()))?;
+        let est = (dur * info.fps_num as f64 / info.fps_den.max(1) as f64).round();
+        (est >= 1.0).then_some(est as u64)
+    });
+    match (total, estimated) {
+        (Some(n), _) => diagnostics.push(format!("frames: {n}")),
+        (None, Some(n)) => diagnostics.push(format!("frames: ~{n} (from duration)")),
+        _ => {}
     }
 
     let bit_depth = parse_pix_fmt(&info.pix_fmt).bit_depth;
@@ -682,6 +699,7 @@ pub fn prepare_single_file(
         tc_fmt,
         start_frame: info.start_tc_frames,
         total_frames: total,
+        estimated_frames: estimated,
         bit_depth,
         pix_fmt: info.pix_fmt,
         width: info.width,

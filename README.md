@@ -9,12 +9,20 @@ engine driving ffmpeg.
 |------|--------|----------------|---------|
 | `diff` | reference + distorted | `psnr` (+ optional `ssim`) | `diff_y/u/v` (RMS pixel difference), `ssim*` |
 | `vmaf` | reference + distorted | `libvmaf` / `libvmaf_cuda` | `vmaf`, `psnr` |
-| `levels` | single file | `signalstats` | `y/u/v_min/max`, `y_avg`, `y/u/v_dif`, `sat_avg` |
+| `levels` | single file | native stats (ffmpeg decode → raw pipe) | `y/u/v_min/max`, `y/u/v_avg`, `y/u/v_dif` |
 
 Both comparison modes sync the two files by start-of-file or by embedded
 timecode, handle resolution and pixel-format mismatches (compare at the
 smaller resolution, upconvert to the higher bit depth), and accept IMF /
 concat manifests as inputs.
+
+`levels` doesn't use an ffmpeg filter: ffmpeg only decodes, writing planar
+YUV at the source's bit depth and subsampling to a pipe, and the statistics
+are computed in Rust on a worker pool (`engine/rawstats.rs`). ffmpeg's
+`signalstats` filter is single-threaded and costs more than decoding, so this
+makes the pass decode-bound. Sources with hardware decoders (H.264, HEVC,
+AV1, …) use `-hwaccel` when ffmpeg offers one, falling back to software if
+no device is available. ProRes / DNxHR always decode in software.
 
 Results are cached as `.vcompare.json` next to the reference file and can be
 reopened from the Recent Analyses list, exported to CSV, and scrubbed in mpv
@@ -25,7 +33,10 @@ reopened from the Recent Analyses list, exported to CSV, and scrubbed in mpv
 `levels` and `diff` analyses feed an event detector that finds flash frames:
 runs of 1–3 frames that differ sharply from *both* neighbours while the
 neighbours agree with each other (which is what separates a flash from a cut).
-Flashes are sub-classified as black, white, or content. Detection runs over
+Flashes are sub-classified as black, white, or content. For native levels
+analyses, whether the neighbours agree is judged from small luma thumbnails
+of the frames on either side; older caches fall back to average luma and
+chroma. Detection runs over
 the cached per-frame stats, so sensitivity can be tuned live without
 re-running ffmpeg. Events are shown as markers on the timeline and chart,
 listed in a panel, and navigable with `n` / `N` (which also seeks mpv).
@@ -60,6 +71,7 @@ src-tauri/
 │   ├── bridge.rs              #[tauri::command] handlers
 │   └── engine/
 │       ├── analysis.rs        ffmpeg command construction + stats parsing
+│       ├── rawstats.rs        Native per-frame stats over a rawvideo pipe
 │       ├── events.rs          Flash-frame / spike detection over series
 │       ├── state.rs           In-memory analysis results, queries, CSV export
 │       ├── cache.rs           .vcompare.json load/save

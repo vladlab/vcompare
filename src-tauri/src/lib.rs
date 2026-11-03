@@ -138,10 +138,12 @@ pub fn run() {
         if let tauri::RunEvent::Exit = event {
             log::info!("App exiting — cleaning up");
 
-            // Kill any running ffmpeg process
+            // Kill any running ffmpeg process. Take it out of the handle:
+            // the analysis runners read an empty handle as "killed
+            // externally" and must not retry or report it as a failure.
             if let Some(handle) = app_handle.try_state::<FfmpegHandle>() {
                 if let Ok(mut child) = handle.0.lock() {
-                    if let Some(ref mut c) = *child {
+                    if let Some(mut c) = child.take() {
                         let _ = c.kill();
                         let _ = c.wait();
                     }

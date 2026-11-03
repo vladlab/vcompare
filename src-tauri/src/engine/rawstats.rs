@@ -459,19 +459,29 @@ pub fn choose_hwaccel(codec_name: &str, file_path: &str, available: Option<&str>
 /// Decode `file_path` with ffmpeg and compute per-frame statistics.
 ///
 /// `hwaccel` is passed through to ffmpeg's `-hwaccel` for the input (only
-/// useful for codecs the GPU can decode; callers decide). `total_frames`
-/// drives `-frames:v` and progress. The ffmpeg child is stored in
-/// `process_handle` so the app can kill it on exit.
+/// useful for codecs the GPU can decode; callers decide). `frame_limit`
+/// becomes `-frames:v`; `progress_total` is the denominator for progress
+/// callbacks and may be an estimate (it is never used to stop decoding).
+/// The ffmpeg child is stored in `process_handle` so the app can kill it on
+/// exit; whoever kills it must `take()` it out of the handle.
 pub fn run_raw_stats(
     file_path: &str,
     fmt: &RawFormat,
     hwaccel: Option<&str>,
-    total_frames: Option<u64>,
+    frame_limit: Option<u64>,
+    progress_total: Option<u64>,
     progress: Option<ProgressFn>,
     process_handle: crate::engine::analysis::ProcessHandle,
 ) -> Result<Vec<FrameStats>, RawStatsError> {
     // ── ffmpeg command ──
-    let mut args: Vec<String> = vec!["-nostdin".into(), "-hide_banner".into()];
+    // -loglevel error: stderr is only kept for error reports (progress comes
+    // from the collector), so keep the banner and stream dump out of them.
+    let mut args: Vec<String> = vec![
+        "-nostdin".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+    ];
     if let Some(hw) = hwaccel {
         if !is_concat_manifest(file_path) {
             args.extend(["-hwaccel".into(), hw.to_string()]);
@@ -484,8 +494,8 @@ pub fn run_raw_stats(
     args.extend(["-map".into(), "0:v:0".into(), "-an".into(), "-sn".into()]);
     // Emit exactly the decoded frames: no duplication/dropping to a fixed rate.
     args.extend(["-fps_mode".into(), "passthrough".into()]);
-    if let Some(total) = total_frames {
-        args.extend(["-frames:v".into(), total.to_string()]);
+    if let Some(limit) = frame_limit {
+        args.extend(["-frames:v".into(), limit.to_string()]);
     }
     args.extend([
         "-f".into(),
@@ -600,16 +610,17 @@ pub fn run_raw_stats(
                 out.push(r.stats);
                 next += 1;
 
-                if let (Some(total), Some(cb)) = (total_frames, progress.as_ref()) {
+                if let (Some(total), Some(cb)) = (progress_total, progress.as_ref()) {
                     if last_progress.elapsed().as_millis() >= 250 {
                         last_progress = Instant::now();
-                        cb(next, total);
+                        // An estimated total can be exceeded; never report >100%.
+                        cb(next, total.max(next));
                     }
                 }
             }
         }
-        if let (Some(total), Some(cb)) = (total_frames, progress.as_ref()) {
-            cb(total.min(next), total);
+        if let (Some(_), Some(cb)) = (progress_total, progress.as_ref()) {
+            cb(next, next);
         }
         out
     });
