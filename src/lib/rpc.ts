@@ -84,6 +84,8 @@ export interface AnalysisSummary {
   v_max_stats?: MetricStats;
   diff_distribution?: DiffDistribution;
   timeline?: TimelineInfo;
+  /** One-line throughput summary for a freshly computed native levels run */
+  perf?: string;
 }
 
 /** Generic frame data — fields depend on analysis mode */

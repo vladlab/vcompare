@@ -413,6 +413,7 @@
     }
 
     state = "ready";
+    if (result.perf) showStatus(result.perf, 20000);
 
     // Flash-frame detection (levels / diff only)
     await runDetection();
@@ -434,6 +435,7 @@
     state = "analyzing";
     progressCurrent = 0;
     progressTotal = 0;
+    resetProgressRate();
     diagnosticLines = [];
 
     try {
@@ -489,9 +491,44 @@
 
   // ── Event handlers ──
 
+  // Throughput: frames/s over a sliding window of recent progress events
+  // (events arrive every ~250 ms), plus an ETA from that rate.
+  const RATE_WINDOW_MS = 3000;
+  let rateSamples: { t: number; frame: number }[] = [];
+  let progressFps: number | null = $state(null);
+  let progressEta: number | null = $state(null);
+
+  function resetProgressRate() {
+    rateSamples = [];
+    progressFps = null;
+    progressEta = null;
+  }
+
   function handleProgress(e: ProgressEvent) {
     progressCurrent = e.current;
     progressTotal = e.total;
+
+    const now = performance.now();
+    rateSamples.push({ t: now, frame: e.current });
+    while (rateSamples.length > 2 && now - rateSamples[0].t > RATE_WINDOW_MS) {
+      rateSamples.shift();
+    }
+    const first = rateSamples[0];
+    const dt = (now - first.t) / 1000;
+    if (rateSamples.length >= 2 && dt > 0.5) {
+      progressFps = (e.current - first.frame) / dt;
+      progressEta = progressFps > 0 && e.total > e.current
+        ? (e.total - e.current) / progressFps
+        : null;
+    }
+  }
+
+  function fmtDuration(sec: number): string {
+    const s = Math.round(sec);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const ss = s % 60;
+    return h > 0 ? `${h}h${String(m).padStart(2, "0")}m` : m > 0 ? `${m}m${String(ss).padStart(2, "0")}s` : `${ss}s`;
   }
 
   function handleDiagnostics(e: DiagnosticsEvent) {
@@ -910,6 +947,10 @@
           {#if progressTotal > 0}
             {progressCurrent.toLocaleString()} / {progressTotal.toLocaleString()} frames
             ({progressPct}%)
+            {#if progressFps != null}
+              · {progressFps.toFixed(1)} fps
+              {#if progressEta != null}· ~{fmtDuration(progressEta)} left{/if}
+            {/if}
           {:else}
             Starting FFmpeg…
           {/if}

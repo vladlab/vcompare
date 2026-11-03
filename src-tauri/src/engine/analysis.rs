@@ -556,7 +556,8 @@ pub fn run_vmaf_analysis(
 /// frames is retried in software.
 ///
 /// `publish` is called with the diagnostics lines whenever they change so
-/// the progress screen can show them.
+/// the progress screen can show them. Returns the frames and a one-line
+/// performance summary (fps and what limited it).
 pub fn run_levels_analysis(
     file_path: &str,
     info: &SingleFileInfo,
@@ -565,7 +566,7 @@ pub fn run_levels_analysis(
     process_handle: ProcessHandle,
     diagnostics: &mut Vec<String>,
     publish: &dyn Fn(&[String]),
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, String), String> {
     use crate::engine::rawstats::{choose_hwaccel, run_raw_stats, RawFormat};
 
     let fmt = RawFormat::for_source(&info.pix_fmt, info.width, info.height)
@@ -599,7 +600,7 @@ pub fn run_levels_analysis(
         })
     };
 
-    let stats = match run_raw_stats(
+    let (stats, report) = match run_raw_stats(
         file_path,
         &fmt,
         hw.as_deref(),
@@ -630,11 +631,12 @@ pub fn run_levels_analysis(
     };
 
     let tc = &info.tc_fmt;
-    Ok(stats
+    let frames = stats
         .iter()
         .enumerate()
         .map(|(i, s)| s.to_json(info.start_frame + i as i64, tc))
-        .collect())
+        .collect();
+    Ok((frames, report.summary()))
 }
 
 /// What a single-file (levels) analysis needs to know about its input.

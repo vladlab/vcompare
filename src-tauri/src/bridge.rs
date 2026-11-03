@@ -455,7 +455,7 @@ async fn _run_levels_analysis(
             let _ = app_progress.emit("rpc:progress", json!({"current": current, "total": total}));
         });
 
-        let frames = engine::analysis::run_levels_analysis(
+        let (frames, perf) = engine::analysis::run_levels_analysis(
             &file_path,
             &info,
             hwaccel.as_deref(),
@@ -483,12 +483,12 @@ async fn _run_levels_analysis(
             },
         });
 
-        Ok::<(Value, Option<String>), String>((result, save_path))
+        Ok::<(Value, Option<String>, String), String>((result, save_path, perf))
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))??;
 
-    let (result_val, save_path) = result;
+    let (result_val, save_path, perf) = result;
 
     engine_state.apply_levels_result(&result_val);
 
@@ -498,7 +498,10 @@ async fn _run_levels_analysis(
     }
 
     engine_state.set_save_path(save_path);
-    engine_state.build_summary()
+    // Not part of the stored analysis: only for this run's status line.
+    let mut summary = engine_state.build_summary()?;
+    summary["perf"] = json!(perf);
+    Ok(summary)
 }
 
 async fn _run_vmaf_analysis(

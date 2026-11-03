@@ -642,6 +642,54 @@ impl From<RawStatsError> for String {
     }
 }
 
+/// Where a raw stats run spent its time, for telling decode-bound runs from
+/// stats-bound ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunReport {
+    pub frames: u64,
+    pub elapsed_s: f64,
+    /// Reader blocked on the pipe: ffmpeg decoding (or reading the file).
+    pub wait_ffmpeg_s: f64,
+    /// Reader blocked for a free buffer: stats workers behind.
+    pub wait_buffer_s: f64,
+    pub workers: usize,
+    /// Fraction of total worker capacity spent computing (0..1).
+    pub worker_busy: f64,
+}
+
+impl RunReport {
+    pub fn fps(&self) -> f64 {
+        if self.elapsed_s > 0.0 { self.frames as f64 / self.elapsed_s } else { 0.0 }
+    }
+
+    /// What limited this run, in a few words.
+    pub fn bottleneck(&self) -> &'static str {
+        let e = self.elapsed_s.max(1e-9);
+        if self.wait_buffer_s > 0.4 * e {
+            "stats workers"
+        } else if self.wait_ffmpeg_s > 0.5 * e {
+            "ffmpeg decode / file read"
+        } else {
+            "balanced"
+        }
+    }
+
+    /// One line for logs and the UI.
+    pub fn summary(&self) -> String {
+        format!(
+            "{} frames in {:.1}s = {:.1} fps — limited by {} (waited on ffmpeg {:.0}%, on stats {:.0}%; {} stats workers {:.0}% busy)",
+            self.frames,
+            self.elapsed_s,
+            self.fps(),
+            self.bottleneck(),
+            100.0 * self.wait_ffmpeg_s / self.elapsed_s.max(1e-9),
+            100.0 * self.wait_buffer_s / self.elapsed_s.max(1e-9),
+            self.workers,
+            100.0 * self.worker_busy,
+        )
+    }
+}
+
 /// Codecs for which passing `-hwaccel` to ffmpeg is worthwhile. Intra-only
 /// mastering codecs (ProRes, DNxHR, FFV1, …) have no hardware decoders.
 pub const HW_DECODE_CODECS: &[&str] =
@@ -679,7 +727,7 @@ pub fn run_raw_stats(
     progress_total: Option<u64>,
     progress: Option<ProgressFn>,
     process_handle: crate::engine::analysis::ProcessHandle,
-) -> Result<Vec<FrameStats>, RawStatsError> {
+) -> Result<(Vec<FrameStats>, RunReport), RawStatsError> {
     // A zero-sized frame would make the reader "read" empty frames forever
     // without touching the pipe (ffprobe reports 0×0 when it can't work out
     // the stream's parameters).
@@ -798,8 +846,10 @@ pub fn run_raw_stats(
     let (res_tx, res_rx) = mpsc::channel::<WorkerOut>();
     let (pool_tx, pool_rx) = mpsc::channel::<Vec<u8>>();
 
+    let busy_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut workers = Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
+        let busy_ns = busy_ns.clone();
         let rx = job_rx.clone();
         let tx = res_tx.clone();
         let fmt = fmt.clone();
@@ -813,7 +863,9 @@ pub fn run_raw_stats(
             if job.index == PANIC_AT_FRAME.load(std::sync::atomic::Ordering::Relaxed) {
                 panic!("injected worker failure at frame {}", job.index);
             }
+            let t0 = Instant::now();
             let (stats, thumb) = compute_frame(&fmt, &job.frame.data, prev);
+            busy_ns.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             if tx.send(WorkerOut { index: job.index, stats, thumb }).is_err() {
                 break;
             }
@@ -907,6 +959,16 @@ pub fn run_raw_stats(
         t_read += (t2 - t1).as_secs_f64();
         t_send += (t3 - t2).as_secs_f64();
     }
+    let report = RunReport {
+        frames: index,
+        elapsed_s: t_start.elapsed().as_secs_f64(),
+        wait_ffmpeg_s: t_read,
+        wait_buffer_s: t_pool,
+        workers: n_workers,
+        worker_busy: busy_ns.load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 1e9
+            / (t_start.elapsed().as_secs_f64() * n_workers as f64).max(1e-9),
+    };
     if profile {
         eprintln!(
             "[vcompare] rawstats reader: {index} frames, {:.2}s total — waiting for buffer {:.2}s, reading pipe {:.2}s, sending jobs {:.2}s (workers={n_workers}, buffers={max_buffers})",
@@ -993,7 +1055,8 @@ pub fn run_raw_stats(
     }
 
     out.shrink_to_fit();
-    Ok(out)
+    eprintln!("[vcompare] native stats: {}", report.summary());
+    Ok((out, report))
 }
 
 /// Whether this ffmpeg understands `-fps_mode` (5.1+). Checked once.
@@ -1263,9 +1326,11 @@ mod tests {
         let clip_s = clip.to_string_lossy().to_string();
 
         // Sanity: the clean run returns every frame.
-        let ok = run_raw_stats(&clip_s, &f, None, None, None, None,
+        let (ok, report) = run_raw_stats(&clip_s, &f, None, None, None, None,
                                std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         assert_eq!(ok.len(), 400);
+        assert_eq!(report.frames, 400);
+        assert!(report.fps() > 0.0 && report.worker_busy > 0.0 && report.worker_busy <= 1.0);
 
         PANIC_AT_FRAME.store(5, std::sync::atomic::Ordering::Relaxed);
         let t = std::time::Instant::now();
