@@ -196,11 +196,27 @@ pub struct LoadedVmafAnalysis {
     pub tc_format: Option<TimecodeFormat>,
 }
 
+/// Write a file so that readers only ever see the old or the complete new
+/// contents: write `<path>.partial`, then rename over `path`. A crash or
+/// quit mid-write leaves at most a `.partial` file, never a truncated
+/// analysis that the picker would offer as "cached".
+pub fn write_atomic(path: &str, content: &[u8]) -> Result<(), String> {
+    let tmp = format!("{path}.partial");
+    if let Err(e) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to write {path}: {e}"));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Failed to write {path}: {e}")
+    })
+}
+
 /// Save a diff analysis result to JSON.
 pub fn save_diff_analysis(result: &Value, path: &str) -> Result<(), String> {
     let content = serde_json::to_string(result)
         .map_err(|e| format!("Failed to serialize analysis: {e}"))?;
-    std::fs::write(path, content).map_err(|e| format!("Failed to write analysis: {e}"))
+    write_atomic(path, content.as_bytes())
 }
 
 /// Save a VMAF analysis result to JSON.
@@ -240,5 +256,5 @@ pub fn save_vmaf_analysis(
 
     let content = serde_json::to_string(&data)
         .map_err(|e| format!("Failed to serialize: {e}"))?;
-    std::fs::write(path, content).map_err(|e| format!("Failed to write: {e}"))
+    write_atomic(path, content.as_bytes())
 }

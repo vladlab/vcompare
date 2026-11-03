@@ -717,8 +717,8 @@ pub fn choose_hwaccel(codec_name: &str, file_path: &str, available: Option<&str>
 /// useful for codecs the GPU can decode; callers decide). `frame_limit`
 /// becomes `-frames:v`; `progress_total` is the denominator for progress
 /// callbacks and may be an estimate (it is never used to stop decoding).
-/// The ffmpeg child is stored in `process_handle` so the app can kill it on
-/// exit; whoever kills it must `take()` it out of the handle.
+/// The ffmpeg child is attached to `process_handle` so the app can cancel it
+/// or kill it on exit (see `engine::process` for the conventions).
 pub fn run_raw_stats(
     file_path: &str,
     fmt: &RawFormat,
@@ -800,7 +800,13 @@ pub fn run_raw_stats(
         .stderr
         .take()
         .ok_or_else(|| RawStatsError::new("Failed to get ffmpeg stderr", 0))?;
-    *process_handle.lock().unwrap() = Some(child);
+    if !process_handle.attach(child) {
+        return Err(RawStatsError {
+            message: "Analysis cancelled".into(),
+            frames_read: 0,
+            killed: true,
+        });
+    }
 
     // ── stderr: keep a tail for error reporting ──
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -983,9 +989,7 @@ pub fn run_raw_stats(
     // end, or the wait() below would block forever. The child stays in the
     // handle so this isn't mistaken for an external kill.
     if read_err.is_some() {
-        if let Some(c) = process_handle.lock().unwrap().as_mut() {
-            let _ = c.kill();
-        }
+        process_handle.kill_attached();
     }
     drop(reader);
 
@@ -1000,9 +1004,7 @@ pub fn run_raw_stats(
     let mut out = match collected {
         Ok(out) if !worker_failed && out.len() as u64 == frames_read => out,
         Ok(out) => {
-            if let Some(c) = process_handle.lock().unwrap().as_mut() {
-                let _ = c.kill();
-            }
+            process_handle.kill_attached();
             if read_err.is_none() {
                 read_err = Some(format!(
                     "stats worker failed: computed {} of {} frames",
@@ -1013,9 +1015,7 @@ pub fn run_raw_stats(
             Vec::new()
         }
         Err(_) => {
-            if let Some(c) = process_handle.lock().unwrap().as_mut() {
-                let _ = c.kill();
-            }
+            process_handle.kill_attached();
             if read_err.is_none() {
                 read_err = Some("stats collector thread panicked".into());
             }
@@ -1024,7 +1024,7 @@ pub fn run_raw_stats(
     };
 
     // ── ffmpeg exit status ──
-    let mut child_opt = process_handle.lock().unwrap().take();
+    let mut child_opt = process_handle.detach();
     let status = match child_opt.as_mut() {
         Some(c) => c.wait().map_err(|e| {
             RawStatsError::new(format!("Failed to wait for ffmpeg: {e}"), frames_read)
@@ -1295,7 +1295,7 @@ mod tests {
         let t = std::time::Instant::now();
         let r = run_raw_stats(
             "/nonexistent.mov", &f, None, None, None, None,
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            crate::engine::process::standalone_job(),
         );
         let e = r.unwrap_err();
         assert!(e.message.contains("0x0"), "{}", e.message);
@@ -1327,7 +1327,7 @@ mod tests {
 
         // Sanity: the clean run returns every frame.
         let (ok, report) = run_raw_stats(&clip_s, &f, None, None, None, None,
-                               std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+                               crate::engine::process::standalone_job()).unwrap();
         assert_eq!(ok.len(), 400);
         assert_eq!(report.frames, 400);
         assert!(report.fps() > 0.0 && report.worker_busy > 0.0 && report.worker_busy <= 1.0);
@@ -1335,7 +1335,7 @@ mod tests {
         PANIC_AT_FRAME.store(5, std::sync::atomic::Ordering::Relaxed);
         let t = std::time::Instant::now();
         let r = run_raw_stats(&clip_s, &f, None, None, None, None,
-                              std::sync::Arc::new(std::sync::Mutex::new(None)));
+                              crate::engine::process::standalone_job());
         PANIC_AT_FRAME.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&dir);
 

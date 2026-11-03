@@ -112,6 +112,7 @@ pub fn run() {
             bridge::check_levels_cache,
             bridge::load_saved_analysis,
             bridge::analyze,
+            bridge::cancel_analysis,
             bridge::get_frames,
             bridge::get_metric_series,
             bridge::detect_events,
@@ -138,16 +139,10 @@ pub fn run() {
         if let tauri::RunEvent::Exit = event {
             log::info!("App exiting — cleaning up");
 
-            // Kill any running ffmpeg process. Take it out of the handle:
-            // the analysis runners read an empty handle as "killed
-            // externally" and must not retry or report it as a failure.
+            // Kill any running ffmpeg process (same path as Cancel: the
+            // runners then neither retry nor save).
             if let Some(handle) = app_handle.try_state::<FfmpegHandle>() {
-                if let Ok(mut child) = handle.0.lock() {
-                    if let Some(mut c) = child.take() {
-                        let _ = c.kill();
-                        let _ = c.wait();
-                    }
-                }
+                handle.0.cancel();
             }
 
             // Kill mpv if running

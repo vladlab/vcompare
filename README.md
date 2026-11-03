@@ -24,6 +24,11 @@ makes the pass decode-bound. Sources with hardware decoders (H.264, HEVC,
 AV1, …) use `-hwaccel` when ffmpeg offers one, falling back to software if
 no device is available. ProRes / DNxHR always decode in software.
 
+Files can be chosen with the file dialog or dropped onto the window: onto
+the Reference / Distorted rows individually, or two at once to fill both.
+A running analysis can be cancelled (button or `Esc`); a cancelled job
+saves nothing and leaves no temp files.
+
 Results are cached as `.vcompare.json` next to the reference file and can be
 reopened from the Recent Analyses list, exported to CSV, and scrubbed in mpv
 (side-by-side or difference view).
@@ -128,5 +133,6 @@ the usual WebKitGTK workaround env vars automatically.
 | `m` | cycle active metric |
 | `t` / `T` | auto-threshold from active metric / clear threshold |
 | `n` / `N` | next / previous flash event |
+| `Esc` | cancel the running analysis (nothing is saved) |
 | `p` / `P` | launch / close mpv side-by-side |
 | `d` / `D` | launch / close mpv difference view |

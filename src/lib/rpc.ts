@@ -265,6 +265,11 @@ export async function analyze(params: AnalyzeParams): Promise<AnalysisSummary> {
   return invoke("analyze", { params });
 }
 
+/** Cancel the running analysis. Its ffmpeg is killed and nothing is saved. */
+export async function cancelAnalysis(): Promise<{ cancelled: boolean; was_running: boolean }> {
+  return invoke("cancel_analysis");
+}
+
 export async function getFrames(params: GetFramesParams): Promise<FrameResult> {
   return invoke("get_frames", { params });
 }

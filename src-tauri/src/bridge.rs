@@ -93,14 +93,18 @@ impl DiffViewState {
     }
 }
 
-/// Handle to a running ffmpeg process for cancellation.
-pub struct FfmpegHandle(pub ProcessHandle);
+/// The app-wide ffmpeg slot: jobs attach their process to it, Cancel and
+/// app quit kill through it.
+pub struct FfmpegHandle(pub Arc<engine::process::ProcessSlot>);
 
 impl FfmpegHandle {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
+        Self(Arc::new(engine::process::ProcessSlot::new()))
     }
 }
+
+/// Error returned by `analyze` when the job was cancelled.
+pub const CANCELLED: &str = "Analysis cancelled";
 
 // ─── Recent analyses ────────────────────────────────────────────────────────
 
@@ -141,7 +145,7 @@ impl RecentsState {
 
     fn save(&self, entries: &[RecentEntry]) {
         if let Ok(json) = serde_json::to_string_pretty(entries) {
-            let _ = std::fs::write(&self.path, json);
+            let _ = cache::write_atomic(&self.path.to_string_lossy(), json.as_bytes());
         }
     }
 }
@@ -300,9 +304,12 @@ pub async fn analyze(
         }
     }
 
-    let process_handle = ffmpeg_handle.0.clone();
+    // A new job: supersedes (and kills) anything still winding down from a
+    // cancelled one.
+    let process_handle = ffmpeg_handle.0.begin();
+    let job = process_handle.clone();
 
-    if mode == "levels" {
+    let result = if mode == "levels" {
         _run_levels_analysis(
             app, &ref_path, save_path, &engine_state, process_handle,
         )
@@ -320,7 +327,24 @@ pub async fn analyze(
             with_ssim, save_path, &engine_state, process_handle,
         )
         .await
+    };
+
+    // Whatever the runner reported, a cancelled job is reported as such
+    // (its ffmpeg was killed, so its own error is just fallout).
+    if job.is_cancelled() {
+        return Err(CANCELLED.into());
     }
+    result
+}
+
+/// Cancel the running analysis: kills its ffmpeg (or the next one it starts)
+/// and stops it from saving anything. Recents are only recorded by the
+/// frontend after a successful job, so nothing else needs undoing.
+#[tauri::command]
+pub async fn cancel_analysis(ffmpeg_handle: State<'_, FfmpegHandle>) -> Result<Value, String> {
+    let was_running = ffmpeg_handle.0.cancel();
+    eprintln!("[vcompare] analysis cancelled (ffmpeg was running: {was_running})");
+    Ok(json!({"cancelled": true, "was_running": was_running}))
 }
 
 async fn _run_diff_analysis(
@@ -334,6 +358,7 @@ async fn _run_diff_analysis(
     engine_state: &State<'_, EngineState>,
     process_handle: ProcessHandle,
 ) -> Result<Value, String> {
+    let cancel_check = process_handle.clone();
     let ref_path = ref_path.to_string();
     let dist_path = dist_path.to_string();
     let sync_mode = sync_mode.to_string();
@@ -416,6 +441,9 @@ async fn _run_diff_analysis(
     .map_err(|e| format!("Task join error: {e}"))??;
 
     let (result_val, save_path) = result;
+    if cancel_check.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
 
     engine_state.apply_diff_result(&result_val);
 
@@ -435,6 +463,7 @@ async fn _run_levels_analysis(
     engine_state: &State<'_, EngineState>,
     process_handle: ProcessHandle,
 ) -> Result<Value, String> {
+    let cancel_check = process_handle.clone();
     let file_path = file_path.to_string();
     let app_clone = app.clone();
 
@@ -489,6 +518,9 @@ async fn _run_levels_analysis(
     .map_err(|e| format!("Task join error: {e}"))??;
 
     let (result_val, save_path, perf) = result;
+    if cancel_check.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
 
     engine_state.apply_levels_result(&result_val);
 
@@ -515,6 +547,7 @@ async fn _run_vmaf_analysis(
     engine_state: &State<'_, EngineState>,
     process_handle: ProcessHandle,
 ) -> Result<Value, String> {
+    let cancel_check = process_handle.clone();
     let ref_path = ref_path.to_string();
     let dist_path = dist_path.to_string();
     let sync_mode = sync_mode.to_string();
@@ -570,6 +603,9 @@ async fn _run_vmaf_analysis(
     .map_err(|e| format!("Task join error: {e}"))??;
 
     let (frames, ref_path, dist_path, ref_start_frame, ref_file_start_tc, sync_mode, tc_fmt, save_path, timeline, scale_w, scale_h, scale_ref) = result;
+    if cancel_check.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
 
     if let Some(ref sp) = save_path {
         cache::save_vmaf_analysis(

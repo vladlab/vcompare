@@ -12,6 +12,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { open, save } from "@tauri-apps/plugin-dialog";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
     type AnalysisSummary,
     type FileProbe,
@@ -31,6 +32,7 @@
     checkLevelsCache,
     loadSavedAnalysis,
     analyze,
+    cancelAnalysis,
     getMetricSeries,
     getFrames,
     exportCsv,
@@ -174,6 +176,32 @@
     );
 
     unlisteners.push(
+      await getCurrentWebview().onDragDropEvent((event) => {
+        const p = event.payload;
+        // Only the file picker accepts drops.
+        if (state !== "idle") {
+          dragActive = false;
+          return;
+        }
+        if (p.type === "enter") {
+          dragActive = true;
+          dragCount = p.paths.length;
+          dragZone = zoneAt(p.position);
+        } else if (p.type === "over") {
+          dragZone = zoneAt(p.position);
+        } else if (p.type === "drop") {
+          const zone = zoneAt(p.position);
+          dragActive = false;
+          dragZone = null;
+          handleDrop(p.paths, zone).catch((e) => showStatus(`Drop failed: ${e}`));
+        } else {
+          dragActive = false;
+          dragZone = null;
+        }
+      })
+    );
+
+    unlisteners.push(
       await listen("menu-event", (event) => {
         const id = event.payload as string;
         if (id === "new-analysis") {
@@ -310,26 +338,51 @@
     { name: "All Files", extensions: ["*"] },
   ];
 
+  function dirOf(path: string): string | undefined {
+    const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+    return i > 0 ? path.substring(0, i) : undefined;
+  }
+
+  /** Set (and probe) the reference / single file — from the dialog or a drop. */
+  async function setReference(path: string) {
+    refPath = path;
+    lastDir = dirOf(path) ?? lastDir;
+    try {
+      refProbe = await probeFile(refPath);
+    } catch (e) {
+      refProbe = null;
+      showStatus(`Can't read ${fileName(path)}: ${e}`);
+    }
+    if (analysisMode === "levels") {
+      await updateCacheInfo();
+    } else if (distPath) {
+      await probeSelected();
+    }
+  }
+
+  async function setDistorted(path: string) {
+    distPath = path;
+    lastDir = dirOf(path) ?? lastDir;
+    try {
+      distProbe = await probeFile(distPath);
+    } catch (e) {
+      distProbe = null;
+      showStatus(`Can't read ${fileName(path)}: ${e}`);
+    }
+    if (refPath) await probeSelected();
+  }
+
+  function fileName(path: string): string {
+    return path.split(/[\\/]/).pop() ?? path;
+  }
+
   async function pickReference() {
     const result = await open({
-      title: "Select reference video",
+      title: analysisMode === "levels" ? "Select video" : "Select reference video",
       filters: VIDEO_FILTERS,
       defaultPath: lastDir,
     });
-    if (result) {
-      refPath = result as string;
-      lastDir = refPath.substring(0, refPath.lastIndexOf("/")) || undefined;
-      try {
-        refProbe = await probeFile(refPath);
-      } catch (e) {
-        refProbe = null;
-      }
-      if (analysisMode === "levels") {
-        await updateCacheInfo();
-      } else if (distPath) {
-        await probeSelected();
-      }
-    }
+    if (result) await setReference(result as string);
   }
 
   async function pickDistorted() {
@@ -338,16 +391,48 @@
       filters: VIDEO_FILTERS,
       defaultPath: lastDir,
     });
-    if (result) {
-      distPath = result as string;
-      lastDir = distPath.substring(0, distPath.lastIndexOf("/")) || undefined;
-      try {
-        distProbe = await probeFile(distPath);
-      } catch (e) {
-        distProbe = null;
-      }
-      if (refPath) await probeSelected();
+    if (result) await setDistorted(result as string);
+  }
+
+  // ── Drag and drop (OS file drops arrive via the webview, with paths) ──
+
+  type DropZone = "ref" | "dist";
+  let dragActive: boolean = $state(false);
+  let dragZone: DropZone | null = $state(null);
+  let dragCount: number = $state(0);
+
+  /** Which drop zone (if any) is under a webview position (physical px). */
+  function zoneAt(pos: { x: number; y: number }): DropZone | null {
+    const dpr = window.devicePixelRatio || 1;
+    const el = document.elementFromPoint(pos.x / dpr, pos.y / dpr);
+    const zone = el?.closest("[data-drop-zone]")?.getAttribute("data-drop-zone");
+    return zone === "ref" || zone === "dist" ? zone : null;
+  }
+
+  /**
+   * Levels: the first file is the one to analyse.
+   * Compare: two files fill reference then distorted (in the order given);
+   * one file goes to the zone it was dropped on, or else to whichever slot
+   * is empty (reference first).
+   */
+  async function handleDrop(paths: string[], zone: DropZone | null) {
+    if (paths.length === 0) return;
+    if (analysisMode === "levels") {
+      await setReference(paths[0]);
+      if (paths.length > 1) showStatus(`Levels analyses one file — using ${fileName(paths[0])}`);
+      return;
     }
+    if (paths.length >= 2) {
+      // Set both before probing so the pair is probed once.
+      distPath = paths[1];
+      await setReference(paths[0]);
+      if (!distProbe) await setDistorted(paths[1]);
+      if (paths.length > 2) showStatus("Compare uses two files — extra files ignored");
+      return;
+    }
+    const target: DropZone = zone ?? (!refPath ? "ref" : !distPath ? "dist" : "ref");
+    if (target === "ref") await setReference(paths[0]);
+    else await setDistorted(paths[0]);
   }
 
   async function probeSelected() {
@@ -382,7 +467,37 @@
 
   // ── Analysis ──
 
-  async function finishAnalysis(result: AnalysisSummary) {
+  // Each job gets a token; a cancelled (or superseded) job's late result or
+  // error is ignored instead of replacing whatever the user is doing now.
+  let jobToken = 0;
+  let cancelling: boolean = $state(false);
+
+  function beginJob(): number {
+    cancelling = false;
+    return ++jobToken;
+  }
+
+  async function handleCancel() {
+    if (state !== "analyzing" || cancelling) return;
+    cancelling = true;
+    jobToken++; // drop whatever the cancelled job eventually returns
+    try {
+      await cancelAnalysis();
+    } catch (e) {
+      console.error("cancel:", e);
+    }
+    progressCurrent = 0;
+    progressTotal = 0;
+    resetProgressRate();
+    diagnosticLines = [];
+    cancelling = false;
+    state = "idle";
+    await updateCacheInfo();
+    showStatus("Analysis cancelled — nothing was saved");
+  }
+
+  async function finishAnalysis(result: AnalysisSummary, token: number) {
+    if (token !== jobToken) return;
     summary = result;
     metricSeries = {};
 
@@ -393,6 +508,7 @@
       } catch (e) {
         console.error(`Failed to fetch series for ${m}:`, e);
       }
+      if (token !== jobToken) return;
     }
 
     // Set active metric to first available
@@ -432,6 +548,7 @@
   }
 
   async function startAnalysis() {
+    const token = beginJob();
     state = "analyzing";
     progressCurrent = 0;
     progressTotal = 0;
@@ -451,8 +568,9 @@
         log_path: cacheInfo?.path,
         force: true,
       });
-      await finishAnalysis(result);
+      await finishAnalysis(result, token);
     } catch (e) {
+      if (token !== jobToken) return; // cancelled: handleCancel already reset the UI
       state = "error";
       errorMessage = `Analysis failed: ${e}`;
     }
@@ -460,11 +578,13 @@
 
   async function loadCached() {
     if (!cacheInfo?.path) return;
+    const token = beginJob();
     state = "analyzing";
     try {
       const result = await loadSavedAnalysis(cacheInfo.path);
-      await finishAnalysis(result);
+      await finishAnalysis(result, token);
     } catch (e) {
+      if (token !== jobToken) return;
       state = "error";
       errorMessage = `Failed to load cached analysis: ${e}`;
     }
@@ -479,11 +599,13 @@
     }
     // Set cacheInfo so finishAnalysis can record it back to recents
     cacheInfo = { exists: true, path: entry.cache_path, frame_count: entry.frame_count, mode: entry.mode };
+    const token = beginJob();
     state = "analyzing";
     try {
       const result = await loadSavedAnalysis(entry.cache_path);
-      await finishAnalysis(result);
+      await finishAnalysis(result, token);
     } catch (e) {
+      if (token !== jobToken) return;
       state = "error";
       errorMessage = `Failed to load recent analysis: ${e}`;
     }
@@ -571,6 +693,11 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (state === "analyzing" && e.key === "Escape") {
+      e.preventDefault();
+      handleCancel();
+      return;
+    }
     if (state !== "ready") return;
     if (isTextEntry(e.target)) return;
 
@@ -819,10 +946,14 @@
           <h2>{analysisMode === "levels" ? "Analyze Video" : "Compare Videos"}</h2>
           <p class="text-secondary">
             {analysisMode === "levels"
-              ? "Select a video file to analyze signal levels."
-              : "Select a reference and distorted file to compare."}
+              ? "Select or drop a video file to analyze signal levels."
+              : "Select or drop a reference and distorted file — or drop both at once."}
           </p>
         </div>
+
+        {#if statusMessage}
+          <div class="picker-status">{statusMessage}</div>
+        {/if}
 
         <div class="options-row" style="margin-bottom: 12px;">
           <label>
@@ -835,7 +966,12 @@
           </label>
         </div>
 
-        <div class="file-row">
+        <div
+          class="file-row drop-zone"
+          class:drop-armed={dragActive}
+          class:drop-hover={dragActive && (dragZone === "ref" || analysisMode === "levels" || dragCount >= 2)}
+          data-drop-zone="ref"
+        >
           <label>{analysisMode === "levels" ? "File" : "Reference"}</label>
           <button onclick={pickReference} class="file-btn" title={refPath || ""}>
             {refPath ? refPath.split("/").pop() : "Choose file…"}
@@ -846,7 +982,12 @@
         </div>
 
         {#if analysisMode !== "levels"}
-          <div class="file-row">
+          <div
+            class="file-row drop-zone"
+            class:drop-armed={dragActive}
+            class:drop-hover={dragActive && (dragZone === "dist" || dragCount >= 2)}
+            data-drop-zone="dist"
+          >
             <label>Distorted</label>
             <button onclick={pickDistorted} class="file-btn" title={distPath || ""}>
               {distPath ? distPath.split("/").pop() : "Choose file…"}
@@ -958,6 +1099,12 @@
         {#if diagnosticLines.length > 0}
           <pre class="diagnostics mono">{diagnosticLines.join("\n")}</pre>
         {/if}
+        <div class="progress-actions">
+          <button class="cancel-btn" onclick={handleCancel} disabled={cancelling} title="Stop the analysis (Esc). Nothing is saved.">
+            {cancelling ? "Cancelling…" : "Cancel"}
+          </button>
+          <span class="text-muted">Esc</span>
+        </div>
       </div>
 
     {:else if state === "ready" && activeSeries}
@@ -1250,6 +1397,37 @@
   }
 
   /* Results */
+  /* Drag and drop */
+  .drop-zone {
+    border: 1px dashed transparent;
+    border-radius: var(--radius-md);
+    padding: 6px 8px;
+    margin: -7px -9px;
+    transition: border-color 80ms, background 80ms;
+  }
+  .drop-zone.drop-armed {
+    border-color: var(--border-strong);
+  }
+  .drop-zone.drop-hover {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .picker-status {
+    font-size: 12px;
+    color: var(--warning);
+  }
+
+  /* Cancel */
+  .progress-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--gap-sm);
+    margin-top: var(--gap-md);
+  }
+  .cancel-btn {
+    min-width: 96px;
+  }
+
   .results-layout {
     flex: 1;
     display: flex;

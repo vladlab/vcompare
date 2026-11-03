@@ -5,6 +5,7 @@ pub mod cache;
 pub mod events;
 pub mod mpv;
 pub mod pixfmt;
+pub mod process;
 pub mod probe;
 pub mod rawstats;
 pub mod state;

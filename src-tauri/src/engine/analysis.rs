@@ -7,7 +7,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::BufReader;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,8 +19,20 @@ use crate::engine::types::{ComparisonConfig, TimelineInfo};
 /// Callback for progress updates: (current_frame, total_frames).
 pub type ProgressFn = Box<dyn Fn(u64, u64) + Send>;
 
-/// Handle to a running ffmpeg process for external cancellation.
-pub type ProcessHandle = Arc<Mutex<Option<Child>>>;
+/// The running ffmpeg process and cancel flag, shared with the app so it can
+/// cancel or kill on quit. See `engine::process`.
+pub type ProcessHandle = Arc<crate::engine::process::Job>;
+
+/// Removes a scratch directory (and anything ffmpeg left in it) when
+/// dropped, so killed or failed runs don't leave partial stats / VMAF JSON
+/// logs behind in the temp folder.
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 // ─── Prepare comparison ─────────────────────────────────────────────────────
 
@@ -256,6 +268,7 @@ pub fn run_diff_analysis(
     let stats_dir = std::env::temp_dir().join(format!("vcompare_diff_{}", std::process::id()));
     std::fs::create_dir_all(&stats_dir)
         .map_err(|e| format!("Failed to create temp dir: {e}"))?;
+    let _cleanup = TempDirGuard(stats_dir.clone());
     let psnr_stats_path = stats_dir.join("psnr_stats.txt");
     let psnr_stats_str = psnr_stats_path.to_string_lossy().to_string();
     let ssim_stats_path = stats_dir.join("ssim_stats.txt");
@@ -366,6 +379,7 @@ pub fn run_vmaf_analysis(
     let log_dir = std::env::temp_dir().join(format!("vcompare_{}", std::process::id()));
     std::fs::create_dir_all(&log_dir)
         .map_err(|e| format!("Failed to create temp dir: {e}"))?;
+    let _cleanup = TempDirGuard(log_dir.clone());
     let log_path = log_dir.join("vmaf_log.json");
     let log_path_str = log_path.to_string_lossy().to_string();
 
@@ -767,8 +781,11 @@ fn run_ffmpeg_with_progress(
     // Take stderr before storing child — the Child retains pid for kill/wait
     let stderr = child.stderr.take().ok_or("Failed to get ffmpeg stderr")?;
 
-    // Store child in handle for external cancellation
-    *process_handle.lock().unwrap() = Some(child);
+    // Store child in handle for external cancellation; a job cancelled
+    // before we got here gets its ffmpeg killed straight away.
+    if !process_handle.attach(child) {
+        return Err("Analysis cancelled".into());
+    }
 
     let frame_re = Regex::new(r"frame=\s*(\d+)").unwrap();
     let mut last_reported: i64 = -1;
@@ -825,7 +842,7 @@ fn run_ffmpeg_with_progress(
     }
 
     // Wait for process to finish
-    let mut child_opt = process_handle.lock().unwrap().take();
+    let mut child_opt = process_handle.detach();
     let status = match child_opt.as_mut() {
         Some(c) => c.wait().map_err(|e| format!("Failed to wait for ffmpeg: {e}"))?,
         None => return Err("ffmpeg process was killed externally".into()),
