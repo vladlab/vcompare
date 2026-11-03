@@ -67,6 +67,8 @@ struct AnalysisMeta {
 const LEVELS_METRICS: &[&str] = &[
     "y_min", "y_max", "u_min", "u_max", "v_min", "v_max",
     "y_avg", "u_avg", "v_avg",
+    "y_low", "y_high",
+    "y_oor_lo", "y_oor_hi", "c_oor",
     "y_dif", "u_dif", "v_dif",
     // signalstats-era caches only
     "sat_avg",

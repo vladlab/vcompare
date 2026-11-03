@@ -112,6 +112,13 @@ export interface FrameData {
   y_avg?: number | null;
   u_avg?: number | null;
   v_avg?: number | null;
+  /** 10th / 90th percentile luma */
+  y_low?: number | null;
+  y_high?: number | null;
+  /** Sample counts outside the legal range (limited-range YUV sources only) */
+  y_oor_lo?: number | null;
+  y_oor_hi?: number | null;
+  c_oor?: number | null;
   /** Thumbnail difference vs 1..4 frames back (0..1) — native engine only */
   tdif_1?: number | null;
   tdif_2?: number | null;

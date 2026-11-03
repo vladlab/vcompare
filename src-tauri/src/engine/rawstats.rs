@@ -11,6 +11,11 @@
 //! format, matching what `signalstats` reported):
 //!
 //! - `y/u/v_min`, `y/u/v_max`, `y/u/v_avg`
+//! - `y_low`, `y_high`: 10th / 90th percentile luma (signalstats YLOW/YHIGH)
+//! - `y_oor_lo`, `y_oor_hi`, `c_oor`: sample counts outside the legal
+//!   (limited/"video") range — luma below black / above white, chroma
+//!   (U and V together) outside 16–240 scaled to the bit depth. Only for
+//!   limited-range YUV sources; absent for full-range and RGB sources.
 //! - `y/u/v_dif`: mean absolute difference against the previous frame
 //! - `tdif_1..=4`: mean absolute difference of a 32×18 luma thumbnail
 //!   against the thumbnail 1..4 frames back, normalized 0..1. These are
@@ -66,14 +71,40 @@ pub struct RawFormat {
     pub sub_x: usize,
     /// 1 or 2: chroma height divisor
     pub sub_y: usize,
+    /// Legal (limited-range) bounds to count out-of-range samples against.
+    /// `None` for full-range and RGB sources, where "legal" doesn't apply.
+    pub legal: Option<LegalRange>,
+}
+
+/// Limited-range code-value bounds for one bit depth (inclusive).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LegalRange {
+    pub y_lo: u32,
+    pub y_hi: u32,
+    pub c_lo: u32,
+    pub c_hi: u32,
+}
+
+impl LegalRange {
+    /// 16–235 luma, 16–240 chroma, scaled by 2^(depth-8) (BT.601/709/2020
+    /// limited range).
+    pub fn limited(bit_depth: u32) -> LegalRange {
+        let k = 1u32 << bit_depth.saturating_sub(8);
+        LegalRange { y_lo: 16 * k, y_hi: 235 * k, c_lo: 16 * k, c_hi: 240 * k }
+    }
 }
 
 impl RawFormat {
     /// Pick the planar YUV format closest to the source. Keeps the source
     /// bit depth and subsampling; RGB sources become 4:4:4 at their depth
     /// (ffmpeg converts; `signalstats` only handled YUV too).
+    ///
+    /// Full-range `yuvj*` sources are emitted as themselves: asking ffmpeg
+    /// for the plain `yuv*` equivalent would rescale them to limited range
+    /// and change the very values being measured.
     pub fn for_source(src_pix_fmt: &str, width: u32, height: u32) -> RawFormat {
-        let p = parse_pix_fmt(src_pix_fmt);
+        let src = src_pix_fmt.trim().to_ascii_lowercase();
+        let p = parse_pix_fmt(&src);
         let (sub_x, sub_y) = match p.subsampling {
             "444" => (1, 1),
             "422" => (2, 1),
@@ -85,10 +116,19 @@ impl RawFormat {
             12 => 12,
             _ => 16,
         };
-        let pix_fmt = if bit_depth == 8 {
+        let full_range_fmt = src.starts_with("yuvj");
+        let pix_fmt = if full_range_fmt {
+            // yuvj420p / yuvj422p / yuvj444p are all 8-bit planar
+            format!("yuvj{}p", p.subsampling)
+        } else if bit_depth == 8 {
             format!("yuv{}p", p.subsampling)
         } else {
             format!("yuv{}p{}le", p.subsampling, bit_depth)
+        };
+        let legal = if p.is_rgb || full_range_fmt {
+            None
+        } else {
+            Some(LegalRange::limited(bit_depth))
         };
         RawFormat {
             pix_fmt,
@@ -97,7 +137,17 @@ impl RawFormat {
             bit_depth,
             sub_x,
             sub_y,
+            legal,
         }
+    }
+
+    /// Mark the source as full range (ffprobe `color_range=pc`), which turns
+    /// off legal-range counting.
+    pub fn with_full_range(mut self, full: bool) -> RawFormat {
+        if full {
+            self.legal = None;
+        }
+        self
     }
 
     pub fn bytes_per_sample(&self) -> usize {
@@ -153,6 +203,12 @@ pub struct FrameStats {
     pub v_min: u32,
     pub v_max: u32,
     pub v_avg: f64,
+    /// 10th / 90th percentile luma code values.
+    pub y_low: u32,
+    pub y_high: u32,
+    /// Out-of-legal-range sample counts (luma below, luma above, chroma
+    /// outside); `None` when the source isn't limited-range YUV.
+    pub oor: Option<OutOfRange>,
     /// Mean |Δ| vs previous frame per plane; 0 for the first frame.
     pub y_dif: f64,
     pub u_dif: f64,
@@ -162,9 +218,31 @@ pub struct FrameStats {
     pub tdif: [f64; TDIF_DEPTH],
 }
 
+/// Sample counts outside the legal range for one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct OutOfRange {
+    pub y_lo: u64,
+    pub y_hi: u64,
+    /// U and V samples together
+    pub c: u64,
+}
+
 impl FrameStats {
     /// Convert to the JSON shape the rest of the engine consumes.
     pub fn to_json(&self, display_frame: i64, tc_fmt: &TimecodeFormat) -> Value {
+        let mut v = self.to_json_base(display_frame, tc_fmt);
+        let obj = v.as_object_mut().expect("object");
+        obj.insert("y_low".into(), self.y_low.into());
+        obj.insert("y_high".into(), self.y_high.into());
+        if let Some(o) = self.oor {
+            obj.insert("y_oor_lo".into(), o.y_lo.into());
+            obj.insert("y_oor_hi".into(), o.y_hi.into());
+            obj.insert("c_oor".into(), o.c.into());
+        }
+        v
+    }
+
+    fn to_json_base(&self, display_frame: i64, tc_fmt: &TimecodeFormat) -> Value {
         serde_json::json!({
             "frame": display_frame,
             "tc": tc_fmt.frame_to_tc(display_frame),
@@ -190,67 +268,172 @@ impl FrameStats {
 
 // ─── Plane maths ────────────────────────────────────────────────────────────
 
-/// (min, max, sum) over a plane.
-fn plane_minmaxsum(bytes: &[u8], two_byte: bool) -> (u32, u32, u64) {
+/// Everything derived from one plane's histogram.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PlaneSummary {
+    min: u32,
+    max: u32,
+    sum: u64,
+    /// 10th / 90th percentile (first code value whose cumulative count
+    /// reaches round(n·0.1) / round(n·0.9), as signalstats computes it)
+    low: u32,
+    high: u32,
+    /// samples < lo and > hi of the given bounds
+    below: u64,
+    above: u64,
+}
+
+/// min / max / sum and out-of-bounds counts in one pass, for planes that
+/// don't need a histogram (chroma). The comparisons are branch-free so the
+/// loops vectorize. `bounds = None` skips the counting.
+fn plane_scan(bytes: &[u8], two_byte: bool, bounds: Option<(u32, u32)>) -> PlaneSummary {
+    // With no bounds, use an impossible range so the counts stay 0 without
+    // a second loop variant.
+    let (lo, hi) = bounds.unwrap_or((0, u32::MAX));
+    let (mut mn, mut mx, mut sum, mut below, mut above) = (u32::MAX, 0u32, 0u64, 0u64, 0u64);
+
     if two_byte {
         let (prefix, mid, suffix) = unsafe { bytes.align_to::<u16>() };
-        // Plane buffers come from Vec<u8> allocations, which are at least
-        // 2-byte aligned on every platform we run on; handle the general
-        // case anyway so this can never read out of bounds.
+        let scalar = |v: u32, mn: &mut u32, mx: &mut u32, sum: &mut u64, b: &mut u64, a: &mut u64| {
+            *mn = (*mn).min(v);
+            *mx = (*mx).max(v);
+            *sum += v as u64;
+            *b += (v < lo) as u64;
+            *a += (v > hi) as u64;
+        };
         if !prefix.is_empty() || !suffix.is_empty() {
-            return minmaxsum_iter(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32));
+            // Unaligned buffer (never happens for Vec-backed frames): byte-wise.
+            for c in bytes.chunks_exact(2) {
+                let v = u16::from_le_bytes([c[0], c[1]]) as u32;
+                scalar(v, &mut mn, &mut mx, &mut sum, &mut below, &mut above);
+            }
+        } else {
+            let lo16 = lo.min(u16::MAX as u32 + 1);
+            let hi16 = hi.min(u16::MAX as u32);
+            for chunk in mid.chunks(1 << 15) {
+                let (mut cmn, mut cmx) = (u16::MAX, 0u16);
+                let (mut s, mut b, mut a) = (0u32, 0u32, 0u32);
+                for &v in chunk {
+                    let v = u16::from_le(v);
+                    cmn = cmn.min(v);
+                    cmx = cmx.max(v);
+                    s += v as u32;
+                    b += ((v as u32) < lo16) as u32;
+                    a += ((v as u32) > hi16) as u32;
+                }
+                mn = mn.min(cmn as u32);
+                mx = mx.max(cmx as u32);
+                sum += s as u64;
+                below += b as u64;
+                above += a as u64;
+            }
         }
-        minmaxsum_u16(mid)
     } else {
-        minmaxsum_u8(bytes)
-    }
-}
-
-fn minmaxsum_u8(data: &[u8]) -> (u32, u32, u64) {
-    let mut mn = u8::MAX;
-    let mut mx = u8::MIN;
-    let mut sum: u64 = 0;
-    // Chunked so the inner loops vectorize and the u32 accumulator can't
-    // overflow (255 * 65536 < u32::MAX).
-    for chunk in data.chunks(1 << 16) {
-        let mut s: u32 = 0;
-        for &v in chunk {
-            mn = mn.min(v);
-            mx = mx.max(v);
-            s += v as u32;
+        for chunk in bytes.chunks(1 << 16) {
+            let (mut cmn, mut cmx) = (u8::MAX, 0u8);
+            let (mut s, mut b, mut a) = (0u32, 0u32, 0u32);
+            for &v in chunk {
+                cmn = cmn.min(v);
+                cmx = cmx.max(v);
+                s += v as u32;
+                b += ((v as u32) < lo) as u32;
+                a += ((v as u32) > hi) as u32;
+            }
+            mn = mn.min(cmn as u32);
+            mx = mx.max(cmx as u32);
+            sum += s as u64;
+            below += b as u64;
+            above += a as u64;
         }
-        sum += s as u64;
     }
-    (mn as u32, mx as u32, sum)
+    if bytes.is_empty() {
+        mn = 0;
+    }
+    PlaneSummary { min: mn, max: mx, sum, low: 0, high: 0, below, above }
 }
 
-fn minmaxsum_u16(data: &[u16]) -> (u32, u32, u64) {
-    let mut mn = u16::MAX;
-    let mut mx = u16::MIN;
-    let mut sum: u64 = 0;
-    for chunk in data.chunks(1 << 15) {
-        let mut s: u32 = 0;
-        for &v in chunk {
-            let v = u16::from_le(v);
-            mn = mn.min(v);
-            mx = mx.max(v);
-            s += v as u32;
+/// Histogram of a plane with `bins` bins (values above the last bin are
+/// clamped into it). Four interleaved sub-histograms avoid the
+/// store-to-load stall of incrementing the same counter back to back on
+/// flat regions, then get summed.
+fn plane_histogram(bytes: &[u8], two_byte: bool, bins: usize) -> Vec<u32> {
+    let top = bins - 1;
+    let mut h = vec![0u32; bins * 4];
+    let (h0, rest) = h.split_at_mut(bins);
+    let (h1, rest) = rest.split_at_mut(bins);
+    let (h2, h3) = rest.split_at_mut(bins);
+
+    if two_byte {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let a = u16::from_le_bytes([c[0], c[1]]) as usize;
+            let b = u16::from_le_bytes([c[2], c[3]]) as usize;
+            let d = u16::from_le_bytes([c[4], c[5]]) as usize;
+            let e = u16::from_le_bytes([c[6], c[7]]) as usize;
+            h0[a.min(top)] += 1;
+            h1[b.min(top)] += 1;
+            h2[d.min(top)] += 1;
+            h3[e.min(top)] += 1;
         }
-        sum += s as u64;
+        for c in chunks.remainder().chunks_exact(2) {
+            h0[(u16::from_le_bytes([c[0], c[1]]) as usize).min(top)] += 1;
+        }
+    } else {
+        let mut chunks = bytes.chunks_exact(4);
+        for c in &mut chunks {
+            h0[(c[0] as usize).min(top)] += 1;
+            h1[(c[1] as usize).min(top)] += 1;
+            h2[(c[2] as usize).min(top)] += 1;
+            h3[(c[3] as usize).min(top)] += 1;
+        }
+        for &v in chunks.remainder() {
+            h0[(v as usize).min(top)] += 1;
+        }
     }
-    (mn as u32, mx as u32, sum)
+
+    for i in 0..bins {
+        h0[i] += h1[i] + h2[i] + h3[i];
+    }
+    h.truncate(bins);
+    h
 }
 
-fn minmaxsum_iter(it: impl Iterator<Item = u32>) -> (u32, u32, u64) {
-    let mut mn = u32::MAX;
-    let mut mx = 0u32;
-    let mut sum = 0u64;
-    for v in it {
-        mn = mn.min(v);
-        mx = mx.max(v);
-        sum += v as u64;
+fn summarize(hist: &[u32], n: u64, bounds: Option<(u32, u32)>) -> PlaneSummary {
+    let low_target = ((n as f64) * 0.10).round() as u64;
+    let high_target = ((n as f64) * 0.90).round() as u64;
+    let (mut min, mut max) = (None, 0u32);
+    let (mut low, mut high) = (None, None);
+    let (mut sum, mut acc, mut below, mut above) = (0u64, 0u64, 0u64, 0u64);
+
+    for (v, &c) in hist.iter().enumerate() {
+        if c == 0 {
+            // still need the percentile test when the target is 0
+            if low.is_none() && acc >= low_target { low = Some(v as u32); }
+            if high.is_none() && acc >= high_target { high = Some(v as u32); }
+            continue;
+        }
+        let v32 = v as u32;
+        let c = c as u64;
+        if min.is_none() { min = Some(v32); }
+        max = v32;
+        sum += v as u64 * c;
+        acc += c;
+        if low.is_none() && acc >= low_target { low = Some(v32); }
+        if high.is_none() && acc >= high_target { high = Some(v32); }
+        if let Some((lo, hi)) = bounds {
+            if v32 < lo { below += c; }
+            if v32 > hi { above += c; }
+        }
     }
-    (mn, mx, sum)
+    PlaneSummary {
+        min: min.unwrap_or(0),
+        max,
+        sum,
+        low: low.unwrap_or(0),
+        high: high.unwrap_or(max),
+        below,
+        above,
+    }
 }
 
 /// Sum of |a - b| over a plane.
@@ -368,33 +551,53 @@ struct WorkerOut {
 
 fn compute_frame(fmt: &RawFormat, frame: &[u8], prev: Option<&[u8]>) -> (FrameStats, Vec<f32>) {
     let two = fmt.bytes_per_sample() == 2;
-    let mut planes = [(0u32, 0u32, 0f64); 3];
+    let bins = 1usize << fmt.bit_depth;
+    let mut planes: [Option<PlaneSummary>; 3] = [None; 3];
     let mut difs = [0f64; 3];
 
     for p in 0..3 {
         let r = fmt.plane_range(p);
         let (w, h) = fmt.plane_dims(p);
-        let n = (w * h) as f64;
-        let (mn, mx, sum) = plane_minmaxsum(&frame[r.clone()], two);
-        planes[p] = (mn, mx, sum as f64 / n);
+        let n = (w * h) as u64;
+        let bounds = fmt.legal.map(|l| if p == 0 { (l.y_lo, l.y_hi) } else { (l.c_lo, l.c_hi) });
+        planes[p] = Some(if p == 0 {
+            // Luma needs percentiles, so it gets a histogram (and min/max/
+            // sum/counts fall out of it). Chroma only needs the scan.
+            let hist = plane_histogram(&frame[r.clone()], two, bins);
+            summarize(&hist, n, bounds)
+        } else {
+            plane_scan(&frame[r.clone()], two, bounds)
+        });
         if let Some(prev) = prev {
-            difs[p] = plane_absdiff_sum(&frame[r.clone()], &prev[r], two) as f64 / n;
+            difs[p] = plane_absdiff_sum(&frame[r.clone()], &prev[r], two) as f64 / n as f64;
         }
     }
+    let [py, pu, pv] = planes.map(|p| p.expect("all planes computed"));
+    let avg = |p: &PlaneSummary, plane: usize| {
+        let (w, h) = fmt.plane_dims(plane);
+        p.sum as f64 / (w * h) as f64
+    };
 
     let (yw, yh) = fmt.plane_dims(0);
     let thumb = luma_thumbnail(&frame[fmt.plane_range(0)], yw, yh, two, fmt.peak());
 
     let stats = FrameStats {
-        y_min: planes[0].0,
-        y_max: planes[0].1,
-        y_avg: planes[0].2,
-        u_min: planes[1].0,
-        u_max: planes[1].1,
-        u_avg: planes[1].2,
-        v_min: planes[2].0,
-        v_max: planes[2].1,
-        v_avg: planes[2].2,
+        y_min: py.min,
+        y_max: py.max,
+        y_avg: avg(&py, 0),
+        u_min: pu.min,
+        u_max: pu.max,
+        u_avg: avg(&pu, 1),
+        v_min: pv.min,
+        v_max: pv.max,
+        v_avg: avg(&pv, 2),
+        y_low: py.low,
+        y_high: py.high,
+        oor: fmt.legal.map(|_| OutOfRange {
+            y_lo: py.below,
+            y_hi: py.above,
+            c: pu.below + pu.above + pv.below + pv.above,
+        }),
         y_dif: difs[0],
         u_dif: difs[1],
         v_dif: difs[2],
@@ -784,6 +987,83 @@ mod tests {
         assert_eq!(f.bit_depth, 12);
         let f = fmt("rgb48le", 10, 10);
         assert_eq!(f.pix_fmt, "yuv444p16le");
+        assert_eq!(f.legal, None);
+        // Full-range sources pass through and don't count legal range
+        let f = fmt("yuvj420p", 64, 36);
+        assert_eq!(f.pix_fmt, "yuvj420p");
+        assert_eq!(f.legal, None);
+        let f = fmt("yuv422p10le", 64, 36);
+        assert_eq!(f.legal, Some(LegalRange { y_lo: 64, y_hi: 940, c_lo: 64, c_hi: 960 }));
+        assert_eq!(f.clone().with_full_range(true).legal, None);
+        assert_eq!(fmt("yuv420p", 2, 2).legal.unwrap().y_hi, 235);
+    }
+
+    #[test]
+    fn percentiles_and_out_of_range() {
+        // 10-bit 4:4:4, 100 luma samples 0..99 → shifted into a known range
+        let f = fmt("yuv444p10le", 10, 10);
+        let mut a = vec![0u8; f.frame_bytes()];
+        let ry = f.plane_range(0);
+        for (i, c) in a[ry.clone()].chunks_exact_mut(2).enumerate() {
+            // values 30, 40, ..., 1020 step 10 → 10 below 64? (30,40,50,60 = 4)
+            let v = 30 + 10 * i as u16;
+            c.copy_from_slice(&v.min(1023).to_le_bytes());
+        }
+        // Chroma: all legal except 3 U samples at 1000 and 2 V samples at 10
+        fill_u16(&mut a, f.plane_range(1), 512);
+        fill_u16(&mut a, f.plane_range(2), 512);
+        let ru = f.plane_range(1);
+        for k in 0..3 {
+            a[ru.start + 2 * k..ru.start + 2 * k + 2].copy_from_slice(&1000u16.to_le_bytes());
+        }
+        let rv = f.plane_range(2);
+        for k in 0..2 {
+            a[rv.start + 2 * k..rv.start + 2 * k + 2].copy_from_slice(&10u16.to_le_bytes());
+        }
+
+        let (s, _) = compute_frame(&f, &a, None);
+        assert_eq!((s.y_min, s.y_max), (30, 1020));
+        // n=100: 10th percentile = 10th smallest (40+..) = 120, 90th = 920
+        assert_eq!(s.y_low, 120);
+        assert_eq!(s.y_high, 920);
+        let o = s.oor.unwrap();
+        assert_eq!(o.y_lo, 4); // 30, 40, 50, 60
+        assert_eq!(o.y_hi, 8); // 950 ..= 1020
+        assert_eq!(o.c, 5);
+        assert!((s.y_avg - (30.0 + 1020.0) / 2.0).abs() < 1e-9);
+
+        let full = f.clone().with_full_range(true);
+        assert_eq!(compute_frame(&full, &a, None).0.oor, None);
+    }
+
+    #[test]
+    fn scan_and_histogram_agree() {
+        // The chroma scan and the luma histogram must give identical
+        // min/max/sum/counts on the same data.
+        for (two, data) in [
+            (true, (0..2000u32).flat_map(|i| (((i * 37) % 1024) as u16).to_le_bytes()).collect::<Vec<u8>>()),
+            (false, (0..2001u32).map(|i| ((i * 37) % 256) as u8).collect::<Vec<u8>>()),
+        ] {
+            let bins = if two { 1024 } else { 256 };
+            let n = if two { data.len() / 2 } else { data.len() } as u64;
+            let b = Some(if two { (64, 960) } else { (16, 240) });
+            let h = summarize(&plane_histogram(&data, two, bins), n, b);
+            let sc = plane_scan(&data, two, b);
+            assert_eq!((h.min, h.max, h.sum, h.below, h.above), (sc.min, sc.max, sc.sum, sc.below, sc.above));
+            let none = plane_scan(&data, two, None);
+            assert_eq!((none.below, none.above), (0, 0));
+        }
+    }
+
+    #[test]
+    fn histogram_clamps_out_of_depth_values() {
+        // A 10-bit buffer holding a stray 16-bit value must not index past the end.
+        let f = fmt("yuv420p10le", 4, 2);
+        let mut a = vec![0u8; f.frame_bytes()];
+        let ry = f.plane_range(0);
+        a[ry.start..ry.start + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        let (s, _) = compute_frame(&f, &a, None);
+        assert_eq!(s.y_max, 1023);
     }
 
     fn fill_u16(buf: &mut [u8], range: std::ops::Range<usize>, val: u16) {

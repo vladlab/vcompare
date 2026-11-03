@@ -568,7 +568,8 @@ pub fn run_levels_analysis(
 ) -> Result<Vec<Value>, String> {
     use crate::engine::rawstats::{choose_hwaccel, run_raw_stats, RawFormat};
 
-    let fmt = RawFormat::for_source(&info.pix_fmt, info.width, info.height);
+    let fmt = RawFormat::for_source(&info.pix_fmt, info.width, info.height)
+        .with_full_range(info.full_range);
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let hw = choose_hwaccel(&info.codec_name, file_path, hwaccel_available);
 
@@ -579,6 +580,13 @@ pub fn run_levels_analysis(
         hw.as_deref().map(|h| format!(" [{h}]")).unwrap_or_default()
     ));
     diagnostics.push(format!("raw: {} {}x{}", fmt.pix_fmt, fmt.width, fmt.height));
+    diagnostics.push(match fmt.legal {
+        Some(l) => format!(
+            "legal range: Y {}–{}, C {}–{} (limited)",
+            l.y_lo, l.y_hi, l.c_lo, l.c_hi
+        ),
+        None => "legal range: n/a (full-range or RGB source)".into(),
+    });
     publish(diagnostics);
 
     // The progress callback may be needed twice (hw attempt + software
@@ -647,6 +655,9 @@ pub struct SingleFileInfo {
     pub height: u32,
     /// ffprobe `codec_name` of the video stream, e.g. "prores", "hevc".
     pub codec_name: String,
+    /// ffprobe `color_range` is "pc" (full range). Unknown counts as limited,
+    /// which is what an untagged YUV file is assumed to be.
+    pub full_range: bool,
 }
 
 /// Prepare a single file for levels analysis.
@@ -661,11 +672,15 @@ pub fn prepare_single_file(
     let probe = ffprobe_json(file_path)?;
     let tc_fmt = detect_timecode_format(&probe)?;
     let info = get_video_info(&probe, &tc_fmt)?;
-    let codec_name = crate::engine::timecode::find_video_stream(&probe)
-        .and_then(|v| v.get("codec_name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let stream_str = |key: &str| {
+        crate::engine::timecode::find_video_stream(&probe)
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let codec_name = stream_str("codec_name");
+    let full_range = stream_str("color_range") == "pc";
 
     diagnostics.push(format!(
         "file: {}x{} {} {} {}/{}",
@@ -705,6 +720,7 @@ pub fn prepare_single_file(
         width: info.width,
         height: info.height,
         codec_name,
+        full_range,
     })
 }
 
