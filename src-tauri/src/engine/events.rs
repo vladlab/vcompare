@@ -18,8 +18,11 @@
 //!
 //! Two inputs are supported:
 //!
-//! - `levels` analyses, using signalstats' per-frame temporal differences
-//!   (`y_dif`, `u_dif`, `v_dif`) and averages (`y_avg`, `sat_avg`).
+//! - `levels` analyses, using the per-frame temporal differences
+//!   (`y_dif`, `u_dif`, `v_dif`) to find runs. Whether the frames either
+//!   side of a run agree is judged from the native engine's thumbnail
+//!   differences (`tdif_1..4`) when present; older signalstats-era caches
+//!   fall back to comparing average luma and saturation / chroma.
 //! - `diff` analyses, using the `diff_y` series: a flash present in the
 //!   distorted file but not the reference is an isolated spike in the
 //!   difference, well above its neighbours.
@@ -64,8 +67,10 @@ pub struct DetectParams {
     /// Sigma multiplier for the auto threshold.
     #[serde(default = "default_auto_k")]
     pub auto_k: f64,
-    /// How close the two neighbours must be (normalized luma average) to
-    /// count as "agreeing", i.e. a flash-and-return rather than at-cut.
+    /// How close the two neighbours must be to count as "agreeing", i.e. a
+    /// flash-and-return rather than at-cut. Compared against the thumbnail
+    /// difference between them when available (mean |Δ| over a 32×18 luma
+    /// thumbnail, 0..1), otherwise against their average-luma difference.
     #[serde(default = "default_neighbour_tol")]
     pub neighbour_tol: f64,
     /// Drop at-cut events from the result.
@@ -161,7 +166,15 @@ pub fn detect_flashes_levels(
     let threshold = resolve_threshold(&d, params);
 
     let y_avg: Vec<f64> = frames.iter().map(|f| num(f, "y_avg").unwrap_or(0.0) / peak).collect();
-    let sat_avg: Vec<f64> = frames.iter().map(|f| num(f, "sat_avg").unwrap_or(0.0) / peak).collect();
+    // Chroma "colour" proxy for the fallback neighbour test: signalstats-era
+    // caches have sat_avg; native ones have u_avg / v_avg.
+    let chroma: Vec<(f64, f64)> = frames
+        .iter()
+        .map(|f| match (num(f, "u_avg"), num(f, "v_avg")) {
+            (Some(u), Some(v)) => (u / peak, v / peak),
+            _ => (num(f, "sat_avg").unwrap_or(0.0) / peak, 0.0),
+        })
+        .collect();
     let y_min: Vec<f64> = frames.iter().map(|f| num(f, "y_min").unwrap_or(0.0) / peak).collect();
     let y_max: Vec<f64> = frames.iter().map(|f| num(f, "y_max").unwrap_or(0.0) / peak).collect();
 
@@ -201,10 +214,19 @@ pub fn detect_flashes_levels(
                 let leave = d[b + 1];
                 let score = enter.min(leave) / threshold;
 
-                // Do the neighbours agree? Compare luma average and saturation.
-                let dy = (y_avg[a - 1] - y_avg[b + 1]).abs();
-                let ds = (sat_avg[a - 1] - sat_avg[b + 1]).abs();
-                let at_cut = dy > params.neighbour_tol || ds > params.neighbour_tol * 1.5;
+                // Do the neighbours agree? Frames a-1 and b+1 are len+1
+                // apart; the native engine records the thumbnail difference
+                // up to TDIF_DEPTH frames back, which compares the actual
+                // pictures. Otherwise compare average luma and chroma.
+                let at_cut = match tdif(&frames[b + 1], len + 1) {
+                    Some(t) => t > params.neighbour_tol,
+                    None => {
+                        let dy = (y_avg[a - 1] - y_avg[b + 1]).abs();
+                        let (c0, c1) = (chroma[a - 1], chroma[b + 1]);
+                        let dc = (c0.0 - c1.0).abs().max((c0.1 - c1.1).abs());
+                        dy > params.neighbour_tol || dc > params.neighbour_tol * 1.5
+                    }
+                };
 
                 let run_ymax = y_max[a..=b].iter().cloned().fold(f64::MIN, f64::max);
                 let run_ymin = y_min[a..=b].iter().cloned().fold(f64::MAX, f64::min);
@@ -359,6 +381,18 @@ fn classify_run(run_ymin: f64, run_ymax: f64) -> String {
     }
 }
 
+/// Thumbnail difference of this frame against the one `back` frames
+/// earlier, if the analysis recorded it.
+fn tdif(f: &Value, back: usize) -> Option<f64> {
+    match back {
+        1 => num(f, "tdif_1"),
+        2 => num(f, "tdif_2"),
+        3 => num(f, "tdif_3"),
+        4 => num(f, "tdif_4"),
+        _ => None,
+    }
+}
+
 fn num(f: &Value, key: &str) -> Option<f64> {
     f.get(key).and_then(|v| v.as_f64())
 }
@@ -415,8 +449,78 @@ mod tests {
         out
     }
 
+    /// Same frames, plus native-engine thumbnail differences. For the flat
+    /// synthetic frames above the thumbnail difference is just |Δ y_avg|.
+    fn levels_frames_tdif(y_avgs: &[f64], noise: f64) -> Vec<Value> {
+        let mut out = levels_frames(y_avgs, noise);
+        for i in 0..out.len() {
+            let obj = out[i].as_object_mut().unwrap();
+            obj.remove("sat_avg");
+            obj.insert("u_avg".into(), json!(128.0));
+            obj.insert("v_avg".into(), json!(128.0));
+            for k in 1..=4usize {
+                let t = if i >= k { (y_avgs[i] - y_avgs[i - k]).abs() / 255.0 } else { 0.0 };
+                obj.insert(format!("tdif_{k}"), json!(t));
+            }
+        }
+        out
+    }
+
     fn shot(level: f64, len: usize) -> Vec<f64> {
         vec![level; len]
+    }
+
+    #[test]
+    fn native_frames_match_proxy_on_simple_cases() {
+        // The main scenarios give the same answer through either neighbour test.
+        let cases: Vec<Vec<f64>> = vec![
+            { let mut s = shot(100.0, 30); s[15] = 235.0; s.extend(shot(100.0, 10)); s },
+            { let mut s = shot(120.0, 20); s.extend([16.0, 16.0]); s.extend(shot(120.0, 20)); s },
+            { let mut s = shot(80.0, 25); s.push(235.0); s.extend(shot(160.0, 25)); s },
+            { let mut s = shot(80.0, 25); s.extend(shot(160.0, 25)); s },
+        ];
+        for seq in cases {
+            let p = DetectParams::default();
+            let a = detect_flashes_levels(&levels_frames(&seq, 0.5), 8, &p).unwrap().events;
+            let b = detect_flashes_levels(&levels_frames_tdif(&seq, 0.5), 8, &p).unwrap().events;
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn thumbnail_test_catches_cut_between_equal_brightness_shots() {
+        // Shot A and shot B have the same average luma, so the proxy thinks
+        // the picture came back; the thumbnails know it didn't.
+        let mut seq = shot(100.0, 20);
+        seq.push(235.0);
+        seq.extend(shot(100.0, 20));
+        let mut frames = levels_frames_tdif(&seq, 0.5);
+        // Frame 21 (first of shot B) vs frame 19 (last of shot A): different picture.
+        frames[21]["tdif_2"] = json!(0.30);
+        let r = detect_flashes_levels(&frames, 8, &DetectParams::default()).unwrap();
+        assert_eq!(r.events.len(), 1);
+        assert!(r.events[0].at_cut, "thumbnail difference should mark this at-cut");
+
+        let proxy = detect_flashes_levels(&levels_frames(&seq, 0.5), 8, &DetectParams::default()).unwrap();
+        assert!(!proxy.events[0].at_cut, "proxy cannot see this cut");
+    }
+
+    #[test]
+    fn long_runs_fall_back_to_chroma_proxy() {
+        // A 4-frame run needs tdif_5, which isn't recorded: use the proxy.
+        // Neighbours have equal luma but different chroma → at cut.
+        let mut seq = shot(100.0, 20);
+        seq.extend(shot(230.0, 4));
+        seq.extend(shot(100.0, 20));
+        let mut frames = levels_frames_tdif(&seq, 0.5);
+        for f in frames.iter_mut().skip(24) {
+            f["u_avg"] = json!(170.0);
+        }
+        let p = DetectParams { max_run: 4, ..Default::default() };
+        let r = detect_flashes_levels(&frames, 8, &p).unwrap();
+        assert_eq!(r.events.len(), 1, "{:?}", r.events);
+        assert_eq!(r.events[0].length, 4);
+        assert!(r.events[0].at_cut);
     }
 
     #[test]
