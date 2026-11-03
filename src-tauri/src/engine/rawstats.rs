@@ -950,13 +950,7 @@ pub fn run_raw_stats(
     }
     args.extend(["-i".into(), file_path.into()]);
     args.extend(["-map".into(), "0:v:0".into(), "-an".into(), "-sn".into()]);
-    // Emit exactly the decoded frames: no duplication/dropping to a fixed rate.
-    // (-fps_mode arrived in ffmpeg 5.1; older builds only know -vsync.)
-    if ffmpeg_has_fps_mode() {
-        args.extend(["-fps_mode".into(), "passthrough".into()]);
-    } else {
-        args.extend(["-vsync".into(), "passthrough".into()]);
-    }
+    args.extend(fps_mode_args());
     if let Some(limit) = frame_limit {
         args.extend(["-frames:v".into(), limit.to_string()]);
     }
@@ -1259,6 +1253,16 @@ pub fn run_raw_stats(
     out.shrink_to_fit();
     eprintln!("[vcompare] native stats: {}", report.summary());
     Ok((out, report))
+}
+
+/// Emit exactly the decoded frames: no duplication/dropping to a fixed
+/// rate. (`-fps_mode` arrived in ffmpeg 5.1; older builds only know `-vsync`.)
+pub fn fps_mode_args() -> [String; 2] {
+    if ffmpeg_has_fps_mode() {
+        ["-fps_mode".into(), "passthrough".into()]
+    } else {
+        ["-vsync".into(), "passthrough".into()]
+    }
 }
 
 /// Whether this ffmpeg understands `-fps_mode` (5.1+). Checked once.

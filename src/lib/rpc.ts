@@ -148,6 +148,34 @@ export interface FlashEvent {
   at_cut: boolean;
   /** Strength relative to threshold, >= 1 */
   score: number;
+  /** The user's verdict, if any */
+  review?: "accept" | "reject" | null;
+}
+
+export type EventReview = "accept" | "reject";
+
+/** Accept / reject (or clear with null) the event starting at `frame`; saved next to the analysis. */
+export async function setEventReview(
+  frame: number,
+  review: EventReview | null,
+): Promise<{ frame: number; review: EventReview | null; saved: boolean }> {
+  return invoke("set_event_review", { frame, review });
+}
+
+export interface PreviewFrame {
+  frame: number;
+  tc: string;
+  /** data: URI, or null before the start of the file */
+  src: string | null;
+}
+export interface PreviewRow {
+  label: string;
+  frames: PreviewFrame[];
+}
+
+/** Thumbnails of `count` display frames from `frame`, one row per file. */
+export async function previewFrames(frame: number, count: number, height: number): Promise<{ rows: PreviewRow[] }> {
+  return invoke("preview_frames", { frame, count, height });
 }
 
 /** All values normalized 0..1 of signal peak. Omitted fields use engine defaults. */

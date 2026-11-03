@@ -119,6 +119,8 @@ pub fn run() {
             bridge::detect_events,
             bridge::export_events_csv,
             bridge::export_events_edl,
+            bridge::set_event_review,
+            bridge::preview_frames,
             bridge::mpv_launch,
             bridge::mpv_seek,
             bridge::mpv_step,

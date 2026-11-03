@@ -674,6 +674,55 @@ pub async fn detect_events(
     engine_state.detect_events(&params.unwrap_or_default())
 }
 
+/// Thumbnails of `count` consecutive display frames from `frame`, for each
+/// file of the analysis. `{ rows: [{ label, frames: [{ frame, tc, src }] }] }`.
+#[tauri::command]
+pub async fn preview_frames(
+    frame: i64,
+    count: u32,
+    height: u32,
+    engine_state: State<'_, EngineState>,
+) -> Result<Value, String> {
+    let (sources, fps) = engine_state.preview_sources()?;
+    let tcs: Vec<String> = (0..count as i64)
+        .map(|k| engine_state.frame_to_tc(frame + k))
+        .collect::<Result<_, _>>()?;
+    let rows = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
+        let mut rows = Vec::new();
+        for (label, path, origin) in sources {
+            let file_frame = frame - origin;
+            let uris = if file_frame + count as i64 <= 0 {
+                Vec::new()
+            } else {
+                engine::thumbs::extract_frames(&path, fps, file_frame, count, height)?
+            };
+            // Frames before the file's start come back as missing.
+            let skipped = (-file_frame).max(0) as usize;
+            let frames: Vec<Value> = (0..count as usize)
+                .map(|k| {
+                    let src = if k >= skipped { uris.get(k - skipped) } else { None };
+                    json!({ "frame": frame + k as i64, "tc": tcs[k], "src": src })
+                })
+                .collect();
+            rows.push(json!({ "label": label, "frames": frames }));
+        }
+        Ok(rows)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+    Ok(json!({ "rows": rows }))
+}
+
+/// Accept / reject (or clear, with `review: null`) the event at `frame`.
+#[tauri::command]
+pub async fn set_event_review(
+    frame: i64,
+    review: Option<String>,
+    engine_state: State<'_, EngineState>,
+) -> Result<Value, String> {
+    engine_state.set_event_review(frame, review.as_deref())
+}
+
 #[tauri::command]
 pub async fn export_events_edl(
     path: Option<String>,

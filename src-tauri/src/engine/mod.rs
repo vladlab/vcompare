@@ -10,5 +10,6 @@ pub mod probe;
 pub mod rawstats;
 pub mod resolve;
 pub mod state;
+pub mod thumbs;
 pub mod timecode;
 pub mod types;

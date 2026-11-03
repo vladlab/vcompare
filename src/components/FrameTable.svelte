@@ -159,6 +159,9 @@
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
+      // With the table focused, arrows step frames here; elsewhere the app
+      // uses them to step flash events.
+      e.stopPropagation();
       const currentIdx = frames.findIndex((f) => f.frame === cursorFrame);
       let nextIdx =
         e.key === "ArrowDown"

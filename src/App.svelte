@@ -39,6 +39,10 @@
     detectEvents,
     exportEventsCsv,
     exportEventsEdl,
+    setEventReview,
+    previewFrames,
+    type EventReview,
+    type PreviewRow,
     getRecents,
     addRecent,
     type RecentEntry,
@@ -186,6 +190,60 @@
     handleCursorChange(frame);
   }
 
+  // ── Event preview (frame before, the run, frame after) ──
+  const PREVIEW_HEIGHT = 108; // px, shown at half size on HiDPI
+  let eventPreview: PreviewRow[] | null = $state(null);
+  const previewCache = new Map<string, PreviewRow[]>();
+  let previewRequest = 0;
+
+  $effect(() => {
+    const frame = selectedEventFrame;
+    const ev = detectResult?.events.find((e) => e.frame === frame);
+    if (frame == null || !ev) {
+      eventPreview = null;
+      return;
+    }
+    const key = `${frame}:${ev.length}`;
+    const cached = previewCache.get(key);
+    if (cached) {
+      eventPreview = cached;
+      return;
+    }
+    eventPreview = null;
+    const req = ++previewRequest;
+    previewFrames(frame - 1, ev.length + 2, PREVIEW_HEIGHT)
+      .then((r) => {
+        previewCache.set(key, r.rows);
+        if (req === previewRequest) eventPreview = r.rows;
+      })
+      .catch((e) => {
+        if (req === previewRequest) showStatus(`Preview: ${e}`);
+      });
+  });
+
+  async function handleReview(frame: number, review: EventReview | null) {
+    try {
+      const r = await setEventReview(frame, review);
+      if (detectResult) {
+        detectResult = {
+          ...detectResult,
+          events: detectResult.events.map((e) => (e.frame === frame ? { ...e, review } : e)),
+        };
+      }
+      if (!r.saved) showStatus("Verdict kept for this session only (analysis has no save path)");
+    } catch (e) {
+      showStatus(`Review: ${e}`);
+    }
+  }
+
+  /** y / x on the picked event. */
+  function reviewSelected(review: EventReview) {
+    const frame = selectedEventFrame;
+    const ev = detectResult?.events.find((e) => e.frame === frame);
+    if (frame == null || !ev) return;
+    handleReview(frame, ev.review === review ? null : review);
+  }
+
   // Debounced seek — sends to both mpv instances if running
   let seekTimer: ReturnType<typeof setTimeout> | null = null;
   let seekGeneration = 0;
@@ -294,6 +352,7 @@
           detectError = null;
           selectedEventFrame = null;
           seenEvents = new Set();
+          previewCache.clear();
           progressCurrent = 0;
           progressTotal = 0;
           diagnosticLines = [];
@@ -593,6 +652,7 @@
     metricSeries = {};
     selectedEventFrame = null;
     seenEvents = new Set();
+    previewCache.clear();
 
     // Fetch series for each available metric
     for (const m of result.metrics_available) {
@@ -829,9 +889,13 @@
         threshold = null;
         break;
       case "n":
+      case "ArrowDown":
+        e.preventDefault();
         jumpToEvent(1);
         break;
       case "N":
+      case "ArrowUp":
+        e.preventDefault();
         jumpToEvent(-1);
         break;
       case "p":
@@ -865,6 +929,12 @@
         break;
       case "r":
         toggleResolveSync();
+        break;
+      case "y":
+        reviewSelected("accept");
+        break;
+      case "x":
+        reviewSelected("reject");
         break;
       case ".":
         if (mpvRunning) mpvStep("forward");
@@ -1278,6 +1348,8 @@
               seen={seenEvents}
               frameRange={analysedRange}
               onSelect={selectEvent}
+              onReview={handleReview}
+              preview={eventPreview}
               onExport={handleExportEvents}
               onExportEdl={handleExportEdl}
             />
@@ -1301,7 +1373,8 @@
         <kbd>m</kbd> metric
         <kbd>t</kbd> threshold
         {#if detectAvailable}
-          <kbd>n</kbd><kbd>N</kbd> flash
+          <kbd>↑</kbd><kbd>↓</kbd> flash
+          <kbd>y</kbd><kbd>x</kbd> accept/reject
         {/if}
         <kbd>f</kbd> smooth{smoothWindow > 0 ? ` (${smoothWindow})` : ""}
         <kbd>e</kbd> export
@@ -1592,7 +1665,7 @@
     min-width: 0;
   }
   .events-area {
-    flex: 0 0 300px;
+    flex: 0 0 360px;
     overflow: hidden;
   }
   .chart-area {

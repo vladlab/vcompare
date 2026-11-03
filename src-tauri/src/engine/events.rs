@@ -51,6 +51,10 @@ pub struct Event {
     /// Detection strength relative to the threshold (>= 1.0). Higher = more
     /// obvious.
     pub score: f64,
+    /// The user's verdict, if any: "accept" or "reject". Kept per analysis
+    /// (see `state::EngineState::set_event_review`), keyed by first frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
 }
 
 /// Detector parameters, all in normalized 0..1 units of the signal peak.
@@ -243,6 +247,7 @@ pub fn detect_flashes_levels(
                         subkind,
                         at_cut,
                         score: round3(score),
+                        review: None,
                     });
                 }
                 // Resume at the frame after the run. d[b+1] was the "leave"
@@ -331,6 +336,7 @@ pub fn detect_flashes_diff(
                     subkind: "content".into(),
                     at_cut: false,
                     score: round3(score),
+                    review: None,
                 });
                 a = b + 1;
             }
@@ -376,6 +382,11 @@ pub fn events_to_resolve_edl(events: &[Event], tc_fmt: &TimecodeFormat, title: &
 
 ",
     });
+    // Rejected events are not markers.
+    let events: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.review.as_deref() != Some("reject"))
+        .collect();
     // Resolve numbers edits with at least three digits.
     let width = events.len().to_string().len().max(3);
     for (i, e) in events.iter().enumerate() {
@@ -714,7 +725,7 @@ mod tests {
         let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: TcType::NonDrop };
         let ev = |frame: i64, length: u32, subkind: &str, at_cut: bool| Event {
             frame, tc: tc.frame_to_tc(frame), length, kind: "flash".into(),
-            subkind: subkind.into(), at_cut, score: 13.452,
+            subkind: subkind.into(), at_cut, score: 13.452, review: None,
         };
         let edl = events_to_resolve_edl(
             &[ev(86400 + 120, 1, "white", false), ev(86400 + 300, 2, "content", true)],
@@ -729,6 +740,13 @@ mod tests {
         assert_eq!(lines[5], "");
         assert_eq!(lines[6], "002  001      V     C        01:00:12:12 01:00:12:14 01:00:12:12 01:00:12:14");
         assert_eq!(lines[7], " |C:ResolveColorCyan |M:flash: content 2 fr x13.5 (at cut) |D:2");
+
+        // Rejected events are left out and the numbering closes up.
+        let mut rejected = ev(100, 1, "black", false);
+        rejected.review = Some("reject".into());
+        let edl = events_to_resolve_edl(&[rejected, ev(200, 1, "white", false)], &tc, "x");
+        assert!(!edl.contains("00:00:04:04"), "rejected event must not be a marker");
+        assert!(edl.contains("\n001  001      V     C        00:00:08:08"));
 
         let df = TimecodeFormat { fps_num: 30000, fps_den: 1001, tc_type: TcType::DropFrame };
         assert!(events_to_resolve_edl(&[], &df, "x").contains("FCM: DROP FRAME"));

@@ -43,6 +43,9 @@ struct Inner {
     mpv_context: Option<MpvContext>,
     /// Events from the last `detect_events` run on these frames.
     events: Vec<Event>,
+    /// User verdicts ("accept" / "reject") keyed by event first frame.
+    /// Persisted in a small sidecar next to the analysis JSON.
+    reviews: std::collections::BTreeMap<i64, String>,
 }
 
 /// Metadata about the current analysis.
@@ -90,6 +93,7 @@ impl EngineState {
                 save_path: None,
                 mpv_context: None,
                 events: Vec::new(),
+                reviews: Default::default(),
             }),
         }
     }
@@ -249,8 +253,64 @@ impl EngineState {
         state.mpv_context = build_mpv_context(&state.meta);
     }
 
+    /// Set where this analysis lives on disk, and load the review verdicts
+    /// saved next to it (if any).
     pub fn set_save_path(&self, path: Option<String>) {
-        self.inner.lock().unwrap().save_path = path;
+        let mut state = self.inner.lock().unwrap();
+        state.reviews = path
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(reviews_path(p)).ok())
+            .and_then(|s| serde_json::from_str::<ReviewsFile>(&s).ok())
+            .map(|f| f.reviews)
+            .unwrap_or_default();
+        if !state.reviews.is_empty() {
+            eprintln!("[vcompare] loaded {} event reviews", state.reviews.len());
+        }
+        let st = &mut *state;
+        for e in st.events.iter_mut() {
+            e.review = st.reviews.get(&e.frame).cloned();
+        }
+        st.save_path = path;
+    }
+
+    /// Record (or clear, with `None`) the verdict on the event starting at
+    /// `frame`, and save the verdicts next to the analysis.
+    pub fn set_event_review(&self, frame: i64, review: Option<&str>) -> Result<Value, String> {
+        let mut state = self.inner.lock().unwrap();
+        match review {
+            Some(r) if r == "accept" || r == "reject" => {
+                state.reviews.insert(frame, r.to_string());
+            }
+            Some(other) => return Err(format!("unknown review {other:?}")),
+            None => {
+                state.reviews.remove(&frame);
+            }
+        }
+        for e in state.events.iter_mut() {
+            if e.frame == frame {
+                e.review = review.map(String::from);
+            }
+        }
+        if let Some(ref sp) = state.save_path {
+            let path = reviews_path(sp);
+            if state.reviews.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let file = ReviewsFile {
+                    version: 1,
+                    ref_path: state.meta.ref_path.clone(),
+                    reviews: state.reviews.clone(),
+                };
+                let content = serde_json::to_string_pretty(&file)
+                    .map_err(|e| format!("Failed to serialize reviews: {e}"))?;
+                crate::engine::cache::write_atomic(&path, content.as_bytes())?;
+            }
+        }
+        Ok(serde_json::json!({
+            "frame": frame,
+            "review": review,
+            "saved": state.save_path.is_some(),
+        }))
     }
 
     /// Clear all analysis state (e.g. for "New Analysis").
@@ -557,6 +617,10 @@ impl EngineState {
             result.events.len(),
             result.threshold
         );
+        let mut result = result;
+        for e in result.events.iter_mut() {
+            e.review = state.reviews.get(&e.frame).cloned();
+        }
         state.events = result.events.clone();
         Ok(result)
     }
@@ -585,11 +649,12 @@ impl EngineState {
             }
         };
 
-        let mut csv = String::from("frame,timecode,length,kind,subkind,at_cut,score\n");
+        let mut csv = String::from("frame,timecode,length,kind,subkind,at_cut,score,review\n");
         for e in &state.events {
             csv.push_str(&format!(
-                "{},{},{},{},{},{},{:.3}\n",
-                e.frame, e.tc, e.length, e.kind, e.subkind, e.at_cut, e.score
+                "{},{},{},{},{},{},{:.3},{}\n",
+                e.frame, e.tc, e.length, e.kind, e.subkind, e.at_cut, e.score,
+                e.review.as_deref().unwrap_or("")
             ));
         }
 
@@ -641,6 +706,32 @@ impl EngineState {
         }))
     }
 
+    /// What the preview needs: each file with the display frame of its
+    /// first frame, plus the frame rate. Levels: the one file; comparisons:
+    /// reference then distorted.
+    pub fn preview_sources(&self) -> Result<(Vec<(String, String, i64)>, (u32, u32)), String> {
+        let state = self.inner.lock().unwrap();
+        let tc = state.meta.tc_format.as_ref().ok_or("No timecode format")?;
+        let meta = &state.meta;
+        if meta.ref_path.is_empty() {
+            return Err("No analysis loaded".into());
+        }
+        let mut v = vec![("REF".to_string(), meta.ref_path.clone(), meta.ref_file_start_tc)];
+        if !meta.dist_path.is_empty() {
+            // In TC sync the distorted file keeps its own start TC; in start
+            // sync it's shown aligned to the reference's.
+            let dist_origin = meta
+                .timeline
+                .as_ref()
+                .map(|t| t.dist_start)
+                .unwrap_or(meta.ref_file_start_tc);
+            v.push(("DIST".to_string(), meta.dist_path.clone(), dist_origin));
+        } else {
+            v[0].0 = "FILE".to_string();
+        }
+        Ok((v, (tc.fps_num, tc.fps_den)))
+    }
+
     /// Timecode string for a display frame, in the analysis's own format.
     pub fn frame_to_tc(&self, frame: i64) -> Result<String, String> {
         let state = self.inner.lock().unwrap();
@@ -663,6 +754,22 @@ impl EngineState {
 
 fn round4(v: f64) -> f64 {
     (v * 10000.0).round() / 10000.0
+}
+
+/// Sidecar holding the user's accept/reject verdicts for one analysis.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReviewsFile {
+    version: u32,
+    ref_path: String,
+    reviews: std::collections::BTreeMap<i64, String>,
+}
+
+/// `X.levels.json` → `X.levels.reviews.json` (same for `.vcompare.json`).
+fn reviews_path(analysis_path: &str) -> String {
+    match analysis_path.strip_suffix(".json") {
+        Some(stem) => format!("{stem}.reviews.json"),
+        None => format!("{analysis_path}.reviews.json"),
+    }
 }
 
 fn str_field(v: &Value, key: &str) -> String {

@@ -19,7 +19,7 @@
     onExportEdl()                 — export events as a Resolve marker EDL
 -->
 <script lang="ts">
-  import type { DetectParams, DetectResult, FlashEvent } from "../lib/rpc";
+  import type { DetectParams, DetectResult, FlashEvent, EventReview, PreviewRow } from "../lib/rpc";
 
   interface Props {
     result: DetectResult | null;
@@ -30,6 +30,9 @@
     seen: Set<number>;
     frameRange: [number, number] | null;
     onSelect: (frame: number) => void;
+    onReview: (frame: number, review: EventReview | null) => void;
+    /** Thumbnails around the picked event (null while loading / none) */
+    preview: PreviewRow[] | null;
     onExport: () => void;
     onExportEdl: () => void;
   }
@@ -43,9 +46,13 @@
     seen,
     frameRange,
     onSelect,
+    onReview,
+    preview,
     onExport,
     onExportEdl,
   }: Props = $props();
+
+  let hideRejected: boolean = $state(false);
 
   // ── Threshold control ──
   //
@@ -58,6 +65,12 @@
     const t = params.threshold ?? result?.threshold ?? 0.04;
     return Math.round(t * 1000) / 10;
   }
+
+  // While dragging, the slider owns its value and only the readout follows
+  // it; detection re-runs on release. Re-rendering the slider from params
+  // on every move made the thumb jump under the pointer.
+  let dragPct: number | null = $state(null);
+  let shownPct = $derived(dragPct ?? thresholdPct());
 
   function setAuto(on: boolean) {
     if (on) {
@@ -82,7 +95,23 @@
 
   // ── Derived ──
 
-  let events = $derived(result?.events ?? []);
+  let allEvents = $derived(result?.events ?? []);
+  let events = $derived(
+    hideRejected ? allEvents.filter((e) => e.review !== "reject") : allEvents
+  );
+  let reviewCounts = $derived.by(() => {
+    let accept = 0, reject = 0;
+    for (const e of allEvents) {
+      if (e.review === "accept") accept++;
+      else if (e.review === "reject") reject++;
+    }
+    return { accept, reject };
+  });
+
+  /** Toggle a verdict: clicking the one already set clears it. */
+  function review(e: FlashEvent, r: EventReview) {
+    onReview(e.frame, e.review === r ? null : r);
+  }
 
   let counts = $derived.by(() => {
     const c: Record<"black" | "white" | "content" | "at_cut", number> = { black: 0, white: 0, content: 0, at_cut: 0 };
@@ -130,7 +159,7 @@
       <span class="count mono">{events.length}</span>
     {/if}
     <span class="spacer"></span>
-    <button class="small" onclick={onExportEdl} disabled={events.length === 0} title="Export events as a DaVinci Resolve marker EDL (Timeline › Import › Timeline Markers from EDL)">
+    <button class="small" onclick={onExportEdl} disabled={events.length === 0} title="Export events as a DaVinci Resolve marker EDL (Timeline › Import › Timeline Markers from EDL). Rejected events are left out.">
       EDL
     </button>
     <button class="small" onclick={onExport} disabled={events.length === 0} title="Export events as CSV">
@@ -147,16 +176,22 @@
         <input type="checkbox" checked={auto} onchange={(e) => setAuto((e.target as HTMLInputElement).checked)} />
         auto
       </label>
-      <label class="slider-label" title="Minimum frame-to-frame change, as % of signal peak">
-        <span class="mono">{thresholdPct().toFixed(1)}%</span>
+      <label class="slider-label" title="Minimum frame-to-frame change, as % of signal peak. Applies when you let go.">
+        <span class="mono">{shownPct.toFixed(1)}%</span>
         <input
           type="range"
           min="0.5"
           max="40"
           step="0.5"
-          value={thresholdPct()}
+          value={shownPct}
           disabled={auto}
-          oninput={(e) => setThresholdPct(parseFloat((e.target as HTMLInputElement).value))}
+          oninput={(e) => (dragPct = parseFloat((e.target as HTMLInputElement).value))}
+          onchange={(e) => {
+            const v = parseFloat((e.target as HTMLInputElement).value);
+            dragPct = null;
+            setThresholdPct(v);
+            (e.target as HTMLElement).blur();
+          }}
         />
       </label>
       <label title="Longest run of frames that still counts as a flash">
@@ -178,7 +213,44 @@
         />
         hide at-cut
       </label>
+      <label class="checkbox-label" title="Hide events you've rejected">
+        <input type="checkbox" bind:checked={hideRejected} />
+        hide rejected
+      </label>
     </div>
+
+    <!-- Preview of the picked event: frame before, the run, frame after -->
+    {#if selectedIndex >= 0}
+      <div class="preview">
+        {#if preview}
+          {#each preview as row (row.label)}
+            <div class="preview-row">
+              {#if preview.length > 1}<span class="preview-label">{row.label}</span>{/if}
+              {#each row.frames as f, k (f.frame)}
+                {@const ev = events[selectedIndex]}
+                {@const inRun = f.frame >= ev.frame && f.frame < ev.frame + ev.length}
+                <button
+                  class="thumb"
+                  class:in-run={inRun}
+                  class:at-cursor={f.frame === cursorFrame}
+                  title="{f.tc} — click to go there"
+                  onclick={(e) => { onSelect(f.frame); (e.currentTarget as HTMLElement).blur(); }}
+                >
+                  {#if f.src}
+                    <img src={f.src} alt={f.tc} />
+                  {:else}
+                    <span class="thumb-empty">—</span>
+                  {/if}
+                  <span class="thumb-tc mono">{k === 0 ? "prev" : inRun ? (ev.length > 1 ? `flash ${f.frame - ev.frame + 1}` : "flash") : "next"}</span>
+                </button>
+              {/each}
+            </div>
+          {/each}
+        {:else}
+          <span class="preview-loading text-muted">loading frames…</span>
+        {/if}
+      </div>
+    {/if}
 
     <!-- Overview strip -->
     {#if frameRange}
@@ -204,6 +276,9 @@
         {counts.content} content · {counts.white} white · {counts.black} black
         {#if counts.at_cut > 0}· {counts.at_cut} at cut{/if}
         · thr {(result.threshold * 100).toFixed(1)}%
+        {#if reviewCounts.accept + reviewCounts.reject > 0}
+          · <span class="ok">{reviewCounts.accept} ✓</span> <span class="no">{reviewCounts.reject} ✗</span>
+        {/if}
       {:else}
         detecting…
       {/if}
@@ -212,19 +287,27 @@
     <!-- Event list -->
     <div class="list" bind:this={listEl}>
       {#each events as e, i (e.frame)}
-        <button
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
           class="row"
           class:active={i === activeIndex}
           class:selected={i === selectedIndex}
           class:seen={seen.has(e.frame)}
-          onclick={(ev) => { onSelect(e.frame); (ev.currentTarget as HTMLElement).blur(); }}
+          class:accepted={e.review === "accept"}
+          class:rejected={e.review === "reject"}
+          onclick={() => onSelect(e.frame)}
         >
           <span class="dot {e.subkind}" class:at-cut={e.at_cut}></span>
           <span class="tc mono">{e.tc || e.frame}</span>
-          {#if seen.has(e.frame)}<span class="seen-mark" title="visited">✓</span>{/if}
+          {#if seen.has(e.frame) && !e.review}<span class="seen-mark" title="visited">·</span>{/if}
           <span class="desc">{label(e)}</span>
           <span class="score mono" title="strength relative to threshold">×{e.score.toFixed(1)}</span>
-        </button>
+          <span class="verdict">
+            <button class="v-btn ok" class:set={e.review === "accept"} title="Accept (y)" onclick={(ev) => { ev.stopPropagation(); review(e, "accept"); }}>✓</button>
+            <button class="v-btn no" class:set={e.review === "reject"} title="Reject (x) — left out of the EDL" onclick={(ev) => { ev.stopPropagation(); review(e, "reject"); }}>✗</button>
+          </span>
+        </div>
       {:else}
         {#if result}
           <p class="empty">No flash frames found.</p>
@@ -363,14 +446,78 @@
     align-items: center;
     gap: var(--gap-sm);
     width: 100%;
-    padding: 4px var(--gap-sm);
+    padding: 3px var(--gap-sm);
     background: transparent;
     border: none;
     border-radius: var(--radius-sm);
     color: var(--text-primary);
     text-align: left;
     cursor: pointer;
+    user-select: none;
   }
+  .row.rejected .tc, .row.rejected .desc { text-decoration: line-through; opacity: 0.55; }
+  .row.accepted .tc { color: var(--success); }
+  .verdict { display: flex; gap: 2px; flex-shrink: 0; }
+  .v-btn {
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    font-size: 11px;
+    line-height: 1;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    opacity: 0.35;
+  }
+  .row:hover .v-btn, .row.selected .v-btn, .v-btn.set { opacity: 1; }
+  .v-btn.ok.set { color: var(--success); border-color: var(--success); }
+  .v-btn.no.set { color: var(--threshold-color); border-color: var(--threshold-color); }
+  .v-btn:hover { background: var(--bg-hover); }
+  .summary .ok { color: var(--success); }
+  .summary .no { color: var(--threshold-color); }
+
+  /* Preview filmstrip */
+  .preview {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: var(--gap-sm) var(--gap-md) 0;
+    flex-shrink: 0;
+  }
+  .preview-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    overflow-x: auto;
+  }
+  .preview-label {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-muted);
+    width: 28px;
+    flex-shrink: 0;
+    padding-top: 2px;
+  }
+  .thumb {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 2px;
+    background: var(--bg-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+  .thumb img { height: 54px; display: block; border-radius: 2px; }
+  .thumb-empty { height: 54px; width: 96px; display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
+  .thumb.in-run { border-color: var(--warning); }
+  .thumb.at-cursor { outline: 1px solid var(--text-primary); }
+  .thumb-tc { font-size: 10px; color: var(--text-muted); }
+  .thumb.in-run .thumb-tc { color: var(--warning); }
+  .preview-loading { font-size: 11px; }
   .row:hover { background: var(--bg-hover); }
   /* selected = the event you picked; it stays grey while you shuttle
      around it, and turns accent again whenever the cursor is on it */
