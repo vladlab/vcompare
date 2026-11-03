@@ -6,6 +6,7 @@ pub mod events;
 pub mod mpv;
 pub mod pixfmt;
 pub mod probe;
+pub mod rawstats;
 pub mod state;
 pub mod timecode;
 pub mod types;
