@@ -17,7 +17,7 @@
   interface Props {
     cursorFrame: number;
     metrics: string[];   // e.g. ["diff_y", "diff_u", "diff_v"] or ["vmaf", "psnr"]
-    mode: "diff" | "vmaf";
+    mode: "diff" | "vmaf" | "levels";
     onFrameSelect: (frame: number) => void;
   }
 
@@ -31,6 +31,16 @@
     diff_v:    { label: "Diff V",   width: "90px", precision: 3 },
     vmaf:      { label: "VMAF",     width: "90px", precision: 2 },
     psnr:      { label: "PSNR",     width: "90px", precision: 2 },
+    ssim:      { label: "SSIM",     width: "90px", precision: 5 },
+    ssim_y:    { label: "SSIM Y",   width: "90px", precision: 5 },
+    ssim_u:    { label: "SSIM U",   width: "90px", precision: 5 },
+    ssim_v:    { label: "SSIM V",   width: "90px", precision: 5 },
+    y_min:     { label: "Y Min",    width: "70px", precision: 0 },
+    y_max:     { label: "Y Max",    width: "70px", precision: 0 },
+    u_min:     { label: "U Min",    width: "70px", precision: 0 },
+    u_max:     { label: "U Max",    width: "70px", precision: 0 },
+    v_min:     { label: "V Min",    width: "70px", precision: 0 },
+    v_max:     { label: "V Max",    width: "70px", precision: 0 },
   };
 
   // ── State ──

@@ -109,6 +109,7 @@ pub fn run() {
             bridge::detect_capabilities,
             bridge::probe_file,
             bridge::check_cache,
+            bridge::check_levels_cache,
             bridge::load_saved_analysis,
             bridge::analyze,
             bridge::get_frames,

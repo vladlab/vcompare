@@ -22,7 +22,8 @@ pub use crate::engine::state::EngineState;
 #[derive(Deserialize, Serialize)]
 pub struct AnalyzeParams {
     pub reference: String,
-    pub distorted: String,
+    #[serde(default)]
+    pub distorted: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,6 +175,32 @@ pub async fn check_cache(
 }
 
 #[tauri::command]
+pub async fn check_levels_cache(
+    reference: String,
+) -> Result<Value, String> {
+    let path = cache::default_levels_path(&reference);
+    if std::path::Path::new(&path).is_file() {
+        match std::fs::read_to_string(&path).and_then(|s| {
+            serde_json::from_str::<Value>(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        }) {
+            Ok(data) => {
+                let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("levels");
+                let fc = data.get("frames").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                Ok(json!({
+                    "exists": mode == "levels",
+                    "path": path,
+                    "frame_count": fc,
+                    "mode": "levels",
+                }))
+            }
+            Err(_) => Ok(json!({"exists": false, "path": path, "frame_count": null})),
+        }
+    } else {
+        Ok(json!({"exists": false, "path": path, "frame_count": null}))
+    }
+}
+
+#[tauri::command]
 pub async fn load_saved_analysis(
     path: String,
     engine_state: State<'_, EngineState>,
@@ -189,7 +216,9 @@ pub async fn load_saved_analysis(
 
     let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("vmaf");
 
-    if mode == "diff" {
+    if mode == "levels" {
+        engine_state.apply_levels_result(&data);
+    } else if mode == "diff" {
         engine_state.apply_diff_result(&data);
     } else {
         let loaded = cache::load_vmaf_analysis(&path)?;
@@ -221,7 +250,7 @@ pub async fn analyze(
 ) -> Result<Value, String> {
     let mode = params.mode.clone().unwrap_or_else(|| "diff".into());
     let ref_path = params.reference.clone();
-    let dist_path = params.distorted.clone();
+    let dist_path = params.distorted.clone().unwrap_or_default();
     let sync_mode = params.sync.clone().unwrap_or_else(|| "start".into());
     let offset = params.offset.unwrap_or(0);
     let save_path = params.log_path.clone();
@@ -230,7 +259,16 @@ pub async fn analyze(
     // Check cache first
     if let Some(ref sp) = save_path {
         if !force && std::path::Path::new(sp).is_file() {
-            if mode == "diff" {
+            if mode == "levels" {
+                if let Ok(cached) = cache::load_diff_cache(sp) {
+                    if cached.get("mode").and_then(|v| v.as_str()) == Some("levels") {
+                        eprintln!("[vcompare] Loaded cached levels analysis: {sp}");
+                        engine_state.apply_levels_result(&cached);
+                        engine_state.set_save_path(save_path);
+                        return engine_state.build_summary();
+                    }
+                }
+            } else if mode == "diff" {
                 if let Ok(cached) = cache::load_diff_cache(sp) {
                     let cached_sync = cached.get("sync_mode").and_then(|v| v.as_str());
                     if cached_sync == Some(sync_mode.as_str()) {
@@ -263,7 +301,12 @@ pub async fn analyze(
 
     let process_handle = ffmpeg_handle.0.clone();
 
-    if mode == "vmaf" {
+    if mode == "levels" {
+        _run_levels_analysis(
+            app, &ref_path, save_path, &engine_state, process_handle,
+        )
+        .await
+    } else if mode == "vmaf" {
         _run_vmaf_analysis(
             app, &ref_path, &dist_path, &sync_mode, offset, &params,
             save_path, &engine_state, process_handle,
@@ -378,6 +421,71 @@ async fn _run_diff_analysis(
     if let Some(ref sp) = save_path {
         cache::save_diff_analysis(&result_val, sp)?;
         eprintln!("[vcompare] Saved diff analysis to {sp}");
+    }
+
+    engine_state.set_save_path(save_path);
+    engine_state.build_summary()
+}
+
+async fn _run_levels_analysis(
+    app: AppHandle,
+    file_path: &str,
+    save_path: Option<String>,
+    engine_state: &State<'_, EngineState>,
+    process_handle: ProcessHandle,
+) -> Result<Value, String> {
+    let file_path = file_path.to_string();
+    let app_clone = app.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut diagnostics = vec!["mode: levels (signalstats)".into()];
+
+        let (tc_fmt, start_frame, total_frames) =
+            engine::analysis::prepare_single_file(&file_path, &mut diagnostics)?;
+
+        let _ = app_clone.emit("rpc:diagnostics", json!({"lines": diagnostics}));
+
+        let app_progress = app_clone.clone();
+        let progress: engine::analysis::ProgressFn = Box::new(move |current, total| {
+            let _ = app_progress.emit("rpc:progress", json!({"current": current, "total": total}));
+        });
+
+        let frames = engine::analysis::run_levels_analysis(
+            &file_path,
+            &tc_fmt,
+            start_frame,
+            total_frames,
+            Some(progress),
+            process_handle,
+        )?;
+
+        eprintln!("[vcompare] Parsed {} levels frames", frames.len());
+
+        let result = json!({
+            "mode": "levels",
+            "frames": frames,
+            "ref_path": file_path,
+            "ref_start_frame": start_frame,
+            "ref_file_start_tc": start_frame,
+            "tc_format": {
+                "fps_num": tc_fmt.fps_num,
+                "fps_den": tc_fmt.fps_den,
+                "tc_type": tc_fmt.tc_type,
+            },
+        });
+
+        Ok::<(Value, Option<String>), String>((result, save_path))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+
+    let (result_val, save_path) = result;
+
+    engine_state.apply_levels_result(&result_val);
+
+    if let Some(ref sp) = save_path {
+        cache::save_diff_analysis(&result_val, sp)?;
+        eprintln!("[vcompare] Saved levels analysis to {sp}");
     }
 
     engine_state.set_save_path(save_path);

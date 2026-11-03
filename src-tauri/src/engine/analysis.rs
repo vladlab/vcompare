@@ -541,6 +541,153 @@ pub fn run_vmaf_analysis(
     Ok(frames)
 }
 
+// ─── Levels analysis (single file) ─────────────────────────────────────────
+
+/// Run single-file levels analysis using FFmpeg's signalstats filter.
+///
+/// Extracts per-frame min/max YUV values.
+/// Returns frame data with y_min, y_max, u_min, u_max, v_min, v_max.
+pub fn run_levels_analysis(
+    file_path: &str,
+    tc_fmt: &TimecodeFormat,
+    start_frame: i64,
+    total_frames: Option<u64>,
+    progress: Option<ProgressFn>,
+    process_handle: ProcessHandle,
+) -> Result<Vec<Value>, String> {
+    let stats_dir = std::env::temp_dir().join(format!("vcompare_levels_{}", std::process::id()));
+    std::fs::create_dir_all(&stats_dir)
+        .map_err(|e| format!("Failed to create temp dir: {e}"))?;
+    let stats_path = stats_dir.join("signalstats.txt");
+    let stats_path_str = stats_path.to_string_lossy().to_string();
+
+    let filter = format!("signalstats,metadata=mode=print:file={stats_path_str}");
+
+    let mut args: Vec<String> = vec!["-y".into()];
+    if is_concat_manifest(file_path) {
+        args.extend(["-f".into(), "concat".into(), "-safe".into(), "0".into()]);
+    }
+    args.extend(["-i".into(), file_path.into()]);
+    args.extend(["-vf".into(), filter]);
+    if let Some(total) = total_frames {
+        args.extend(["-frames:v".into(), total.to_string()]);
+    }
+    args.extend(["-f".into(), "null".into(), "-".into()]);
+
+    eprintln!("[vcompare] cmd: ffmpeg {}", args.join(" "));
+
+    run_ffmpeg_with_progress(&args, total_frames, progress, process_handle)?;
+
+    let frames = parse_signalstats_metadata(&stats_path_str, tc_fmt, start_frame)?;
+
+    let _ = std::fs::remove_file(&stats_path);
+    let _ = std::fs::remove_dir(&stats_dir);
+
+    Ok(frames)
+}
+
+/// Prepare a single file for levels analysis.
+///
+/// Probes the file and returns timecode format, start frame, and total frames.
+pub fn prepare_single_file(
+    file_path: &str,
+    diagnostics: &mut Vec<String>,
+) -> Result<(TimecodeFormat, i64, Option<u64>), String> {
+    let probe = ffprobe_json(file_path)?;
+    let tc_fmt = detect_timecode_format(&probe)?;
+    let info = get_video_info(&probe, &tc_fmt)?;
+
+    diagnostics.push(format!(
+        "file: {}x{} {} {}/{}",
+        info.width, info.height, info.pix_fmt, info.fps_num, info.fps_den
+    ));
+    if let Some(ref tc) = info.start_tc {
+        diagnostics.push(format!("timecode: {tc}"));
+    }
+
+    let total = info.nb_frames.map(|n| n as u64);
+    if let Some(n) = total {
+        diagnostics.push(format!("frames: {n}"));
+    }
+
+    Ok((tc_fmt, info.start_tc_frames, total))
+}
+
+/// Parse signalstats metadata output.
+///
+/// Format:
+/// ```text
+/// frame:0          pts:0        pts_time:0
+/// lavfi.signalstats.YMIN=16
+/// lavfi.signalstats.YMAX=235
+/// lavfi.signalstats.UMIN=110
+/// lavfi.signalstats.UMAX=140
+/// lavfi.signalstats.VMIN=115
+/// lavfi.signalstats.VMAX=145
+/// ...
+/// ```
+fn parse_signalstats_metadata(
+    stats_path: &str,
+    tc_fmt: &TimecodeFormat,
+    start_frame: i64,
+) -> Result<Vec<Value>, String> {
+    let content = std::fs::read_to_string(stats_path)
+        .map_err(|e| format!("Failed to read signalstats: {e}"))?;
+
+    let frame_re = Regex::new(r"^frame:(\d+)").unwrap();
+    let kv_re = Regex::new(r"^lavfi\.signalstats\.(\w+)=([\d.]+)").unwrap();
+
+    let mut frames = Vec::new();
+    let mut current_frame: Option<i64> = None;
+    let mut current_vals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+
+    let flush = |frame_num: i64,
+                 vals: &std::collections::HashMap<String, f64>,
+                 tc_fmt: &TimecodeFormat,
+                 start_frame: i64,
+                 frames: &mut Vec<Value>| {
+        let display_frame = frame_num + start_frame;
+        frames.push(serde_json::json!({
+            "frame": display_frame,
+            "tc": tc_fmt.frame_to_tc(display_frame),
+            "y_min": vals.get("YMIN").copied().unwrap_or(0.0),
+            "y_max": vals.get("YMAX").copied().unwrap_or(0.0),
+            "u_min": vals.get("UMIN").copied().unwrap_or(0.0),
+            "u_max": vals.get("UMAX").copied().unwrap_or(0.0),
+            "v_min": vals.get("VMIN").copied().unwrap_or(0.0),
+            "v_max": vals.get("VMAX").copied().unwrap_or(0.0),
+        }));
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(caps) = frame_re.captures(line) {
+            // Flush previous frame
+            if let Some(fn_) = current_frame {
+                flush(fn_, &current_vals, tc_fmt, start_frame, &mut frames);
+            }
+            current_frame = caps[1].parse::<i64>().ok();
+            current_vals.clear();
+        } else if let Some(caps) = kv_re.captures(line) {
+            let key = caps[1].to_string();
+            if let Ok(val) = caps[2].parse::<f64>() {
+                current_vals.insert(key, val);
+            }
+        }
+    }
+
+    // Flush last frame
+    if let Some(fn_) = current_frame {
+        flush(fn_, &current_vals, tc_fmt, start_frame, &mut frames);
+    }
+
+    Ok(frames)
+}
+
 // ─── FFmpeg process management ──────────────────────────────────────────────
 
 /// Build -ss/-f/-i args for one input file.

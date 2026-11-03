@@ -26,6 +26,20 @@ pub fn default_log_path(ref_path: &str, dist_path: &str) -> String {
         .to_string()
 }
 
+/// Default cache path for levels analysis: `{dir}/{stem}.levels.json`
+pub fn default_levels_path(file_path: &str) -> String {
+    let p = Path::new(file_path);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let dir = p.parent().unwrap_or_else(|| Path::new("."));
+
+    dir.join(format!("{stem}.levels.json"))
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Check if a cached analysis exists and return info about it.
 pub fn check_cache(ref_path: &str, dist_path: &str, log_path: Option<&str>) -> Value {
     let path = log_path

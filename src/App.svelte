@@ -23,6 +23,7 @@
     detectCapabilities,
     probeFile,
     checkCache,
+    checkLevelsCache,
     loadSavedAnalysis,
     analyze,
     getMetricSeries,
@@ -75,7 +76,7 @@
   let recentEntries: RecentEntry[] = $state([]);
 
   // Analysis options
-  let analysisMode: "diff" | "vmaf" = $state("diff");
+  let analysisMode: "diff" | "vmaf" | "levels" = $state("diff");
   let syncMode: string = $state("start");
   let hwaccelMode: string = $state("auto");
   let wantPsnr: boolean = $state(false);
@@ -240,7 +241,11 @@
       } catch (e) {
         refProbe = null;
       }
-      if (distPath) await probeSelected();
+      if (analysisMode === "levels") {
+        await updateCacheInfo();
+      } else if (distPath) {
+        await probeSelected();
+      }
     }
   }
 
@@ -263,22 +268,32 @@
   }
 
   async function probeSelected() {
-    if (!refPath || !distPath) return;
+    if (!refPath || (!distPath && analysisMode !== "levels")) return;
     state = "probing";
     try {
-      [refProbe, distProbe] = await Promise.all([
-        probeFile(refPath),
-        probeFile(distPath),
-      ]);
-      try {
-        cacheInfo = await checkCache(refPath, distPath);
-      } catch {
-        cacheInfo = null;
+      refProbe = await probeFile(refPath);
+      if (distPath && analysisMode !== "levels") {
+        distProbe = await probeFile(distPath);
       }
+      await updateCacheInfo();
       state = "idle";
     } catch (e) {
       state = "error";
       errorMessage = `Probe failed: ${e}`;
+    }
+  }
+
+  async function updateCacheInfo() {
+    try {
+      if (analysisMode === "levels" && refPath) {
+        cacheInfo = await checkLevelsCache(refPath);
+      } else if (refPath && distPath) {
+        cacheInfo = await checkCache(refPath, distPath);
+      } else {
+        cacheInfo = null;
+      }
+    } catch {
+      cacheInfo = null;
     }
   }
 
@@ -305,21 +320,22 @@
     // Auto-set threshold
     if (result.mode === "diff" && result.diff_y_stats) {
       const s = result.diff_y_stats;
-      // For diff: threshold = mean + 1σ (flag things above)
       threshold = Math.round((s.mean + (s.stddev ?? 0)) * 100) / 100;
     } else if (result.mode === "vmaf" && result.vmaf_stats) {
       const s = result.vmaf_stats;
-      // For vmaf: threshold = mean - 1σ (flag things below)
       threshold = Math.round((s.mean - (s.stddev ?? 0)) * 100) / 100;
+    } else if (result.mode === "levels") {
+      // No threshold for levels by default
+      threshold = null;
     }
 
     state = "ready";
 
     // Record in recents
-    if (cacheInfo?.path && refPath && distPath) {
+    if (cacheInfo?.path && refPath) {
       addRecent({
         ref_path: refPath,
-        dist_path: distPath,
+        dist_path: distPath || "",
         cache_path: cacheInfo.path,
         mode: result.mode,
         frame_count: result.frame_count,
@@ -337,7 +353,7 @@
     try {
       const result = await analyze({
         reference: refPath,
-        distorted: distPath,
+        distorted: analysisMode !== "levels" ? distPath : undefined,
         mode: analysisMode,
         hwaccel: hwaccelMode,
         sync: syncMode,
@@ -370,6 +386,9 @@
     showRecents = false;
     refPath = entry.ref_path;
     distPath = entry.dist_path;
+    if (entry.mode === "levels" || entry.mode === "diff" || entry.mode === "vmaf") {
+      analysisMode = entry.mode;
+    }
     // Set cacheInfo so finishAnalysis can record it back to recents
     cacheInfo = { exists: true, path: entry.cache_path, frame_count: entry.frame_count, mode: entry.mode };
     state = "analyzing";
@@ -569,6 +588,12 @@
       ssim_v: "SSIM V",
       vmaf: "VMAF",
       psnr: "PSNR",
+      y_min: "Y Min",
+      y_max: "Y Max",
+      u_min: "U Min",
+      u_max: "U Max",
+      v_min: "V Min",
+      v_max: "V Max",
     };
     return labels[m] ?? m;
   }
@@ -589,8 +614,12 @@
         {/if}
         {#if activeStats()}
           · {fmtMetricLabel(activeMetric)}
-          μ={activeStats().mean.toFixed(activeMetric.startsWith("ssim") ? 4 : 2)}
-          {activeMetric.startsWith("diff") ? "max" : "min"}={activeMetric.startsWith("diff") ? activeStats().max.toFixed(2) : activeStats().min.toFixed(activeMetric.startsWith("ssim") ? 4 : 2)}
+          μ={activeStats().mean.toFixed(activeMetric.startsWith("ssim") ? 4 : 0)}
+          {#if summary.mode === "levels"}
+            range={activeStats().min.toFixed(0)}–{activeStats().max.toFixed(0)}
+          {:else}
+            {activeMetric.startsWith("diff") ? "max" : "min"}={activeMetric.startsWith("diff") ? activeStats().max.toFixed(2) : activeStats().min.toFixed(activeMetric.startsWith("ssim") ? 4 : 2)}
+          {/if}
         {/if}
       </span>
       {#if summary.mode === "diff" && summary.diff_distribution}
@@ -615,14 +644,27 @@
       <!-- File picker panel -->
       <div class="picker-panel">
         <div class="picker-section">
-          <h2>Compare Videos</h2>
+          <h2>{analysisMode === "levels" ? "Analyze Video" : "Compare Videos"}</h2>
           <p class="text-secondary">
-            Select a reference and distorted file to compare.
+            {analysisMode === "levels"
+              ? "Select a video file to analyze signal levels."
+              : "Select a reference and distorted file to compare."}
           </p>
         </div>
 
+        <div class="options-row" style="margin-bottom: 12px;">
+          <label>
+            Mode
+            <select bind:value={analysisMode} onchange={() => updateCacheInfo()}>
+              <option value="diff">Pixel Diff</option>
+              <option value="vmaf">VMAF</option>
+              <option value="levels">Levels</option>
+            </select>
+          </label>
+        </div>
+
         <div class="file-row">
-          <label>Reference</label>
+          <label>{analysisMode === "levels" ? "File" : "Reference"}</label>
           <button onclick={pickReference} class="file-btn" title={refPath || ""}>
             {refPath ? refPath.split("/").pop() : "Choose file…"}
           </button>
@@ -631,30 +673,41 @@
           {/if}
         </div>
 
-        <div class="file-row">
-          <label>Distorted</label>
-          <button onclick={pickDistorted} class="file-btn" title={distPath || ""}>
-            {distPath ? distPath.split("/").pop() : "Choose file…"}
-          </button>
-          {#if distProbe}
-            <span class="file-meta mono">{fmtProbe(distProbe)}</span>
-          {/if}
-        </div>
+        {#if analysisMode !== "levels"}
+          <div class="file-row">
+            <label>Distorted</label>
+            <button onclick={pickDistorted} class="file-btn" title={distPath || ""}>
+              {distPath ? distPath.split("/").pop() : "Choose file…"}
+            </button>
+            {#if distProbe}
+              <span class="file-meta mono">{fmtProbe(distProbe)}</span>
+            {/if}
+          </div>
+        {/if}
 
-        {#if refProbe && distProbe}
+        {#if analysisMode === "levels" && refProbe}
+          <button class="primary analyze-btn" onclick={startAnalysis}>
+            {cacheInfo?.exists ? "Re-analyze" : "Analyze"}
+          </button>
+
+          {#if cacheInfo?.exists}
+            <div class="cache-row">
+              <span class="cache-info mono">
+                Cached (levels): {cacheInfo.frame_count?.toLocaleString()} frames
+                ({cacheInfo.path.split("/").pop()})
+              </span>
+              <button class="primary" onclick={loadCached}>
+                Load cached
+              </button>
+            </div>
+          {/if}
+        {:else if analysisMode !== "levels" && refProbe && distProbe}
           {#if Math.abs(refProbe.fps - distProbe.fps) > 0.01}
             <div class="fps-warning">
               ⚠ Framerate mismatch: ref {refProbe.fps_num}/{refProbe.fps_den} ({refProbe.fps.toFixed(3)}fps) vs dist {distProbe.fps_num}/{distProbe.fps_den} ({distProbe.fps.toFixed(3)}fps) — results may be unreliable
             </div>
           {/if}
           <div class="options-row">
-            <label>
-              Mode
-              <select bind:value={analysisMode}>
-                <option value="diff">Pixel Diff</option>
-                <option value="vmaf">VMAF</option>
-              </select>
-            </label>
             <label>
               Sync
               <select bind:value={syncMode}>
@@ -714,7 +767,7 @@
     {:else if state === "analyzing"}
       <!-- Progress view -->
       <div class="progress-panel">
-        <h2>Analyzing… ({analysisMode === "diff" ? "pixel diff" : "VMAF"})</h2>
+        <h2>Analyzing… ({analysisMode === "diff" ? "pixel diff" : analysisMode === "levels" ? "levels" : "VMAF"})</h2>
         <div class="progress-bar-container">
           <div class="progress-bar" style="width: {progressPct}%"></div>
         </div>
@@ -809,7 +862,7 @@
               onclick={() => loadRecentEntry(entry)}
             >
               <span class="recents-files mono">
-                {entry.ref_path.split("/").pop()} vs {entry.dist_path.split("/").pop()}
+                {entry.ref_path.split("/").pop()}{entry.dist_path ? ` vs ${entry.dist_path.split("/").pop()}` : ""}
               </span>
               <span class="recents-meta">
                 {entry.mode} · {entry.frame_count.toLocaleString()} frames · {new Date(entry.timestamp * 1000).toLocaleDateString()}

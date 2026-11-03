@@ -56,6 +56,12 @@
     ssim_y: { color: "#7be870", label: "SSIM (Y)" },
     ssim_u: { color: "#70b8e8", label: "SSIM (U)" },
     ssim_v: { color: "#d870e8", label: "SSIM (V)" },
+    y_min:  { color: "#b89830", label: "Y Min" },
+    y_max:  { color: "#f0d060", label: "Y Max" },
+    u_min:  { color: "#4090c0", label: "U Min (Cb)" },
+    u_max:  { color: "#70c0f0", label: "U Max (Cb)" },
+    v_min:  { color: "#c04070", label: "V Min (Cr)" },
+    v_max:  { color: "#f070a0", label: "V Max (Cr)" },
   };
 
   function getColor(): string {
@@ -214,9 +220,14 @@
         return [0, max + pad];
       }
       if (metric.startsWith("ssim")) {
-        // SSIM: 0-1 range, zoom into the data range for detail
         const pad = (max - min) * 0.1 || 0.001;
         return [Math.max(0, min - pad), Math.min(1, max + pad)];
+      }
+      if (metric.startsWith("y_") || metric.startsWith("u_") || metric.startsWith("v_")) {
+        // Levels: signal values, auto-detect range from data
+        // Use full 0–peak range, where peak is inferred (255 or 1023)
+        const peak = max > 255 ? 1023 : 255;
+        return [0, peak];
       }
       const pad = (max - min) * 0.05 || 1;
       return [min - pad, max + pad];
@@ -598,7 +609,9 @@
                 ctx.fillStyle = THRESHOLD_COLOR;
                 ctx.font = "10px 'JetBrains Mono', monospace";
                 ctx.textAlign = "left";
-                ctx.fillText(`${threshold.toFixed(metric.startsWith("ssim") ? 4 : 1)}`, u.bbox.left + 4, y - 4);
+                const isLevels = metric.startsWith("y_") || metric.startsWith("u_") || metric.startsWith("v_");
+                const precision = isLevels ? 0 : metric.startsWith("ssim") ? 4 : 1;
+                ctx.fillText(`${threshold.toFixed(precision)}`, u.bbox.left + 4, y - 4);
                 ctx.restore();
               },
             ],

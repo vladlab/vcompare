@@ -58,7 +58,7 @@ export interface TimelineInfo {
 }
 
 export interface AnalysisSummary {
-  mode: "diff" | "vmaf";
+  mode: "diff" | "vmaf" | "levels";
   frame_count: number;
   metrics_available: string[];
   tc_format: TcFormat | null;
@@ -75,6 +75,13 @@ export interface AnalysisSummary {
   ssim_y_stats?: MetricStats;
   ssim_u_stats?: MetricStats;
   ssim_v_stats?: MetricStats;
+  // Levels stats
+  y_min_stats?: MetricStats;
+  y_max_stats?: MetricStats;
+  u_min_stats?: MetricStats;
+  u_max_stats?: MetricStats;
+  v_min_stats?: MetricStats;
+  v_max_stats?: MetricStats;
   diff_distribution?: DiffDistribution;
   timeline?: TimelineInfo;
 }
@@ -95,6 +102,13 @@ export interface FrameData {
   // vmaf mode
   vmaf?: number | null;
   psnr?: number | null;
+  // levels mode
+  y_min?: number | null;
+  y_max?: number | null;
+  u_min?: number | null;
+  u_max?: number | null;
+  v_min?: number | null;
+  v_max?: number | null;
 }
 
 export interface FrameResult {
@@ -132,8 +146,8 @@ export interface MpvPositionEvent {
 
 export interface AnalyzeParams {
   reference: string;
-  distorted: string;
-  mode?: "diff" | "vmaf";
+  distorted?: string;
+  mode?: "diff" | "vmaf" | "levels";
   model?: string;
   hwaccel?: string;
   sync?: string;
@@ -180,6 +194,10 @@ export async function probeFile(path: string): Promise<FileProbe> {
 
 export async function checkCache(reference: string, distorted: string): Promise<CacheCheck> {
   return invoke("check_cache", { reference, distorted });
+}
+
+export async function checkLevelsCache(reference: string): Promise<CacheCheck> {
+  return invoke("check_levels_cache", { reference });
 }
 
 export async function loadSavedAnalysis(path: string): Promise<AnalysisSummary> {

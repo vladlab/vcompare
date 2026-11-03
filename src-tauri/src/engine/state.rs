@@ -184,6 +184,46 @@ impl EngineState {
         state.mpv_context = build_mpv_context(&state.meta);
     }
 
+    /// Store levels analysis results (single-file YUV min/max).
+    pub fn apply_levels_result(&self, result: &Value) {
+        let mut state = self.inner.lock().unwrap();
+        state.frames = result
+            .get("frames")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        state.metrics_available = vec![
+            "y_min".into(),
+            "y_max".into(),
+            "u_min".into(),
+            "u_max".into(),
+            "v_min".into(),
+            "v_max".into(),
+        ];
+        state.analysis_mode = Some("levels".into());
+        state.meta = AnalysisMeta {
+            ref_path: str_field(result, "ref_path"),
+            dist_path: String::new(),
+            ref_start_frame: result
+                .get("ref_start_frame")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            ref_file_start_tc: result
+                .get("ref_file_start_tc")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            sync_mode: "start".into(),
+            bit_depth: None,
+            tc_format: parse_tc_format(result.get("tc_format")),
+            timeline: None,
+            scale_w: 0,
+            scale_h: 0,
+            scale_ref: false,
+        };
+        state.mpv_context = None; // No comparison mpv for levels
+    }
+
     pub fn set_save_path(&self, path: Option<String>) {
         self.inner.lock().unwrap().save_path = path;
     }
