@@ -10,6 +10,9 @@ pub mod probe;
 pub mod rawstats;
 pub mod resolve;
 pub mod state;
+#[cfg(test)]
+pub mod testenv;
 pub mod thumbs;
+pub mod timeline;
 pub mod timecode;
 pub mod types;

@@ -11,7 +11,7 @@
 //! queues up a backlog in Resolve.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 
 const BRIDGE_SOURCE: &str = include_str!("resolve_bridge.py");
@@ -56,59 +56,9 @@ impl ResolveSync {
         let on_status = Arc::new(on_status);
         on_status(ResolveStatus::Connecting);
 
-        let script = std::env::temp_dir().join("vcompare_resolve_bridge.py");
-        std::fs::write(&script, BRIDGE_SOURCE)
-            .map_err(|e| format!("Failed to write bridge script: {e}"))?;
-
-        let mut child = python_command()?
-            .arg(&script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to start Python for the Resolve bridge: {e}"))?;
-
-        let stdin = child.stdin.take().ok_or("bridge stdin")?;
-        let stdout = child.stdout.take().ok_or("bridge stdout")?;
-        let stderr = child.stderr.take().ok_or("bridge stderr")?;
-
-        // Drain stderr so the helper can't block on it; keep a tail for errors.
-        let err_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        {
-            let tail = err_tail.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    let mut t = tail.lock().unwrap();
-                    if t.len() >= 10 {
-                        t.remove(0);
-                    }
-                    t.push(line);
-                }
-            });
-        }
-
-        let mut reader = BufReader::new(stdout);
-        let mut first = String::new();
-        reader
-            .read_line(&mut first)
-            .map_err(|e| format!("Resolve bridge: {e}"))?;
-        let first = first.trim().to_string();
-        let target = match first.strip_prefix("READY ") {
-            Some(t) => t.to_string(),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let msg = first
-                    .strip_prefix("FAIL ")
-                    .map(String::from)
-                    .unwrap_or_else(|| {
-                        let tail = err_tail.lock().unwrap().join("\n");
-                        if tail.is_empty() {
-                            "Resolve bridge exited without connecting".into()
-                        } else {
-                            format!("Resolve bridge failed:\n{tail}")
-                        }
-                    });
+        let Spawned { child, stdin, mut reader, target } = match spawn_bridge() {
+            Ok(s) => s,
+            Err(msg) => {
                 on_status(ResolveStatus::Failed { message: msg.clone() });
                 return Err(msg);
             }
@@ -238,6 +188,207 @@ impl Drop for ResolveSync {
     }
 }
 
+/// A started helper that answered READY.
+struct Spawned {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    /// "project / timeline"
+    target: String,
+}
+
+/// Write the helper script out, start it and wait for its READY line.
+fn spawn_bridge() -> Result<Spawned, String> {
+    let script = std::env::temp_dir().join("vcompare_resolve_bridge.py");
+    std::fs::write(&script, BRIDGE_SOURCE)
+        .map_err(|e| format!("Failed to write bridge script: {e}"))?;
+
+    let mut child = python_command()?
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start Python for the Resolve bridge: {e}"))?;
+
+    let stdin = child.stdin.take().ok_or("bridge stdin")?;
+    let stdout = child.stdout.take().ok_or("bridge stdout")?;
+    let stderr = child.stderr.take().ok_or("bridge stderr")?;
+
+    // Drain stderr so the helper can't block on it; keep a tail for errors.
+    let err_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let tail = err_tail.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut t = tail.lock().unwrap();
+                if t.len() >= 10 {
+                    t.remove(0);
+                }
+                t.push(line);
+            }
+        });
+    }
+
+    let mut reader = BufReader::new(stdout);
+    let mut first = String::new();
+    reader
+        .read_line(&mut first)
+        .map_err(|e| format!("Resolve bridge: {e}"))?;
+    let first = first.trim().to_string();
+    match first.strip_prefix("READY ") {
+        Some(t) => Ok(Spawned { child, stdin, reader, target: t.to_string() }),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(first
+                .strip_prefix("FAIL ")
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    // The reader thread may still be collecting the traceback.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let tail = err_tail.lock().unwrap().join("\n");
+                    if tail.is_empty() {
+                        "Resolve bridge exited without connecting".into()
+                    } else {
+                        format!("Resolve bridge failed:\n{tail}")
+                    }
+                }))
+        }
+    }
+}
+
+// ─── Synchronous session (timeline runs) ────────────────────────────────────
+
+/// Timeline facts the bridge reports with every TRACKS / CLIPS answer.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TimelineMeta {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub start_frame: Option<i64>,
+    #[serde(default)]
+    pub end_frame: Option<i64>,
+    #[serde(default)]
+    pub start_tc: Option<String>,
+    /// Resolve's setting string, e.g. "23.976".
+    #[serde(default)]
+    pub fps: Option<String>,
+    #[serde(default)]
+    pub drop_frame: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrackInfo {
+    pub index: u32,
+    pub name: String,
+    /// `None` on builds without `GetIsTrackEnabled`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    pub items: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TracksReply {
+    pub timeline: TimelineMeta,
+    pub tracks: Vec<TrackInfo>,
+}
+
+/// One item on a video track, as Resolve reports it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClipItem {
+    pub track: u32,
+    pub name: String,
+    pub start: Option<i64>,
+    pub duration: Option<i64>,
+    pub end: Option<i64>,
+    /// `None` when the build can't tell.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClipsReply {
+    pub timeline: TimelineMeta,
+    pub items: Vec<ClipItem>,
+}
+
+/// A private helper for one timeline run: every command waits for its
+/// answer, nothing is coalesced (a run must not skip seeks). Independent of
+/// the cursor-sync connection, which may be open at the same time.
+pub struct ResolveSession {
+    child: Option<Child>,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    pub target: String,
+}
+
+impl ResolveSession {
+    pub fn connect() -> Result<Self, String> {
+        let Spawned { child, stdin, reader, target } = spawn_bridge()?;
+        Ok(Self { child: Some(child), stdin, reader, target })
+    }
+
+    /// Send one line, return the answer after `OK` (possibly empty).
+    fn request(&mut self, line: &str) -> Result<String, String> {
+        writeln!(self.stdin, "{line}")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|e| format!("Resolve bridge closed: {e}"))?;
+        let mut answer = String::new();
+        match self.reader.read_line(&mut answer) {
+            Ok(n) if n > 0 => {}
+            _ => return Err("Resolve bridge closed".into()),
+        }
+        let answer = answer.trim_end();
+        if let Some(rest) = answer.strip_prefix("OK") {
+            Ok(rest.trim_start().to_string())
+        } else if let Some(err) = answer.strip_prefix("ERR ") {
+            Err(err.to_string())
+        } else {
+            Err(format!("Resolve bridge: unexpected answer {answer:?}"))
+        }
+    }
+
+    pub fn tracks(&mut self) -> Result<TracksReply, String> {
+        let body = self.request("TRACKS")?;
+        serde_json::from_str(&body).map_err(|e| format!("Resolve bridge: bad TRACKS answer: {e}"))
+    }
+
+    pub fn clips(&mut self, tracks: &[u32]) -> Result<ClipsReply, String> {
+        let list: Vec<String> = tracks.iter().map(|t| t.to_string()).collect();
+        let body = self.request(&format!("CLIPS {}", list.join(",")))?;
+        serde_json::from_str(&body).map_err(|e| format!("Resolve bridge: bad CLIPS answer: {e}"))
+    }
+
+    /// Move the playhead and wait until Resolve has accepted it.
+    pub fn seek(&mut self, timecode: &str) -> Result<(), String> {
+        self.request(&format!("SEEK {timecode}")).map(|_| ())
+    }
+
+    pub fn close(&mut self) {
+        let _ = writeln!(self.stdin, "QUIT");
+        let _ = self.stdin.flush();
+        if let Some(mut c) = self.child.take() {
+            for _ in 0..20 {
+                if c.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for ResolveSession {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// A Python 3 to run the bridge with. `VCOMPARE_PYTHON` overrides.
 fn python_command() -> Result<Command, String> {
     if let Some(p) = std::env::var_os("VCOMPARE_PYTHON") {
@@ -276,6 +427,7 @@ mod tests {
             eprintln!("no python3; skipping");
             return;
         }
+        let _env = crate::engine::testenv::lock();
         let dir = std::env::temp_dir().join(format!("vcompare_resolve_stub_{}", std::process::id()));
         let modules = dir.join("Modules");
         std::fs::create_dir_all(&modules).unwrap();
@@ -345,6 +497,51 @@ def scriptapp(name): return _R()
         let statuses = seen.lock().unwrap();
         assert!(matches!(statuses[0], ResolveStatus::Connecting));
         assert!(matches!(statuses[1], ResolveStatus::Connected { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// TRACKS / CLIPS / synchronous SEEK against the shared fake Resolve in
+    /// `testdata/fake_resolve` (also used by the timeline run tests).
+    #[test]
+    fn session_tracks_clips_seek() {
+        if python_command().is_err() {
+            eprintln!("no python3; skipping");
+            return;
+        }
+        let _env = crate::engine::testenv::lock();
+        let dir = std::env::temp_dir().join(format!("vcompare_session_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tl = dir.join("timeline.json");
+        std::fs::write(
+            &tl,
+            r#"{"project":"P","name":"Reel 1","start_frame":86400,"start_tc":"01:00:00:00",
+                "fps":"23.976","drop_frame":false,
+                "tracks":[{"name":"V1","enabled":true,"items":[
+                            {"name":"A 001","start":86400,"duration":10},
+                            {"name":"B","start":86410,"duration":1,"enabled":false}]},
+                          {"name":"Gfx","enabled":false,"items":[]}]}"#,
+        )
+        .unwrap();
+        let playhead = dir.join("playhead");
+        crate::engine::testenv::use_fake_resolve(&tl, Some(&playhead));
+
+        let mut s = ResolveSession::connect().unwrap();
+        assert_eq!(s.target, "P / Reel 1");
+        let t = s.tracks().unwrap();
+        assert_eq!(t.tracks.len(), 2);
+        assert_eq!(t.tracks[0].items, 2);
+        assert_eq!(t.tracks[1].enabled, Some(false));
+        assert_eq!(t.timeline.fps.as_deref(), Some("23.976"));
+        assert_eq!(t.timeline.start_frame, Some(86400));
+        let c = s.clips(&[1, 2]).unwrap();
+        assert_eq!(c.items.len(), 2);
+        assert_eq!(c.items[0].name, "A 001");
+        assert_eq!(c.items[0].end, Some(86410));
+        assert_eq!(c.items[1].enabled, Some(false));
+        s.seek("01:00:00:05").unwrap();
+        assert_eq!(std::fs::read_to_string(&playhead).unwrap().trim(), "01:00:00:05");
+        assert!(s.seek("bogus").is_err(), "a refused seek is an error");
+        assert!(s.clips(&[]).unwrap().items.is_empty());
+        s.close();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

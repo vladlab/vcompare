@@ -13,3 +13,4 @@ dist/
 
 # Archives / snapshots
 *.tar.gz
+__pycache__/
