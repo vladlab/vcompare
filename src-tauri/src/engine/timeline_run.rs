@@ -330,6 +330,10 @@ pub fn run(p: &RunParams, job: &Arc<Job>, cb: &Callbacks) -> Result<Value, Strin
     let mut signal: Option<GrabMeta> = None;
     let mut signal_changes = 0usize;
     let mut fatal: Option<String> = None;
+    // Resolve refuses every seek while the Project Manager (or a modal
+    // dialog) is open: stop early with a hint rather than refuse the reel.
+    let mut any_seek_ok = false;
+    let mut refused_in_a_row = 0usize;
     let loop_t0 = Instant::now();
     let total = todo.len();
     for (k, &i) in todo.iter().enumerate() {
@@ -349,9 +353,19 @@ pub fn run(p: &RunParams, job: &Arc<Job>, cb: &Callbacks) -> Result<Value, Strin
                 break;
             }
             rows[i].status = "seek_error";
-            rows[i].error = Some(e);
+            rows[i].error = Some(e.clone());
+            refused_in_a_row += 1;
+            if !any_seek_ok && refused_in_a_row >= 3 {
+                fatal = Some(format!(
+                    "Resolve refused the first {refused_in_a_row} seeks ({e}). \
+                     Close the Project Manager and any dialogs, and have the timeline open on the Edit or Color page."
+                ));
+                break;
+            }
             continue;
         }
+        any_seek_ok = true;
+        refused_in_a_row = 0;
         match grabber.grab(&tc, timeout) {
             Ok((meta, data)) => {
                 if !same_tc(&meta.tc, &tc) {
