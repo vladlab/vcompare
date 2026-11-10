@@ -57,8 +57,10 @@ export interface TimelineInfo {
   span_end: number;
 }
 
+export type AnalysisMode = "diff" | "vmaf" | "levels" | "timeline";
+
 export interface AnalysisSummary {
-  mode: "diff" | "vmaf" | "levels";
+  mode: AnalysisMode;
   frame_count: number;
   metrics_available: string[];
   tc_format: TcFormat | null;
@@ -86,6 +88,56 @@ export interface AnalysisSummary {
   timeline?: TimelineInfo;
   /** One-line throughput summary for a freshly computed native levels run */
   perf?: string;
+  /** Timeline mode: the run's report */
+  timeline_run?: TimelineRunReport;
+  /** Timeline mode: where the run was saved (null for a dry run) */
+  save_path?: string | null;
+  ref_path?: string;
+}
+
+export interface TimelineRunReport {
+  dry_run?: boolean;
+  resolve?: {
+    target: string;
+    project: string | null;
+    timeline: string | null;
+    start_tc: string | null;
+    fps: string | null;
+    drop_frame: boolean;
+    tracks: number[];
+  };
+  /** What the SDI signal said it carries (first grabbed frame) */
+  signal?: {
+    width: number;
+    height: number;
+    levels: string;
+    levels_auto: boolean;
+    colorspace: number;
+    eotf: number;
+    name: string;
+  } | null;
+  file_signal?: {
+    matrix: string;
+    matrix_tagged: boolean;
+    full_range: boolean;
+    range_tagged: boolean;
+    primaries: string | null;
+    transfer: string | null;
+    pix_fmt: string;
+    width: number;
+    height: number;
+  };
+  /** Samples by status: ok, not_in_file, grab_timeout, grab_error, seek_error, compare_error, grabbed (dry run) */
+  counts?: Record<string, number>;
+  plan?: { samples: number; in_file: number; merged: number; skipped_disabled: number; skipped_bad: number };
+  timing?: {
+    elapsed_s: number;
+    per_sample_ms: number;
+    grab_wait_ms: { median: number; p95: number; max: number };
+  };
+  diagnostics?: string[];
+  offset?: number;
+  compare_format?: string;
 }
 
 /** Generic frame data — fields depend on analysis mode */
@@ -130,11 +182,20 @@ export interface FrameData {
   u_dif?: number | null;
   v_dif?: number | null;
   sat_avg?: number | null;
+  // timeline mode
+  track?: number;
+  clip?: string;
+  pos?: "first" | "mid" | "last";
+  status?: string;
+  error?: string;
+  waited_ms?: number;
 }
 
 // ─── Events (flash frames) ─────────────────────────────────────────────────
 
-export type EventSubkind = "black" | "white" | "content";
+/** Flashes: black / white / content. Timeline mismatches: the sample's
+ *  position in its clip. Timeline errors: the sample's status. */
+export type EventSubkind = "black" | "white" | "content" | "first" | "mid" | "last" | string;
 
 export interface FlashEvent {
   /** First frame of the run (display frame number) */
@@ -142,7 +203,7 @@ export interface FlashEvent {
   tc: string;
   /** Run length in frames */
   length: number;
-  kind: "flash";
+  kind: "flash" | "mismatch" | "error";
   subkind: EventSubkind;
   /** True when the run sits on a cut (neighbours disagree) */
   at_cut: boolean;
@@ -150,6 +211,8 @@ export interface FlashEvent {
   score: number;
   /** The user's verdict, if any */
   review?: "accept" | "reject" | null;
+  /** Timeline mode: "<clip> (V<track>, <pos>)" */
+  label?: string;
 }
 
 export type EventReview = "accept" | "reject";
@@ -193,7 +256,7 @@ export interface DetectResult {
   events: FlashEvent[];
   /** Threshold actually used */
   threshold: number;
-  source: "levels" | "diff_y";
+  source: "levels" | "diff_y" | "timeline";
 }
 
 export interface FrameResult {
@@ -212,6 +275,8 @@ export interface Capabilities {
   hwaccel: string | null;
   vmaf_cuda: boolean;
   has_mpv: boolean;
+  /** Path of scopetap_grab, if installed (timeline mode needs it) */
+  grabber?: string | null;
 }
 
 export interface ProgressEvent {
@@ -232,7 +297,7 @@ export interface MpvPositionEvent {
 export interface AnalyzeParams {
   reference: string;
   distorted?: string;
-  mode?: "diff" | "vmaf" | "levels";
+  mode?: AnalysisMode;
   model?: string;
   hwaccel?: string;
   sync?: string;
@@ -244,6 +309,12 @@ export interface AnalyzeParams {
   force?: boolean;
   /** Levels: parallel ffmpeg decodes; omit (or 0) for auto */
   chunks?: number;
+  /** Timeline: video tracks (1-based) to sample */
+  tracks?: number[];
+  /** Timeline: seek + grab only, nothing compared or saved */
+  dry_run?: boolean;
+  grab_timeout_ms?: number;
+  settle_ms?: number;
 }
 
 export interface GetFramesParams {
@@ -389,6 +460,48 @@ export async function resolveSeek(frame: number): Promise<{ ok: boolean; timecod
 
 export async function resolveDisconnect(): Promise<{ status: string }> {
   return invoke("resolve_disconnect");
+}
+
+// ─── Timeline mode ──────────────────────────────────────────────────────────
+
+export interface TimelineTrack {
+  index: number;
+  name: string;
+  /** null on Resolve builds that can't tell */
+  enabled: boolean | null;
+  items: number;
+}
+
+export interface TimelineTracksReply {
+  target: string;
+  timeline: {
+    project: string | null;
+    name: string | null;
+    start_frame: number | null;
+    end_frame: number | null;
+    start_tc: string | null;
+    fps: string | null;
+    drop_frame: boolean;
+  };
+  tracks: TimelineTrack[];
+  grabber: string | null;
+}
+
+/** Video tracks of the timeline open in Resolve (for the checklist). */
+export async function timelineTracks(): Promise<TimelineTracksReply> {
+  return invoke("timeline_tracks");
+}
+
+export interface TimelineProgressEvent {
+  done: number;
+  total: number;
+  clip: string;
+  tc: string;
+  eta_s: number | null;
+}
+
+export function onTimelineProgress(callback: (e: TimelineProgressEvent) => void): Promise<UnlistenFn> {
+  return listen<TimelineProgressEvent>("rpc:timeline-progress", (e) => callback(e.payload));
 }
 
 export function onResolveStatus(callback: (s: ResolveStatus) => void): Promise<UnlistenFn> {

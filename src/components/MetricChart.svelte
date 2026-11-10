@@ -26,6 +26,8 @@
     timeline?: TimelineInfo | null;
     /** Detected events to mark on the chart (flash frames). */
     events?: FlashEvent[];
+    /** Data is a set of samples (timeline mode): draw the points. */
+    sparse?: boolean;
   }
 
   let {
@@ -36,6 +38,7 @@
     onCursorChange,
     timeline = null,
     events = [],
+    sparse = false,
   }: Props = $props();
 
   // ── Refs ──
@@ -83,6 +86,9 @@
     black: "#9a9a9a",
     white: "#ffffff",
     content: "#e8b830",
+    // timeline mode (by kind)
+    mismatch: "#e5534b",
+    error: "#d29922",
   };
   const EVENT_AT_CUT_ALPHA = 0.45;
 
@@ -463,8 +469,9 @@
               const x2 = u.valToPos(ev.frame + ev.length, "x", true);
               if (x2 < left || x1 > right) continue;
 
-              const color = EVENT_COLORS[ev.subkind] ?? EVENT_COLORS.content;
-              ctx.globalAlpha = ev.at_cut ? EVENT_AT_CUT_ALPHA : 1;
+              const flash = ev.kind === "flash";
+              const color = (flash ? EVENT_COLORS[ev.subkind] : EVENT_COLORS[ev.kind]) ?? EVENT_COLORS.content;
+              ctx.globalAlpha = flash && ev.at_cut ? EVENT_AT_CUT_ALPHA : 1;
 
               // Band over the run (min 1.5px so it never vanishes)
               const bx1 = Math.max(x1, left);
@@ -474,7 +481,7 @@
               ctx.fillRect(bx1, top, bx2 - bx1, height);
 
               // Tick at the top edge
-              ctx.globalAlpha = ev.at_cut ? EVENT_AT_CUT_ALPHA : 1;
+              ctx.globalAlpha = flash && ev.at_cut ? EVENT_AT_CUT_ALPHA : 1;
               ctx.fillStyle = color;
               ctx.fillRect(bx1, top, Math.max(bx2 - bx1, 2 * dpr), tickH);
             }
@@ -651,7 +658,7 @@
           stroke: color,
           width: 1,
           fill: color + "18",
-          points: { show: false },
+          points: { show: sparse, size: 5, fill: color },
           label: getLabel(),
         },
       ],

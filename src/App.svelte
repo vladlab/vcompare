@@ -5,8 +5,11 @@
     - diff (default): fast pixel difference (psnr/ssim filters)
     - vmaf: perceptual quality (libvmaf)
     - levels: single-file signal levels (signalstats)
+    - timeline: a deliverable against Resolve's SDI output, sampled at the
+      first / middle / last frame of every clip (needs scopetap_grab)
 
-  Flash-frame detection runs over diff and levels results (EventPanel).
+  Flash-frame detection runs over diff and levels results (EventPanel);
+  in timeline mode the same panel lists the flagged samples.
 -->
 
 <script lang="ts">
@@ -65,11 +68,15 @@
     onDiagnostics,
     onMpvPosition,
     onDiffviewPosition,
+    onTimelineProgress,
+    type TimelineProgressEvent,
   } from "./lib/rpc";
   import MetricChart from "./components/MetricChart.svelte";
   import FrameTable from "./components/FrameTable.svelte";
   import TimelineBar from "./components/TimelineBar.svelte";
   import EventPanel from "./components/EventPanel.svelte";
+  import TimelineSetup from "./components/TimelineSetup.svelte";
+  import TimelineReport from "./components/TimelineReport.svelte";
 
   // ── App state ──
 
@@ -96,7 +103,9 @@
   let recentEntries: RecentEntry[] = $state([]);
 
   // Analysis options
-  let analysisMode: "diff" | "vmaf" | "levels" = $state("diff");
+  let analysisMode: "diff" | "vmaf" | "levels" | "timeline" = $state("diff");
+  /** Single-file modes: one file, no "distorted" slot. */
+  let singleFile = $derived(analysisMode === "levels" || analysisMode === "timeline");
   let syncMode: string = $state("start");
   let hwaccelMode: string = $state("auto");
   let wantPsnr: boolean = $state(false);
@@ -118,6 +127,7 @@
   let progressCurrent: number = $state(0);
   let progressTotal: number = $state(0);
   let diagnosticLines: string[] = $state([]);
+  let timelineProgress: TimelineProgressEvent | null = $state(null);
 
   // View state
   let activeMetric: string = $state("diff_y");
@@ -139,6 +149,7 @@
     if (resolveBusy) return;
     if (resolveOn) {
       resolveOn = false;
+      resolveDeclined = true;
       resolveDisconnect().catch(() => {});
       resolveStatus = { state: "disconnected" };
       return;
@@ -270,6 +281,7 @@
   onMount(async () => {
     unlisteners.push(await onProgress(handleProgress));
     unlisteners.push(await onDiagnostics(handleDiagnostics));
+    unlisteners.push(await onTimelineProgress((e) => (timelineProgress = e)));
     unlisteners.push(
       await onMpvPosition((e) => {
         mpvFrame = e.frame;
@@ -396,8 +408,10 @@
   // ── Flash-frame detection ──
 
   let detectAvailable = $derived(
-    summary?.mode === "levels" || summary?.mode === "diff"
+    summary?.mode === "levels" || summary?.mode === "diff" ||
+    (summary?.mode === "timeline" && !summary.timeline_run?.dry_run)
   );
+  let isTimeline = $derived(summary?.mode === "timeline");
 
   async function runDetection() {
     if (!detectAvailable) {
@@ -454,8 +468,8 @@
   async function handleExportEdl() {
     const stem = refPath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "vcompare";
     const result = await save({
-      title: "Export flash frames as Resolve marker EDL",
-      defaultPath: `${stem}_flash_markers.edl`,
+      title: isTimeline ? "Export flagged samples as Resolve marker EDL" : "Export flash frames as Resolve marker EDL",
+      defaultPath: isTimeline ? `${stem}_timeline_markers.edl` : `${stem}_flash_markers.edl`,
       filters: [{ name: "EDL", extensions: ["edl"] }],
     });
     if (result) {
@@ -467,8 +481,8 @@
   async function handleExportEvents() {
     const stem = refPath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "vcompare";
     const result = await save({
-      title: "Export flash frames CSV",
-      defaultPath: `${stem}_flash_frames.csv`,
+      title: isTimeline ? "Export flagged samples CSV" : "Export flash frames CSV",
+      defaultPath: isTimeline ? `${stem}_timeline_flags.csv` : `${stem}_flash_frames.csv`,
       filters: [{ name: "CSV", extensions: ["csv"] }],
     });
     if (result) {
@@ -506,6 +520,8 @@
     }
     if (analysisMode === "levels") {
       await updateCacheInfo();
+    } else if (analysisMode === "timeline") {
+      cacheInfo = null;
     } else if (distPath) {
       await probeSelected();
     }
@@ -529,7 +545,7 @@
 
   async function pickReference() {
     const result = await open({
-      title: analysisMode === "levels" ? "Select video" : "Select reference video",
+      title: analysisMode === "levels" ? "Select video" : analysisMode === "timeline" ? "Select the deliverable" : "Select reference video",
       filters: VIDEO_FILTERS,
       defaultPath: lastDir,
     });
@@ -568,9 +584,9 @@
    */
   async function handleDrop(paths: string[], zone: DropZone | null) {
     if (paths.length === 0) return;
-    if (analysisMode === "levels") {
+    if (singleFile) {
       await setReference(paths[0]);
-      if (paths.length > 1) showStatus(`Levels analyses one file — using ${fileName(paths[0])}`);
+      if (paths.length > 1) showStatus(`This mode takes one file — using ${fileName(paths[0])}`);
       return;
     }
     if (paths.length >= 2) {
@@ -587,11 +603,11 @@
   }
 
   async function probeSelected() {
-    if (!refPath || (!distPath && analysisMode !== "levels")) return;
+    if (!refPath || (!distPath && !singleFile)) return;
     state = "probing";
     try {
       refProbe = await probeFile(refPath);
-      if (distPath && analysisMode !== "levels") {
+      if (distPath && !singleFile) {
         distProbe = await probeFile(distPath);
       }
       await updateCacheInfo();
@@ -604,7 +620,9 @@
 
   async function updateCacheInfo() {
     try {
-      if (analysisMode === "levels" && refPath) {
+      if (analysisMode === "timeline") {
+        cacheInfo = null;
+      } else if (analysisMode === "levels" && refPath) {
         cacheInfo = await checkLevelsCache(refPath);
       } else if (refPath && distPath) {
         cacheInfo = await checkCache(refPath, distPath);
@@ -639,6 +657,7 @@
     }
     progressCurrent = 0;
     progressTotal = 0;
+    timelineProgress = null;
     resetProgressRate();
     diagnosticLines = [];
     cancelling = false;
@@ -677,8 +696,8 @@
     } else if (result.mode === "vmaf" && result.vmaf_stats) {
       const s = result.vmaf_stats;
       threshold = Math.round((s.mean - (s.stddev ?? 0)) * 100) / 100;
-    } else if (result.mode === "levels") {
-      // No threshold for levels by default
+    } else if (result.mode === "levels" || result.mode === "timeline") {
+      // No threshold line by default (timeline: the event panel flags samples)
       threshold = null;
     }
 
@@ -687,6 +706,18 @@
 
     // Flash-frame detection (levels / diff only)
     await runDetection();
+
+    if (result.mode === "timeline") {
+      // Where the run was saved (none for a dry run), for recents.
+      cacheInfo = result.save_path
+        ? { exists: true, path: result.save_path, frame_count: result.frame_count, mode: "timeline" }
+        : null;
+      // Reviewing a flagged sample means seeing it on the reference monitor:
+      // follow the cursor in Resolve unless the operator turned that off.
+      if (!result.timeline_run?.dry_run && !resolveOn && !resolveBusy && !resolveDeclined) {
+        toggleResolveSync();
+      }
+    }
 
     // Record in recents
     if (cacheInfo?.path && refPath) {
@@ -701,6 +732,34 @@
     }
   }
 
+  /** Set once the operator turns Resolve sync off, so a later run doesn't
+   *  switch it back on. */
+  let resolveDeclined: boolean = $state(false);
+
+  async function startTimeline(opts: { tracks: number[]; offset: number; dry_run: boolean }) {
+    const token = beginJob();
+    state = "analyzing";
+    progressCurrent = 0;
+    progressTotal = 0;
+    timelineProgress = null;
+    resetProgressRate();
+    diagnosticLines = [];
+    try {
+      const result = await analyze({
+        reference: refPath,
+        mode: "timeline",
+        tracks: opts.tracks,
+        offset: opts.offset,
+        dry_run: opts.dry_run,
+      });
+      await finishAnalysis(result, token);
+    } catch (e) {
+      if (token !== jobToken) return;
+      state = "error";
+      errorMessage = `Timeline check failed: ${e}`;
+    }
+  }
+
   async function startAnalysis() {
     const token = beginJob();
     state = "analyzing";
@@ -712,7 +771,7 @@
     try {
       const result = await analyze({
         reference: refPath,
-        distorted: analysisMode !== "levels" ? distPath : undefined,
+        distorted: !singleFile ? distPath : undefined,
         mode: analysisMode,
         hwaccel: hwaccelMode,
         sync: syncMode,
@@ -749,7 +808,7 @@
     showRecents = false;
     refPath = entry.ref_path;
     distPath = entry.dist_path;
-    if (entry.mode === "levels" || entry.mode === "diff" || entry.mode === "vmaf") {
+    if (entry.mode === "levels" || entry.mode === "diff" || entry.mode === "vmaf" || entry.mode === "timeline") {
       analysisMode = entry.mode;
     }
     // Set cacheInfo so finishAnalysis can record it back to recents
@@ -1078,7 +1137,7 @@
     {#if state === "ready" && summary}
       <span class="header-badge">{summary.mode}</span>
       <span class="header-meta mono">
-        {summary.frame_count.toLocaleString()} frames
+        {summary.frame_count.toLocaleString()} {summary.mode === "timeline" ? "samples" : "frames"}
         {#if summary.tc_format}
           · {summary.tc_format.fps_num}/{summary.tc_format.fps_den}fps
         {/if}
@@ -1130,11 +1189,13 @@
       <!-- File picker panel -->
       <div class="picker-panel">
         <div class="picker-section">
-          <h2>{analysisMode === "levels" ? "Analyze Video" : "Compare Videos"}</h2>
+          <h2>{analysisMode === "levels" ? "Analyze Video" : analysisMode === "timeline" ? "Check a Deliverable Against Resolve" : "Compare Videos"}</h2>
           <p class="text-secondary">
             {analysisMode === "levels"
               ? "Select or drop a video file to analyze signal levels."
-              : "Select or drop a reference and distorted file — or drop both at once."}
+              : analysisMode === "timeline"
+                ? "Compares the file with what Resolve puts out on SDI, at the first, middle and last frame of every clip on the tracks you tick."
+                : "Select or drop a reference and distorted file — or drop both at once."}
           </p>
         </div>
 
@@ -1149,6 +1210,7 @@
               <option value="diff">Pixel Diff</option>
               <option value="vmaf">VMAF</option>
               <option value="levels">Levels</option>
+              <option value="timeline">Timeline (vs. Resolve SDI)</option>
             </select>
           </label>
         </div>
@@ -1156,10 +1218,10 @@
         <div
           class="file-row drop-zone"
           class:drop-armed={dragActive}
-          class:drop-hover={dragActive && (dragZone === "ref" || analysisMode === "levels" || dragCount >= 2)}
+          class:drop-hover={dragActive && (dragZone === "ref" || singleFile || dragCount >= 2)}
           data-drop-zone="ref"
         >
-          <label>{analysisMode === "levels" ? "File" : "Reference"}</label>
+          <label>{analysisMode === "levels" ? "File" : analysisMode === "timeline" ? "Deliverable" : "Reference"}</label>
           <button onclick={pickReference} class="file-btn" title={refPath || ""}>
             {refPath ? refPath.split("/").pop() : "Choose file…"}
           </button>
@@ -1168,7 +1230,7 @@
           {/if}
         </div>
 
-        {#if analysisMode !== "levels"}
+        {#if !singleFile}
           <div
             class="file-row drop-zone"
             class:drop-armed={dragActive}
@@ -1185,7 +1247,9 @@
           </div>
         {/if}
 
-        {#if analysisMode === "levels" && refProbe}
+        {#if analysisMode === "timeline"}
+          <TimelineSetup filePicked={refProbe != null} grabber={caps?.grabber} onStart={startTimeline} />
+        {:else if analysisMode === "levels" && refProbe}
           <div class="options-row">
             <label title="How many ffmpeg processes decode the file side by side. One ffmpeg tops out around 60 fps for UHD 10-bit; more lift that on fast local storage. Lower it for slow disks or network shares. Only intra-frame, constant-rate files (ProRes, DNxHR, …) can be split.">
               Parallel decodes
@@ -1212,7 +1276,7 @@
               </button>
             </div>
           {/if}
-        {:else if analysisMode !== "levels" && refProbe && distProbe}
+        {:else if !singleFile && refProbe && distProbe}
           {#if Math.abs(refProbe.fps - distProbe.fps) > 0.01}
             <div class="fps-warning">
               ⚠ Framerate mismatch: ref {refProbe.fps_num}/{refProbe.fps_den} ({refProbe.fps.toFixed(3)}fps) vs dist {distProbe.fps_num}/{distProbe.fps_den} ({distProbe.fps.toFixed(3)}fps) — results may be unreliable
@@ -1278,12 +1342,24 @@
     {:else if state === "analyzing"}
       <!-- Progress view -->
       <div class="progress-panel">
-        <h2>Analyzing… ({analysisMode === "diff" ? "pixel diff" : analysisMode === "levels" ? "levels" : "VMAF"})</h2>
+        <h2>
+          {#if analysisMode === "timeline"}
+            Checking the timeline…
+          {:else}
+            Analyzing… ({analysisMode === "diff" ? "pixel diff" : analysisMode === "levels" ? "levels" : "VMAF"})
+          {/if}
+        </h2>
         <div class="progress-bar-container">
           <div class="progress-bar" style="width: {progressPct}%"></div>
         </div>
         <div class="progress-label mono">
-          {#if progressTotal > 0}
+          {#if analysisMode === "timeline" && timelineProgress}
+            sample {timelineProgress.done.toLocaleString()} / {timelineProgress.total.toLocaleString()}
+            {#if timelineProgress.tc}· {timelineProgress.tc} · {timelineProgress.clip}{/if}
+            {#if timelineProgress.eta_s != null && timelineProgress.done < timelineProgress.total}· ~{fmtDuration(timelineProgress.eta_s)} left{/if}
+          {:else if analysisMode === "timeline"}
+            Connecting to Resolve and scopetap_grab…
+          {:else if progressTotal > 0}
             {progressCurrent.toLocaleString()} / {progressTotal.toLocaleString()} frames
             ({progressPct}%)
             {#if progressFps != null}
@@ -1305,10 +1381,23 @@
         </div>
       </div>
 
+    {:else if state === "ready" && isTimeline && !activeSeries && summary?.timeline_run}
+      <!-- Timeline dry run (or a run where nothing could be compared) -->
+      <div class="progress-panel">
+        <h2>{summary.timeline_run.dry_run ? "Dry run finished" : "Nothing was compared"}</h2>
+        <TimelineReport report={summary.timeline_run} full />
+        <div class="progress-actions">
+          <button class="primary" onclick={() => (state = "idle")}>Back</button>
+        </div>
+      </div>
+
     {:else if state === "ready" && activeSeries}
       <!-- Results view -->
       <div class="results-layout">
         <div class="results-main">
+          {#if isTimeline && summary?.timeline_run}
+            <TimelineReport report={summary.timeline_run} />
+          {/if}
           {#if summary?.timeline}
             <TimelineBar
               timeline={summary.timeline}
@@ -1327,6 +1416,7 @@
               onCursorChange={handleCursorChange}
               timeline={summary?.timeline}
               events={detectResult?.events ?? []}
+              sparse={isTimeline}
             />
           </div>
           <div class="table-area">
@@ -1351,9 +1441,10 @@
               onSelect={selectEvent}
               onReview={handleReview}
               preview={eventPreview}
-              previewRows={summary?.mode === "levels" ? 1 : 2}
+              previewRows={summary?.mode === "levels" || isTimeline ? 1 : 2}
               onExport={handleExportEvents}
               onExportEdl={handleExportEdl}
+              timeline={isTimeline}
             />
           </div>
         {/if}
@@ -1375,7 +1466,7 @@
         <kbd>m</kbd> metric
         <kbd>t</kbd> threshold
         {#if detectAvailable}
-          <kbd>↑</kbd><kbd>↓</kbd> flash
+          <kbd>↑</kbd><kbd>↓</kbd> {isTimeline ? "flagged" : "flash"}
           <kbd>y</kbd><kbd>x</kbd> accept/reject
         {/if}
         <kbd>f</kbd> smooth{smoothWindow > 0 ? ` (${smoothWindow})` : ""}
@@ -1418,7 +1509,7 @@
                 {entry.ref_path.split("/").pop()}{entry.dist_path ? ` vs ${entry.dist_path.split("/").pop()}` : ""}
               </span>
               <span class="recents-meta">
-                {entry.mode} · {entry.frame_count.toLocaleString()} frames · {new Date(entry.timestamp * 1000).toLocaleDateString()}
+                {entry.mode} · {entry.frame_count.toLocaleString()} {entry.mode === "timeline" ? "samples" : "frames"} · {new Date(entry.timestamp * 1000).toLocaleDateString()}
               </span>
             </button>
           {/each}

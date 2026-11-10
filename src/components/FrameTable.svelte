@@ -4,6 +4,7 @@
   Dynamic columns based on analysis mode:
     - diff mode: Frame, TC, Mean Diff, Peak Diff
     - vmaf mode: Frame, TC, VMAF, [PSNR]
+    - timeline mode: Frame, TC, Clip, Pos, Status, Diff Y/U/V
 
   Supports sort, filter, virtual scroll, click-to-select, keyboard nav.
 -->
@@ -17,7 +18,7 @@
   interface Props {
     cursorFrame: number;
     metrics: string[];   // e.g. ["diff_y", "diff_u", "diff_v"] or ["vmaf", "psnr"]
-    mode: "diff" | "vmaf" | "levels";
+    mode: "diff" | "vmaf" | "levels" | "timeline";
     onFrameSelect: (frame: number) => void;
   }
 
@@ -220,6 +221,11 @@
       Frame{sortIcon("frame")}
     </div>
     <div class="th col-tc">Timecode</div>
+    {#if mode === "timeline"}
+      <div class="th col-clip">Clip</div>
+      <div class="th col-pos">Pos</div>
+      <div class="th col-status">Status</div>
+    {/if}
     {#each metrics as m}
       {@const cfg = COLUMN_CONFIG[m]}
       {#if cfg}
@@ -253,6 +259,15 @@
           >
             <div class="td col-frame mono">{frame.frame}</div>
             <div class="td col-tc mono">{frame.tc}</div>
+            {#if mode === "timeline"}
+              <div class="td col-clip" title={frame.clip ?? ""}>
+                <span class="mono trk">V{frame.track}</span> {frame.clip ?? ""}
+              </div>
+              <div class="td col-pos mono">{frame.pos ?? ""}</div>
+              <div class="td col-status mono" class:bad={frame.status !== "ok" && frame.status !== "not_in_file"} title={frame.error ?? ""}>
+                {(frame.status ?? "").replace(/_/g, " ")}
+              </div>
+            {/if}
             {#each metrics as m}
               {@const val = getVal(frame, m)}
               {@const cfg = COLUMN_CONFIG[m]}
@@ -276,7 +291,7 @@
 
   <!-- Footer -->
   <div class="table-footer mono">
-    {totalCount.toLocaleString()} frames
+    {totalCount.toLocaleString()} {mode === "timeline" ? "samples" : "frames"}
     {#if filterMetric && (filterBelow != null || filterAbove != null)}
       · filtered
       {#if filterAbove != null}
@@ -375,5 +390,27 @@
     background: var(--bg-surface);
     border-top: 1px solid var(--border-subtle);
     flex-shrink: 0;
+  }
+  .col-clip {
+    width: 220px;
+    flex-shrink: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .col-clip .trk {
+    color: var(--text-muted);
+  }
+  .col-pos {
+    width: 52px;
+    flex-shrink: 0;
+  }
+  .col-status {
+    width: 100px;
+    flex-shrink: 0;
+    color: var(--text-secondary);
+  }
+  .col-status.bad {
+    color: var(--warning, #d29922);
   }
 </style>

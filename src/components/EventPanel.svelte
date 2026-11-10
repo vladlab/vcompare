@@ -17,6 +17,9 @@
     onSelect(frame)               — jump the cursor (and mpv) to a frame
     onExport()                    — export events CSV
     onExportEdl()                 — export events as a Resolve marker EDL
+    timeline                      — timeline mode: the events are flagged
+                                    samples (mismatch) and samples that
+                                    couldn't be checked (error)
 -->
 <script lang="ts">
   import type { DetectParams, DetectResult, FlashEvent, EventReview, PreviewRow } from "../lib/rpc";
@@ -37,6 +40,7 @@
     previewRows: number;
     onExport: () => void;
     onExportEdl: () => void;
+    timeline?: boolean;
   }
 
   let {
@@ -53,6 +57,7 @@
     previewRows,
     onExport,
     onExportEdl,
+    timeline = false,
   }: Props = $props();
 
   let hideRejected: boolean = $state(false);
@@ -116,10 +121,20 @@
     onReview(e.frame, e.review === r ? null : r);
   }
 
+  let timelineCounts = $derived.by(() => {
+    let mismatch = 0, error = 0;
+    for (const e of events) {
+      if (e.kind === "error") error++;
+      else mismatch++;
+    }
+    return { mismatch, error };
+  });
+
   let counts = $derived.by(() => {
     const c: Record<"black" | "white" | "content" | "at_cut", number> = { black: 0, white: 0, content: 0, at_cut: 0 };
     for (const e of events) {
-      c[e.subkind] = (c[e.subkind] ?? 0) + 1;
+      const k = e.subkind as "black" | "white" | "content";
+      c[k] = (c[k] ?? 0) + 1;
       if (e.at_cut) c.at_cut++;
     }
     return c;
@@ -142,6 +157,9 @@
   }
 
   function label(e: FlashEvent): string {
+    if (timeline) {
+      return e.kind === "error" ? `${e.label ?? ""} · ${e.subkind.replace(/_/g, " ")}` : (e.label ?? e.subkind);
+    }
     const len = e.length === 1 ? "1 fr" : `${e.length} fr`;
     return `${e.subkind} · ${len}${e.at_cut ? " · at cut" : ""}`;
   }
@@ -157,7 +175,7 @@
 
 <div class="event-panel">
   <div class="panel-header">
-    <span class="panel-title">Flash frames</span>
+    <span class="panel-title">{timeline ? "Flagged samples" : "Flash frames"}</span>
     {#if result}
       <span class="count mono">{events.length}</span>
     {/if}
@@ -175,17 +193,17 @@
   {:else}
     <!-- Controls -->
     <div class="controls">
-      <label class="checkbox-label" title="Derive the threshold from the footage's own frame-to-frame noise">
+      <label class="checkbox-label" title={timeline ? "Derive the threshold from this run's own spread (median + 6σ, kept between 0.4% and 3% of peak, so a fault on every sample is still flagged)" : "Derive the threshold from the footage's own frame-to-frame noise"}>
         <input type="checkbox" checked={auto} onchange={(e) => setAuto((e.target as HTMLInputElement).checked)} />
         auto
       </label>
-      <label class="slider-label" title="Minimum frame-to-frame change, as % of signal peak. Applies when you let go.">
-        <span class="mono">{shownPct.toFixed(1)}%</span>
+      <label class="slider-label" title={timeline ? "RMS luma difference that flags a sample, as % of peak. Applies when you let go." : "Minimum frame-to-frame change, as % of signal peak. Applies when you let go."}>
+        <span class="mono">{shownPct.toFixed(timeline ? 2 : 1)}%</span>
         <input
           type="range"
-          min="0.5"
-          max="40"
-          step="0.5"
+          min={timeline ? 0.1 : 0.5}
+          max={timeline ? 10 : 40}
+          step={timeline ? 0.05 : 0.5}
           value={shownPct}
           disabled={auto}
           oninput={(e) => (dragPct = parseFloat((e.target as HTMLInputElement).value))}
@@ -197,6 +215,7 @@
           }}
         />
       </label>
+      {#if !timeline}
       <label title="Longest run of frames that still counts as a flash">
         ≤
         <select value={params.max_run ?? 3} onchange={(e) => setMaxRun(parseInt((e.target as HTMLSelectElement).value))}>
@@ -208,13 +227,14 @@
         </select>
         fr
       </label>
-      <label class="checkbox-label" title="Hide short inserts that sit on a cut (fast montage, etc.)">
+      {/if}
+      <label class="checkbox-label" title={timeline ? "Hide samples on a clip's first or last frame (where an edit that moved by a frame shows)" : "Hide short inserts that sit on a cut (fast montage, etc.)"}>
         <input
           type="checkbox"
           checked={params.exclude_at_cut ?? false}
           onchange={(e) => setExcludeAtCut((e.target as HTMLInputElement).checked)}
         />
-        hide at-cut
+        {timeline ? "hide cut frames" : "hide at-cut"}
       </label>
       <label class="checkbox-label" title="Hide events you've rejected">
         <input type="checkbox" bind:checked={hideRejected} />
@@ -249,7 +269,7 @@
                   {:else}
                     <span class="thumb-empty">—</span>
                   {/if}
-                  <span class="thumb-tc mono">{k === 0 ? "prev" : inRun ? (ev.length > 1 ? `flash ${f.frame - ev.frame + 1}` : "flash") : "next"}</span>
+                  <span class="thumb-tc mono">{k === 0 ? "prev" : inRun ? (timeline ? "sample" : ev.length > 1 ? `flash ${f.frame - ev.frame + 1}` : "flash") : "next"}</span>
                 </button>
               {/each}
             {:else}
@@ -257,7 +277,7 @@
               {#each Array.from({ length: (ev?.length ?? 1) + 2 }, (_, k) => k) as k (k)}
                 <div class="thumb placeholder" class:in-run={ev != null && k > 0 && k <= ev.length}>
                   <span class="thumb-empty"></span>
-                  <span class="thumb-tc mono">{ev ? (k === 0 ? "prev" : k <= ev.length ? "flash" : "next") : "\u00a0"}</span>
+                  <span class="thumb-tc mono">{ev ? (k === 0 ? "prev" : k <= ev.length ? (timeline ? "sample" : "flash") : "next") : "\u00a0"}</span>
                 </div>
               {/each}
             {/if}
@@ -273,8 +293,8 @@
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <span
-            class="strip-tick {e.subkind}"
-            class:at-cut={e.at_cut}
+            class="strip-tick {timeline ? e.kind : e.subkind}"
+            class:at-cut={!timeline && e.at_cut}
             class:active={i === activeIndex}
             class:selected={i === selectedIndex}
             style="left: {stripPct(e.frame)}%"
@@ -286,7 +306,9 @@
 
     <!-- Summary line -->
     <div class="summary mono">
-      {#if result}
+      {#if result && timeline}
+        {timelineCounts.mismatch} mismatched · {timelineCounts.error} not checked
+      {:else if result}
         {counts.content} content · {counts.white} white · {counts.black} black
         {#if counts.at_cut > 0}· {counts.at_cut} at cut{/if}
         · thr {(result.threshold * 100).toFixed(1)}%
@@ -312,11 +334,11 @@
           class:rejected={e.review === "reject"}
           onclick={() => onSelect(e.frame)}
         >
-          <span class="dot {e.subkind}" class:at-cut={e.at_cut}></span>
+          <span class="dot {timeline ? e.kind : e.subkind}" class:at-cut={!timeline && e.at_cut}></span>
           <span class="tc mono">{e.tc || e.frame}</span>
           {#if seen.has(e.frame) && !e.review}<span class="seen-mark" title="visited">·</span>{/if}
           <span class="desc">{label(e)}</span>
-          <span class="score mono" title="strength relative to threshold">×{e.score.toFixed(1)}</span>
+          <span class="score mono" title="strength relative to threshold">{e.kind === "error" ? "—" : `×${e.score.toFixed(1)}`}</span>
           <span class="verdict">
             <button class="v-btn ok" class:set={e.review === "accept"} title="Accept (y)" onclick={(ev) => { ev.stopPropagation(); review(e, "accept"); }}>✓</button>
             <button class="v-btn no" class:set={e.review === "reject"} title="Reject (x) — left out of the EDL" onclick={(ev) => { ev.stopPropagation(); review(e, "reject"); }}>✗</button>
@@ -324,7 +346,7 @@
         </div>
       {:else}
         {#if result}
-          <p class="empty">No flash frames found.</p>
+          <p class="empty">{timeline ? "No mismatches: every sample matches the SDI picture." : "No flash frames found."}</p>
         {/if}
       {/each}
     </div>
@@ -581,5 +603,7 @@
   .content, .dot.content { background: #e8b830; }
   .white,   .dot.white   { background: #ffffff; }
   .black,   .dot.black   { background: #9a9a9a; }
+  .mismatch, .dot.mismatch { background: #e5534b; }
+  .error,    .dot.error    { background: #d29922; }
   .at-cut { opacity: 0.45; }
 </style>
