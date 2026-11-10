@@ -12,6 +12,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use serde::Deserialize;
 use std::sync::{Arc, Condvar, Mutex};
 
 const BRIDGE_SOURCE: &str = include_str!("resolve_bridge.py");
@@ -273,11 +274,21 @@ pub struct TimelineMeta {
     pub end_frame: Option<i64>,
     #[serde(default)]
     pub start_tc: Option<String>,
-    /// Resolve's setting string, e.g. "23.976".
-    #[serde(default)]
+    /// Resolve's setting, e.g. "23.976" (Resolve may hand it over as a number).
+    #[serde(default, deserialize_with = "string_or_number")]
     pub fps: Option<String>,
     #[serde(default)]
     pub drop_frame: bool,
+}
+
+/// `"23.976"`, `23.976` or `null` → `Some("23.976")` / `None`.
+fn string_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(other) => Some(other.to_string()),
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -553,6 +564,22 @@ def scriptapp(name): return _R()
         assert_eq!(std::fs::read_to_string(&playhead).unwrap().trim(), "01:00:00:05");
         assert!(s.seek("bogus").is_err(), "a refused seek is an error");
         assert!(s.clips(&[]).unwrap().items.is_empty());
+
+        // Real Resolve (20.x) returns the frame rate as a number and the
+        // start frame as a float: both must come through.
+        std::fs::write(
+            &tl,
+            r#"{"project":"P","name":"Reel 1","start_frame":86400.0,"start_tc":"01:00:00:00",
+                "fps":23.976,"fps_as_number":true,"drop_frame":false,
+                "tracks":[{"name":"V1","enabled":1,"items":[{"name":"A","start":86400.0,"duration":10}]}]}"#,
+        )
+        .unwrap();
+        let t = s.tracks().unwrap();
+        assert_eq!(t.timeline.fps.as_deref(), Some("23.976"));
+        assert_eq!(t.timeline.start_frame, Some(86400));
+        assert_eq!(t.tracks[0].enabled, Some(true));
+        let c = s.clips(&[1]).unwrap();
+        assert_eq!(c.items[0].start, Some(86400));
         s.close();
         let _ = std::fs::remove_dir_all(&dir);
     }

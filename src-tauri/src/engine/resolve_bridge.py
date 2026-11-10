@@ -114,15 +114,26 @@ def _timeline_info(project, timeline):
         if v in (None, ""):
             v = _get(project, "GetSetting", key)
         return v
+    # Resolve's own types vary by build and setting (the frame rate comes back
+    # as the number 23.976 on 20.x, a string elsewhere): normalise everything.
+    fps = setting("timelineFrameRate")
     return {
-        "project": _get(project, "GetName"),
-        "name": _get(timeline, "GetName"),
-        "start_frame": _get(timeline, "GetStartFrame"),
-        "end_frame": _get(timeline, "GetEndFrame"),
-        "start_tc": _get(timeline, "GetStartTimecode"),
-        "fps": setting("timelineFrameRate"),
-        "drop_frame": str(setting("timelineDropFrameTimecode") or "0") in ("1", "True", "true"),
+        "project": _str(_get(project, "GetName")),
+        "name": _str(_get(timeline, "GetName")),
+        "start_frame": _int(_get(timeline, "GetStartFrame")),
+        "end_frame": _int(_get(timeline, "GetEndFrame")),
+        "start_tc": _str(_get(timeline, "GetStartTimecode")),
+        "fps": None if fps in (None, "") else ("%g" % fps if isinstance(fps, float) else str(fps)),
+        "drop_frame": str(setting("timelineDropFrameTimecode") or "0").strip().lower() in ("1", "1.0", "true"),
     }
+
+
+def _str(v):
+    return None if v is None else str(v)
+
+
+def _bool(v):
+    return None if v is None else bool(v)
 
 
 def _int(v):
@@ -139,9 +150,9 @@ def _tracks(project, timeline):
         items = _get(timeline, "GetItemListInTrack", "video", i) or []
         out.append({
             "index": i,
-            "name": _get(timeline, "GetTrackName", "video", i) or ("V%d" % i),
+            "name": _str(_get(timeline, "GetTrackName", "video", i)) or ("V%d" % i),
             # None when the build has no GetIsTrackEnabled (before 18.5)
-            "enabled": _get(timeline, "GetIsTrackEnabled", "video", i),
+            "enabled": _bool(_get(timeline, "GetIsTrackEnabled", "video", i)),
             "items": len(items),
         })
     return {"timeline": _timeline_info(project, timeline), "tracks": out}
@@ -157,12 +168,12 @@ def _clips(project, timeline, arg):
         for it in _get(timeline, "GetItemListInTrack", "video", t) or []:
             items.append({
                 "track": t,
-                "name": _get(it, "GetName") or "",
+                "name": _str(_get(it, "GetName")) or "",
                 "start": _int(_get(it, "GetStart")),
                 "duration": _int(_get(it, "GetDuration")),
                 "end": _int(_get(it, "GetEnd")),
                 # None when the build can't tell
-                "enabled": _get(it, "GetClipEnabled"),
+                "enabled": _bool(_get(it, "GetClipEnabled")),
             })
     return {"timeline": _timeline_info(project, timeline), "items": items}
 

@@ -72,6 +72,7 @@ class _Timeline:
 
     def GetSetting(self, key):
         if key == "timelineFrameRate":
+            # As given in the JSON: a string, or a number like Resolve 20.x returns.
             return self._d.get("fps", "24")
         if key == "timelineDropFrameTimecode":
             return "1" if self._d.get("drop_frame") else "0"
