@@ -144,11 +144,16 @@ cargo test --manifest-path src-tauri/Cargo.toml   # engine unit tests
 Set `RUST_LOG=debug` for verbose logging. On NVIDIA / Wayland the app sets
 the usual WebKitGTK workaround env vars automatically.
 
-## Building
+## Building and installing
 
 ```bash
-./scripts/build.sh     # → src-tauri/target/release/bundle/{appimage,deb}/
+./scripts/build.sh      # → src-tauri/target/release/bundle/{appimage,deb}/
+./scripts/install.sh    # AppImage → ~/.local/bin/vcompare + app-menu entry and icon
+./scripts/install.sh --uninstall
 ```
+
+The install is per-user (no root). ffmpeg, ffprobe and mpv aren't bundled;
+install them from your distribution.
 
 ## Keyboard
 
