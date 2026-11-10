@@ -392,26 +392,38 @@ impl Drop for ResolveSession {
 /// A Python 3 to run the bridge with. `VCOMPARE_PYTHON` overrides.
 fn python_command() -> Result<Command, String> {
     if let Some(p) = std::env::var_os("VCOMPARE_PYTHON") {
-        return Ok(Command::new(p));
+        return Ok(crate::engine::sysenv::command(p));
     }
     let candidates: &[&str] = if cfg!(target_os = "windows") {
         &["python", "py", "python3"]
     } else {
         &["python3", "python"]
     };
+    // Why each candidate didn't do, so "not found" never hides "found but broken".
+    let mut why: Vec<String> = Vec::new();
     for c in candidates {
-        let ok = Command::new(c)
+        match crate::engine::sysenv::command(c)
             .args(["-c", "import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            return Ok(Command::new(c));
+            .stderr(Stdio::piped())
+            .output()
+        {
+            Ok(o) if o.status.success() => return Ok(crate::engine::sysenv::command(c)),
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let last = err.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("").trim().to_string();
+                why.push(format!("{c}: exit {}{}", o.status.code().unwrap_or(-1),
+                                 if last.is_empty() { String::new() } else { format!(" ({last})") }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => why.push(format!("{c}: not on PATH")),
+            Err(e) => why.push(format!("{c}: {e}")),
         }
     }
-    Err("Python 3 not found — the Resolve bridge needs it (Resolve's scripting API is Python)".into())
+    Err(format!(
+        "Python 3 not usable — the Resolve bridge needs it (Resolve's scripting API is Python). \
+         Set VCOMPARE_PYTHON to pick one. Tried {}",
+        why.join("; ")
+    ))
 }
 
 #[cfg(test)]

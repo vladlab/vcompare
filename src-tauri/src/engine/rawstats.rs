@@ -37,7 +37,9 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+#[cfg(test)]
+use std::process::Command;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -964,7 +966,7 @@ pub fn run_raw_stats(
 
     eprintln!("[vcompare] cmd: ffmpeg {}", args.join(" "));
 
-    let mut child = Command::new("ffmpeg")
+    let mut child = crate::engine::sysenv::command("ffmpeg")
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1269,7 +1271,7 @@ pub fn fps_mode_args() -> [String; 2] {
 fn ffmpeg_has_fps_mode() -> bool {
     static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HAS.get_or_init(|| {
-        Command::new("ffmpeg")
+        crate::engine::sysenv::command("ffmpeg")
             .args(["-hide_banner", "-h", "long"])
             .stdin(Stdio::null())
             .stderr(Stdio::null())

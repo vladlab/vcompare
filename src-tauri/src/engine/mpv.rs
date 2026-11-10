@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -135,7 +135,7 @@ impl MpvController {
 
         let sock_str = self.sock_path.to_string_lossy().to_string();
 
-        let mut cmd = Command::new("mpv");
+        let mut cmd = crate::engine::sysenv::command("mpv");
 
         let title = if self.view_mode == ViewMode::Single {
             eprintln!("[vcompare] mpv: single file {ref_name}");

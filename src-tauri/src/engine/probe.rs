@@ -6,7 +6,6 @@
 
 use serde_json::Value;
 use std::path::Path;
-use std::process::Command;
 
 use crate::engine::timecode::{find_video_stream, parse_rational, tc_string_to_frames};
 use crate::engine::timecode::TimecodeFormat;
@@ -16,7 +15,7 @@ use crate::engine::types::{Capabilities, ProbeResult, VideoInfo};
 
 /// Run ffprobe and return parsed JSON. Handles concat manifests.
 pub fn ffprobe_json(path: &str) -> Result<Value, String> {
-    let mut cmd = Command::new("ffprobe");
+    let mut cmd = crate::engine::sysenv::command("ffprobe");
     cmd.args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"]);
 
     if is_concat_manifest(path) {
@@ -222,7 +221,7 @@ pub fn detect_hwaccel() -> Option<String> {
         vec!["cuda", "vaapi"]
     };
 
-    let output = Command::new("ffmpeg")
+    let output = crate::engine::sysenv::command("ffmpeg")
         .args(["-hide_banner", "-hwaccels"])
         .output()
         .ok()?;
@@ -240,7 +239,7 @@ pub fn detect_hwaccel() -> Option<String> {
 
 /// Check if ffmpeg was built with the libvmaf_cuda filter.
 pub fn detect_vmaf_cuda() -> bool {
-    let output = match Command::new("ffmpeg")
+    let output = match crate::engine::sysenv::command("ffmpeg")
         .args(["-hide_banner", "-filters"])
         .output()
     {
@@ -268,7 +267,7 @@ pub fn detect_capabilities() -> Capabilities {
 
 /// Check if mpv is available in PATH.
 fn detect_mpv() -> bool {
-    Command::new("mpv")
+    crate::engine::sysenv::command("mpv")
         .arg("--version")
         .output()
         .map(|o| o.status.success())

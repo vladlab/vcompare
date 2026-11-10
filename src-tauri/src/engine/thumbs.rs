@@ -6,7 +6,9 @@
 //! range so the JPEGs look right in a browser.
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+#[cfg(test)]
+use std::process::Command;
 
 use crate::engine::probe::is_concat_manifest;
 use crate::engine::rawstats::{fps_mode_args, seek_seconds};
@@ -52,7 +54,7 @@ pub fn extract_frames(
         "pipe:1".into(),
     ]);
 
-    let mut child = Command::new("ffmpeg")
+    let mut child = crate::engine::sysenv::command("ffmpeg")
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

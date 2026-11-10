@@ -21,7 +21,9 @@
 //! scaled down in the same `scale`, so each side is resampled once.
 
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+#[cfg(test)]
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -320,7 +322,7 @@ pub fn compare_one(
     args.extend(fps_mode_args());
     args.extend(["-frames:v".into(), "1".into(), "-f".into(), "null".into(), "-".into()]);
 
-    let mut child = Command::new("ffmpeg")
+    let mut child = crate::engine::sysenv::command("ffmpeg")
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

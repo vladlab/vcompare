@@ -11,6 +11,7 @@ pub mod probe;
 pub mod rawstats;
 pub mod resolve;
 pub mod state;
+pub mod sysenv;
 #[cfg(test)]
 pub mod testenv;
 pub mod thumbs;

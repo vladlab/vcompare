@@ -7,7 +7,9 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::BufReader;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+#[cfg(test)]
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -971,7 +973,7 @@ fn run_ffmpeg_with_progress(
     progress: Option<ProgressFn>,
     process_handle: ProcessHandle,
 ) -> Result<(), String> {
-    let mut child = Command::new("ffmpeg")
+    let mut child = crate::engine::sysenv::command("ffmpeg")
         .args(args)
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
