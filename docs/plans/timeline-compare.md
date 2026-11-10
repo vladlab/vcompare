@@ -12,10 +12,13 @@ Additions beyond the plan, found while implementing:
   go to 4:4:4. Without it a lossless 4:2:2 file compares at 15–21 codes RMS
   on chroma (hard colour edges), which would hide real chroma faults; with
   it, 0 lossless and ~1.2 for ProRes HQ on every plane.
-- The auto threshold is clamped to an absolute ceiling (3 % of peak), and the
-  run warns when the median exceeds 1.5 %. A purely relative threshold misses
-  a fault that hits every sample (wrong levels, a missing output LUT): it
-  becomes the median.
+- The auto threshold is centred on the clean end of the run (lower quartile
+  + 6σ of the cleaner half), not the median: through the real grabber, a
+  reel with two thirds of its clips slipped by a frame (24 codes over a clean
+  0) flagged only a third of them with a median centre. It is also clamped to
+  an absolute ceiling (3 % of peak) and the run warns when the median exceeds
+  1.5 %, so a fault on every sample (wrong levels, a missing output LUT) is
+  still flagged.
 - Samples that couldn't be measured are events too (`kind: "error"`), so a
   timeout is reviewed like a mismatch, and markers say "not checked".
 - A dry run is a checkbox in the setup (not a hidden command); it is the
@@ -324,6 +327,14 @@ Facts (fill in as gates pass):
   ProRes 422 HQ smooth picture 1.2 / 1.2 / 1.1 (Y/U/V); lossless 4:2:2 0;
   heavy per-frame noise (worst case) ~13 / 11 / 11. A one-frame slip on
   noisy content ~87, BT.601 read as 709 ~68, 2020 read as 709 ~31.
+- Against the real `scopetap_grab` (scopetap `grab-tool` at `4e45e83`, built
+  with its no-GPU rig, `fake_stream` driven by `scripts/dev/scopetap_rig_sdi.py`
+  from the fake Resolve's playhead): protocol, READY, `;`/`:` timecodes and
+  pixels all line up; a clean clip compares at 0.0 codes. Opt-in test:
+  `VCOMPARE_SCOPETAP_RIG=<dir> cargo test -- --ignored real_grabber_rig`.
+- Seek cost on Color 02 (from scopetap's bench): `SetCurrentTimecode` blocks
+  ~317 ms, whole sample ~500 ms median, so ~1.5 s per clip: a 253-clip reel
+  is ~6–7 min. With the Project Manager open Resolve refuses every seek.
 - File ranges: prores_ks in MOV doesn't keep `color_range`, so ProRes files
   usually show as "limited (untagged, assumed)". Correct for video-range
   renders; a full-range ProRes render would need a tag or an override.

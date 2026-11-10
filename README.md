@@ -99,9 +99,10 @@ conversion is applied: the monitor is assumed to show the deliverable's
 colour space, and the run warns when the SDI tags and the file's disagree.
 
 Flagging: a sample is flagged when its RMS luma difference stands out from
-the run (median + 6σ, robust), with the threshold kept between 0.4 % and
-3 % of peak so a fault on every sample (wrong levels, a missing output LUT)
-is still flagged, plus a warning when the whole run differs. Samples that
+the clean end of the run (lower quartile + 6σ of the cleaner half, so a fault
+on most clips can't become the baseline), with the threshold kept between
+0.4 % and 3 % of peak so a fault on every sample (wrong levels, a missing
+output LUT) is still flagged, plus a warning when the whole run differs. Samples that
 couldn't be checked (the SDI never settled on the timecode, a seek was
 refused, outside the file) are listed too. Selecting one seeks Resolve (sync
 turns on by itself) and mpv to that frame; flagged samples export as Resolve

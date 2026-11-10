@@ -193,7 +193,7 @@
   {:else}
     <!-- Controls -->
     <div class="controls">
-      <label class="checkbox-label" title={timeline ? "Derive the threshold from this run's own spread (median + 6σ, kept between 0.4% and 3% of peak, so a fault on every sample is still flagged)" : "Derive the threshold from the footage's own frame-to-frame noise"}>
+      <label class="checkbox-label" title={timeline ? "Derive the threshold from the cleanest samples of this run (lower quartile + 6σ, kept between 0.4% and 3% of peak, so a fault on every sample is still flagged)" : "Derive the threshold from the footage's own frame-to-frame noise"}>
         <input type="checkbox" checked={auto} onchange={(e) => setAuto((e.target as HTMLInputElement).checked)} />
         auto
       </label>

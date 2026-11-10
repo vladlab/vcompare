@@ -374,9 +374,14 @@ pub const TIMELINE_MEDIAN_WARN: f64 = 0.015;
 /// Flag timeline samples whose `diff_y` stands out, and report samples that
 /// couldn't be measured.
 ///
-/// Auto threshold: median + `auto_k` · 1.4826 · MAD of the run's normalized
-/// `diff_y`, clamped to [`TIMELINE_FLOOR`, `TIMELINE_CEILING`]. An explicit
-/// `params.threshold` (normalized) is used as is.
+/// Auto threshold, from the clean end of the run: the lower quartile `q` of
+/// the normalized `diff_y` plus `auto_k` · 1.4826 · MAD of the cleaner half
+/// (values up to the median) around `q`, clamped to [`TIMELINE_FLOOR`,
+/// `TIMELINE_CEILING`]. Faults only ever add difference, so the cleanest
+/// samples say what codec noise looks like; centring on the median instead
+/// would let a fault on most of the run become the baseline (a reel where
+/// two thirds of the clips slipped by a frame flagged only a third of them).
+/// An explicit `params.threshold` (normalized) is used as is.
 ///
 /// Events: `kind` "mismatch" (subkind = position in the clip: first / mid /
 /// last; `at_cut` for first and last) or "error" (subkind = the row status:
@@ -394,11 +399,12 @@ pub fn detect_timeline(frames: &[Value], bit_depth: u32, params: &DetectParams) 
         None => {
             let mut v: Vec<f64> = measured.iter().map(|m| m.1).collect();
             v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = v[v.len() / 2];
-            let mut dev: Vec<f64> = v.iter().map(|x| (x - median).abs()).collect();
+            let q = v[(v.len() - 1) / 4];
+            let cleaner = &v[..=v.len() / 2];
+            let mut dev: Vec<f64> = cleaner.iter().map(|x| (x - q).abs()).collect();
             dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let sigma = 1.4826 * dev[dev.len() / 2];
-            (median + params.auto_k * sigma).clamp(TIMELINE_FLOOR, TIMELINE_CEILING)
+            (q + params.auto_k * sigma).clamp(TIMELINE_FLOOR, TIMELINE_CEILING)
         }
     };
     let label = |f: &Value| {
@@ -933,6 +939,18 @@ mod tests {
         let r = detect_timeline(&all_bad, 10, &DetectParams::default()).unwrap();
         assert_eq!(r.events.len(), 10, "threshold {}", r.threshold);
         assert_eq!(r.threshold, TIMELINE_CEILING);
+        // Two thirds of the run off by a frame (24 codes) over a clean 0:
+        // the clean end sets the baseline, so every bad sample is flagged.
+        let mut majority: Vec<Value> = (0..3).map(|i| row(&format!("01:00:00:{i:02}"), i, "ok", Some(0.0), "mid")).collect();
+        majority.extend((3..9).map(|i| row(&format!("01:00:00:{i:02}"), i, "ok", Some(24.3 + i as f64), "mid")));
+        let r = detect_timeline(&majority, 10, &DetectParams::default()).unwrap();
+        assert_eq!(r.events.len(), 6, "threshold {}", r.threshold);
+        // A clean reel with grain varying shot to shot (1..10 codes): nothing flagged.
+        let mixed: Vec<Value> = (0..30)
+            .map(|i| row(&format!("01:00:{:02}:00", i), i, "ok", Some(1.0 + (i * 7 % 30) as f64 * 0.3), "mid"))
+            .collect();
+        let r = detect_timeline(&mixed, 10, &DetectParams::default()).unwrap();
+        assert!(r.events.is_empty(), "threshold {} flagged {:?}", r.threshold, r.events.iter().map(|e| &e.tc).collect::<Vec<_>>());
         // Excluding cut-adjacent samples drops first/last mismatches only.
         let p = DetectParams { exclude_at_cut: true, ..Default::default() };
         let r = detect_timeline(&frames, 10, &p).unwrap();

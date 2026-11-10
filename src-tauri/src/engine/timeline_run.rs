@@ -714,4 +714,122 @@ mod tests {
         let w = signal_warnings(&sig, &file);
         assert_eq!(w.len(), 2, "{w:?}");
     }
+    /// The same kind of run through the *real* scopetap_grab, built with
+    /// scopetap's no-GPU rig (a host-memory CUDA stand-in and `fake_stream`
+    /// as the producer). `scripts/dev/scopetap_rig_sdi.py` plays Resolve's SDI
+    /// output: it publishes the frame the fake Resolve is parked on. Opt-in:
+    ///
+    /// ```text
+    /// # in scopetap (see tests/grab_rig/fake_stream.cpp):
+    /// g++ -std=c++17 -I. tests/grab_rig/fake_stream.cpp -o $RIG/fake_stream -lrt
+    /// g++ -std=c++17 -Itests/grab_rig tools/scopetap_grab.cpp -o $RIG/scopetap_grab -lrt
+    /// # here:
+    /// VCOMPARE_SCOPETAP_RIG=$RIG cargo test -- --ignored real_grabber_rig
+    /// ```
+    ///
+    /// Uses the real /scopetap-stream ring name: don't run it next to a live stream.
+    #[test]
+    #[ignore]
+    fn real_grabber_rig() {
+        let Some(rig) = std::env::var_os("VCOMPARE_SCOPETAP_RIG").map(std::path::PathBuf::from) else {
+            panic!("set VCOMPARE_SCOPETAP_RIG to the directory with scopetap_grab and fake_stream");
+        };
+        let _env = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("vcompare_rig_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h, n) = (64usize, 16usize, 72usize);
+        // Must match VALUE in scripts/dev/scopetap_rig_sdi.py.
+        let value = |k: usize| 0.2 + 0.03 * (k % 20) as f64;
+        // Deliverable: clip 1 right, clip 2 slipped by a frame, clip 3 with squeezed levels.
+        let mut raw = Vec::with_capacity(w * h * 6 * n);
+        for k in 0..n {
+            let v = match k {
+                0..=23 => value(k),
+                24..=47 => value(k + 1),
+                _ => value(k) * 0.86 + 0.137,
+            };
+            for y in 0..h {
+                let row = if y == 0 { 1.0 } else if y == h - 1 { 0.0 } else { v };
+                let code = ((row * 65535.0f64).round() as u16).to_le_bytes();
+                for _ in 0..w * 3 {
+                    raw.extend_from_slice(&code);
+                }
+            }
+        }
+        let rawp = dir.join("frames.rgb48");
+        std::fs::write(&rawp, &raw).unwrap();
+        let file = dir.join("deliverable.mov");
+        ff(&[
+            "-f", "rawvideo", "-pix_fmt", "rgb48le", "-video_size", &format!("{w}x{h}"), "-framerate", "24",
+            "-i", &rawp.to_string_lossy(),
+            "-vf", "scale=out_color_matrix=bt709:out_range=limited:flags=lanczos,format=yuv422p10le",
+            "-c:v", "prores_ks", "-profile:v", "3", "-colorspace", "bt709", "-color_primaries", "bt709",
+            "-color_trc", "bt709", "-timecode", "01:00:00:00", &file.to_string_lossy(),
+        ]);
+        let tl = dir.join("timeline.json");
+        std::fs::write(
+            &tl,
+            r#"{"project":"P","name":"Rig","start_frame":86400,"start_tc":"01:00:00:00","fps":"24",
+                "tracks":[{"name":"V1","items":[
+                    {"name":"good","start":86400,"duration":24},
+                    {"name":"slipped","start":86424,"duration":24},
+                    {"name":"levels","start":86448,"duration":24}]}]}"#,
+        )
+        .unwrap();
+        let playhead = dir.join("playhead");
+        testenv::use_fake_resolve(&tl, Some(&playhead));
+
+        let sdi_script = testenv::crate_dir().join("../scripts/dev/scopetap_rig_sdi.py");
+        let mut sdi = Command::new("python3")
+            .arg(&sdi_script)
+            .arg(rig.join("fake_stream"))
+            .args(["/scopetap-stream", &w.to_string(), &h.to_string()])
+            .arg(&playhead)
+            .args(["01:00:00:00", "24"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::env::set_var("VCOMPARE_GRABBER", rig.join("scopetap_grab"));
+
+        let diags: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let cb = Callbacks { progress: &|_| {}, diagnostics: &|d| *diags.lock().unwrap() = d.to_vec() };
+        let params = RunParams {
+            file: file.to_string_lossy().to_string(),
+            tracks: vec![1],
+            offset: 0,
+            dry_run: false,
+            grab_timeout_ms: Some(3000),
+            settle_ms: Some(60),
+            workers: Some(2),
+            matrix_override: None,
+        };
+        let result = run(&params, &standalone_job(), &cb);
+        let _ = sdi.kill();
+        let _ = sdi.wait();
+        std::env::remove_var("VCOMPARE_GRABBER");
+        for d in diags.lock().unwrap().iter() {
+            eprintln!("  {d}");
+        }
+        let v = result.unwrap();
+        let rows = rows_by_tc(&v);
+        let mut tcs: Vec<&String> = rows.keys().collect();
+        tcs.sort();
+        for tc in &tcs {
+            let r = &rows[*tc];
+            eprintln!("{tc} {} {} y={} {}", r["clip"], r["status"], r["diff_y"], r["error"]);
+        }
+        assert_eq!(v["counts"]["ok"], 9, "{}", v["counts"]);
+        let y = |tc: &str| rows[tc]["diff_y"].as_f64().unwrap();
+        for tc in ["01:00:00:00", "01:00:00:11", "01:00:00:23"] {
+            assert!(y(tc) < 3.0, "good {tc} {}", y(tc));
+        }
+        for tc in ["01:00:01:00", "01:00:01:11", "01:00:01:23", "01:00:02:00", "01:00:02:11", "01:00:02:23"] {
+            assert!(y(tc) > 15.0, "bad {tc} {}", y(tc));
+        }
+        let state = crate::engine::state::EngineState::new();
+        state.apply_timeline_result(&v);
+        let det = state.detect_events(&Default::default()).unwrap();
+        assert_eq!(det.events.len(), 6, "{:?}", det.events.iter().map(|e| &e.tc).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
