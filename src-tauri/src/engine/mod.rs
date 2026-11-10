@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod cache;
 pub mod events;
+pub mod grab;
 pub mod mpv;
 pub mod pixfmt;
 pub mod process;
@@ -14,5 +15,6 @@ pub mod state;
 pub mod testenv;
 pub mod thumbs;
 pub mod timeline;
+pub mod timeline_compare;
 pub mod timecode;
 pub mod types;
