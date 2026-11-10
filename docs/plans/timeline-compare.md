@@ -1,7 +1,30 @@
 # Plan: timeline mode (file vs. Resolve's SDI output)
 
-Branch: `timeline-compare` (off `native-stats` at `81009e3`). **Status: not
-started** (written 2026-11-10).
+Branch: `timeline-compare` (off `native-stats` at `81009e3`). **Status:
+steps 1–7 built (2026-11-10), every gate that can pass without hardware
+has.** The gates still open need the office machine: a real Resolve
+timeline, the SDI loop, and `scopetap_grab` (scopetap `docs/GRAB_PLAN.md`,
+not written yet). Until then the mode runs against the fakes:
+`scripts/dev/fake_timeline_demo.sh`.
+
+Additions beyond the plan, found while implementing:
+- The live side goes through the file's own chroma subsampling before both
+  go to 4:4:4. Without it a lossless 4:2:2 file compares at 15–21 codes RMS
+  on chroma (hard colour edges), which would hide real chroma faults; with
+  it, 0 lossless and ~1.2 for ProRes HQ on every plane.
+- The auto threshold is clamped to an absolute ceiling (3 % of peak), and the
+  run warns when the median exceeds 1.5 %. A purely relative threshold misses
+  a fault that hits every sample (wrong levels, a missing output LUT): it
+  becomes the median.
+- Samples that couldn't be measured are events too (`kind: "error"`), so a
+  timeout is reviewed like a mismatch, and markers say "not checked".
+- A dry run is a checkbox in the setup (not a hidden command); it is the
+  speed test of step 3.
+- Resolve sync switches itself on when a run's results open (unless the
+  operator turned it off this session), since reviewing a flagged sample
+  means seeing it on the reference monitor.
+- `psnr` needs `shortest=1`, or framesync repeats the single live frame
+  against the file's next frames.
 
 Start a session with: *"Read docs/plans/timeline-compare.md, then begin at
 the first step whose gate isn't ticked."* Each step is a commit and ends
@@ -183,7 +206,7 @@ clips, generators, titles and transitions appear in `GetItemListInTrack`;
 the settings keys for frame rate and drop-frame.
 
 **Gate**
-- [ ] Unit tests pass with the stub.
+- [x] Unit tests pass with the stub (`resolve::tests::session_tracks_clips_seek`).
 - [ ] Against a real timeline, the item list for a ticked track matches the
       Edit page cut for cut (spot-check 20 cuts incl. the first and last).
 
@@ -195,15 +218,15 @@ clips (one sample), two-frame clips (two), drop-frame timelines, and a
 timeline that starts at 00:59:58:00 with a file that starts at 01:00:00:00.
 
 **Gate**
-- [ ] Tests pass.
+- [x] Tests pass (`timeline::tests`, 8).
 
 ### 3. Grabber client and a dry run
 
 `engine/grab.rs`: spawn `scopetap_grab --serve`, parse `READY` / `OK` /
 `ERR`, read exactly `nbytes`. Attach the child to the `Job`.
 
-Add a hidden dev command (`timeline_dry_run`) that does seek + grab for
-every sample and discards the pixels, reporting `waited_ms` min / median /
+A dry run (checkbox in the setup; `analyze` with `dry_run: true`) does
+seek + grab for every sample and discards the pixels, reporting `waited_ms` min / median /
 p95 / max and total time. This is the speed test on real projects before
 any compare code exists.
 
@@ -220,14 +243,17 @@ chains from the existing diff negotiation plus the explicit live-side
 unscaled.
 
 **Gate**
-- [ ] Synthetic test, no Resolve needed: generate colour bars with ffmpeg,
+- [x] Synthetic test, no Resolve needed (`timeline_compare::tests::synthetic_compare`): generate colour bars with ffmpeg,
       encode ProRes 422 HQ, feed the *same* bars as rgb48le on stdin as the
       live side. `diff_y/u/v` are at codec-noise level. Repeat with a
       bt2020nc file. Repeat with the matrix deliberately wrong and confirm
       the diff jumps (proves the test can fail).
 - [ ] Real test: render a short timeline, run the compare against the SDI
       loop. Record the baseline diff per codec in §9.
-- [ ] Break things on purpose and confirm each is flagged: a clip with its
+- [ ] Break things on purpose and confirm each is flagged (done with the
+      fakes for a one-frame slip and wrong data levels,
+      `timeline_run::tests::end_to_end_with_fakes`; still to do on real
+      renders, plus bypassed grade and offline clip): a clip with its
       grade bypassed in the render, a clip slipped by one frame, a clip
       taken offline, a render with the wrong data levels.
 
@@ -237,8 +263,10 @@ unscaled.
 progress events, cancel, threshold, summary, cache save / load, recents.
 
 **Gate**
-- [ ] A full reel runs end to end, twice, with the same flags both times.
-- [ ] Cancel mid-run leaves no ffmpeg, grabber or Python process behind.
+- [ ] A full reel runs end to end, twice, with the same flags both times
+      (with the fakes: yes; real reel: to do).
+- [ ] Cancel mid-run leaves no ffmpeg, grabber or Python process behind
+      (grabber and ffmpeg are attached to the job; check on hardware).
 - [ ] RSS stays flat across the run.
 
 ### 6. Frontend
@@ -246,8 +274,10 @@ progress events, cancel, threshold, summary, cache save / load, recents.
 Mode button, track checklist, progress, results views, review flow (§6).
 
 **Gate**
-- [ ] The whole flow by keyboard and mouse on the office machine.
-- [ ] Reopen a saved timeline analysis with Resolve closed.
+- [ ] The whole flow by keyboard and mouse on the office machine (done on
+      a virtual display against the fakes: setup, run, review, dry run,
+      reopen from recents).
+- [x] Reopen a saved timeline analysis with Resolve closed.
 
 ### 7. Docs
 
@@ -284,7 +314,16 @@ confirmed or struck off as they are tested:
 
 Facts (fill in as gates pass):
 
-- `GetEnd()` semantics:
-- Item types seen in `GetItemListInTrack`:
-- Dry-run timing (reel, samples, median / p95 `waited_ms`, total):
-- Baseline diff by codec:
+- `GetEnd()` semantics: not verified. The planner uses `GetDuration()` when
+  present and only falls back to `GetEnd() - GetStart()` (exclusive end).
+- Item types seen in `GetItemListInTrack`: not verified. Disabled items
+  (`GetClipEnabled() == False`) are skipped and counted.
+- Dry-run timing (reel, samples, median / p95 `waited_ms`, total): fakes
+  only (76 ms/sample on a 2-core VM, meaningless for hardware).
+- Baseline diff by codec (synthetic, swscale encode, 10-bit codes RMS):
+  ProRes 422 HQ smooth picture 1.2 / 1.2 / 1.1 (Y/U/V); lossless 4:2:2 0;
+  heavy per-frame noise (worst case) ~13 / 11 / 11. A one-frame slip on
+  noisy content ~87, BT.601 read as 709 ~68, 2020 read as 709 ~31.
+- File ranges: prores_ks in MOV doesn't keep `color_range`, so ProRes files
+  usually show as "limited (untagged, assumed)". Correct for video-range
+  renders; a full-range ProRes render would need a tag or an override.

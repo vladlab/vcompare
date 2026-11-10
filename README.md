@@ -10,6 +10,7 @@ engine driving ffmpeg.
 | `diff` | reference + distorted | `psnr` (+ optional `ssim`) | `diff_y/u/v` (RMS pixel difference), `ssim*` |
 | `vmaf` | reference + distorted | `libvmaf` / `libvmaf_cuda` | `vmaf`, `psnr` |
 | `levels` | single file | native stats (ffmpeg decode → raw pipe) | `y/u/v_min/max`, `y/u/v_avg`, `y/u/v_dif` |
+| `timeline` | single file + Resolve's SDI output | `psnr` per sample | `diff_y/u/v` at the first / middle / last frame of every clip |
 
 Both comparison modes sync the two files by start-of-file or by embedded
 timecode, handle resolution and pixel-format mismatches (compare at the
@@ -70,6 +71,58 @@ open in Resolve, via Resolve's scripting API. Needs Resolve running with
 Python 3 on the PATH (set `VCOMPARE_PYTHON` to pick one). Timecodes are the
 file's own, so this lines up when the file was exported from that timeline.
 
+### Timeline mode (file vs. Resolve's SDI output)
+
+Checks a deliverable against what Resolve puts out on SDI, which is what
+was on the reference monitor during the grade. For every clip on the video
+tracks you tick, vcompare parks Resolve's playhead on the clip's first,
+middle and last frame, takes that frame off the SDI loop, and compares it
+with the same timecode in the file. Nothing is rendered and nothing is kept
+on disk per frame: each grabbed frame is compared and dropped.
+
+Needs, on the grading machine:
+
+- Resolve Studio with *External scripting using: Local* and a Python 3 (as
+  for Resolve sync).
+- [scopetap](https://github.com/vladlab/scopetap): `scopetap_stream --scopes`
+  running on the DeckLink input that loops Resolve's SDI output back in, and
+  `scopetap_grab` on the PATH (or `VCOMPARE_GRABBER` pointing at it). Without
+  it the mode is offered but the Check button says what's missing.
+
+How it compares: both sides go to planar 4:4:4 at the file's bit depth (at
+least 10), the SDI side converted with the file's own matrix and range from
+its tags (untagged: BT.709 limited, or BT.2020 when the primaries say so),
+and first put through the file's chroma subsampling so 4:2:2 losses on hard
+colour edges don't drown everything else. ProRes 422 HQ of a clean picture
+compares at about 1–2 codes RMS on every plane. No transfer or gamut
+conversion is applied: the monitor is assumed to show the deliverable's
+colour space, and the run warns when the SDI tags and the file's disagree.
+
+Flagging: a sample is flagged when its RMS luma difference stands out from
+the run (median + 6σ, robust), with the threshold kept between 0.4 % and
+3 % of peak so a fault on every sample (wrong levels, a missing output LUT)
+is still flagged, plus a warning when the whole run differs. Samples that
+couldn't be checked (the SDI never settled on the timecode, a seek was
+refused, outside the file) are listed too. Selecting one seeks Resolve (sync
+turns on by itself) and mpv to that frame; flagged samples export as Resolve
+timeline markers. Runs are saved as `<file>.timeline.json` and reopen from
+Recent Analyses without Resolve.
+
+Resolve's monitoring state is the operator's job, and shows up as
+differences: bypass, wipes / split screen, highlight, reference stills,
+timeline proxy or performance mode, a stale render cache, LUTs applied only
+to the monitor output, SDI data levels different from the render. Temporal
+effects (temporal NR, optical-flow retimes) can also differ between a parked
+frame and a rendered one.
+
+**Dry run** grabs every sample without comparing or saving, to measure how
+long a real run will take on a given machine and reel.
+
+**Without the hardware:** `scripts/dev/fake_timeline_demo.sh` builds a reel
+with two planted faults and prints the environment that points vcompare at a
+fake Resolve (`src-tauri/testdata/fake_resolve`) and a fake grabber
+(`scripts/dev/fake_scopetap_grab.py`).
+
 ## Architecture
 
 ```
@@ -108,8 +161,16 @@ src-tauri/
 │       ├── pixfmt.rs          Pixel-format negotiation
 │       ├── timecode.rs        TC ⇄ frame arithmetic (incl. drop-frame)
 │       ├── mpv.rs             mpv IPC controller
+│       ├── resolve.rs         Resolve bridge: cursor sync + run sessions
+│       ├── resolve_bridge.py  Python helper (Resolve's API is Python)
+│       ├── grab.rs            scopetap_grab client (SDI frames by timecode)
+│       ├── timeline.rs        Timeline mode: sample planner
+│       ├── timeline_compare.rs  …one SDI frame vs. the file (ffmpeg psnr)
+│       ├── timeline_run.rs    …the run: seek, grab, compare pool, report
 │       └── types.rs           Shared structs
+├── testdata/fake_resolve/     Fake DaVinciResolveScript for tests and the demo
 └── tauri.conf.json
+scripts/dev/                   fake_scopetap_grab.py, fake_timeline_demo.sh
 src/
 ├── App.svelte                 State machine: pick → analyze → view
 ├── lib/rpc.ts                 Typed invoke() wrappers + event listeners
@@ -117,7 +178,9 @@ src/
     ├── MetricChart.svelte     uPlot detail + overview minimap
     ├── TimelineBar.svelte     Ref/dist overlap + event markers
     ├── FrameTable.svelte      Virtual-scrolled frame table
-    └── EventPanel.svelte      Flash-frame detector controls + event list
+    ├── EventPanel.svelte      Flash-frame detector controls + event list
+    ├── TimelineSetup.svelte   Timeline mode: Resolve tracks, start
+    └── TimelineReport.svelte  Timeline mode: what a run looked at
 ```
 
 ## Prerequisites
