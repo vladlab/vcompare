@@ -134,6 +134,7 @@ pub fn run() {
             bridge::resolve_connect,
             bridge::resolve_seek,
             bridge::resolve_disconnect,
+            bridge::timeline_tracks,
             bridge::export_csv,
             bridge::get_recents,
             bridge::add_recent,

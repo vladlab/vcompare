@@ -46,6 +46,9 @@ struct Inner {
     /// User verdicts ("accept" / "reject") keyed by event first frame.
     /// Persisted in a small sidecar next to the analysis JSON.
     reviews: std::collections::BTreeMap<i64, String>,
+    /// Timeline mode: the run's report (Resolve target, SDI signal, counts,
+    /// timing, diagnostics), passed through to the summary as `timeline_run`.
+    run_report: Option<Value>,
 }
 
 /// Metadata about the current analysis.
@@ -94,6 +97,7 @@ impl EngineState {
                 mpv_context: None,
                 events: Vec::new(),
                 reviews: Default::default(),
+                run_report: None,
             }),
         }
     }
@@ -104,6 +108,7 @@ impl EngineState {
     pub fn apply_diff_result(&self, result: &Value) {
         let mut state = self.inner.lock().unwrap();
         state.events.clear();
+        state.run_report = None;
         state.frames = result
             .get("frames")
             .and_then(|v| v.as_array())
@@ -170,6 +175,7 @@ impl EngineState {
     ) {
         let mut state = self.inner.lock().unwrap();
         state.events.clear();
+        state.run_report = None;
 
         let has_vmaf = frames
             .iter()
@@ -209,6 +215,7 @@ impl EngineState {
     pub fn apply_levels_result(&self, result: &Value) {
         let mut state = self.inner.lock().unwrap();
         state.events.clear();
+        state.run_report = None;
         state.frames = result
             .get("frames")
             .and_then(|v| v.as_array())
@@ -250,6 +257,48 @@ impl EngineState {
             scale_ref: false,
         };
         // Single-file mpv view (no comparison) — dist_path stays empty.
+        state.mpv_context = build_mpv_context(&state.meta);
+    }
+
+    /// Store a timeline-mode result (file vs. Resolve's SDI output, sampled).
+    pub fn apply_timeline_result(&self, result: &Value) {
+        let mut state = self.inner.lock().unwrap();
+        state.events.clear();
+        state.frames = result
+            .get("frames")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        state.metrics_available = ["diff_y", "diff_u", "diff_v"]
+            .iter()
+            .filter(|m| state.frames.iter().any(|f| f.get(**m).and_then(|v| v.as_f64()).is_some()))
+            .map(|m| m.to_string())
+            .collect();
+        state.analysis_mode = Some("timeline".into());
+        state.meta = AnalysisMeta {
+            ref_path: str_field(result, "ref_path"),
+            dist_path: String::new(),
+            ref_start_frame: result.get("ref_start_frame").and_then(|v| v.as_i64()).unwrap_or(0),
+            ref_file_start_tc: result.get("ref_file_start_tc").and_then(|v| v.as_i64()).unwrap_or(0),
+            sync_mode: "tc".into(),
+            bit_depth: result.get("bit_depth").and_then(|v| v.as_u64()).map(|v| v as u32),
+            tc_format: parse_tc_format(result.get("tc_format")),
+            timeline: None,
+            scale_w: 0,
+            scale_h: 0,
+            scale_ref: false,
+        };
+        let mut report = serde_json::Map::new();
+        for k in [
+            "dry_run", "resolve", "signal", "file_signal", "counts", "plan", "timing",
+            "diagnostics", "offset", "compare_format", "file_frames",
+        ] {
+            if let Some(v) = result.get(k) {
+                report.insert(k.into(), v.clone());
+            }
+        }
+        state.run_report = Some(Value::Object(report));
+        // Single-file mpv view of the file; Resolve shows the other side.
         state.mpv_context = build_mpv_context(&state.meta);
     }
 
@@ -324,6 +373,7 @@ impl EngineState {
         state.save_path = None;
         state.mpv_context = None;
         state.events.clear();
+        state.run_report = None;
     }
 
     // ─── Queries (called by commands) ───────────────────────────────────
@@ -403,6 +453,11 @@ impl EngineState {
         }
 
         eprintln!("[vcompare] summary: {}", serde_json::to_string(&summary).unwrap_or_default());
+
+        if let Some(ref r) = state.run_report {
+            summary["timeline_run"] = r.clone();
+            summary["ref_path"] = serde_json::json!(meta.ref_path);
+        }
 
         // Add timeline info if available
         if let Some(ref tl) = meta.timeline {
@@ -553,7 +608,9 @@ impl EngineState {
                 let dist_stem = PathBuf::from(&state.meta.dist_path)
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "dist".into());
+                    .unwrap_or_else(|| {
+                        if state.analysis_mode.as_deref() == Some("timeline") { "timeline" } else { "dist" }.into()
+                    });
                 let ref_dir = PathBuf::from(&state.meta.ref_path)
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
@@ -567,6 +624,30 @@ impl EngineState {
 
         let metrics = &state.metrics_available;
         let mut csv = String::new();
+
+        if state.analysis_mode.as_deref() == Some("timeline") {
+            csv.push_str("frame,timecode,track,clip,pos,status,diff_y,diff_u,diff_v,waited_ms,error\n");
+            for f in &state.frames {
+                let txt = |k: &str| f.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let num = |k: &str| f.get(k).and_then(|v| v.as_f64()).map(|v| format!("{v:.4}")).unwrap_or_default();
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{}\n",
+                    f.get("frame").and_then(|v| v.as_i64()).unwrap_or(0),
+                    txt("tc"),
+                    f.get("track").and_then(|v| v.as_u64()).unwrap_or(0),
+                    csv_field(&txt("clip")),
+                    txt("pos"),
+                    txt("status"),
+                    num("diff_y"),
+                    num("diff_u"),
+                    num("diff_v"),
+                    f.get("waited_ms").and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or_default(),
+                    csv_field(&txt("error")),
+                ));
+            }
+            std::fs::write(&output_path, &csv).map_err(|e| format!("Failed to write CSV: {e}"))?;
+            return Ok(serde_json::json!({ "path": output_path, "rows": state.frames.len() }));
+        }
 
         // Header
         csv.push_str("frame,timecode");
@@ -643,18 +724,20 @@ impl EngineState {
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf();
-                dir.join(format!("{stem}_flash_frames.csv"))
+                let what = if state.analysis_mode.as_deref() == Some("timeline") { "timeline_flags" } else { "flash_frames" };
+                dir.join(format!("{stem}_{what}.csv"))
                     .to_string_lossy()
                     .to_string()
             }
         };
 
-        let mut csv = String::from("frame,timecode,length,kind,subkind,at_cut,score,review\n");
+        let mut csv = String::from("frame,timecode,length,kind,subkind,at_cut,score,review,label\n");
         for e in &state.events {
             csv.push_str(&format!(
-                "{},{},{},{},{},{},{:.3},{}\n",
+                "{},{},{},{},{},{},{:.3},{},{}\n",
                 e.frame, e.tc, e.length, e.kind, e.subkind, e.at_cut, e.score,
-                e.review.as_deref().unwrap_or("")
+                e.review.as_deref().unwrap_or(""),
+                csv_field(e.label.as_deref().unwrap_or(""))
             ));
         }
 
@@ -690,7 +773,8 @@ impl EngineState {
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf();
-                dir.join(format!("{stem}_flash_markers.edl"))
+                let what = if state.analysis_mode.as_deref() == Some("timeline") { "timeline_markers" } else { "flash_markers" };
+                dir.join(format!("{stem}_{what}.edl"))
                     .to_string_lossy()
                     .to_string()
             }
@@ -751,6 +835,15 @@ impl EngineState {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Quote a CSV field when it needs it.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
 
 fn round4(v: f64) -> f64 {
     (v * 10000.0).round() / 10000.0

@@ -40,6 +40,17 @@ pub fn default_levels_path(file_path: &str) -> String {
         .to_string()
 }
 
+/// Default path for a timeline-mode analysis: `{dir}/{stem}.timeline.json`
+pub fn default_timeline_path(file_path: &str) -> String {
+    let p = Path::new(file_path);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let dir = p.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{stem}.timeline.json")).to_string_lossy().to_string()
+}
+
 /// Check if a cached analysis exists and return info about it.
 pub fn check_cache(ref_path: &str, dist_path: &str, log_path: Option<&str>) -> Value {
     let path = log_path

@@ -262,6 +262,7 @@ pub fn detect_capabilities() -> Capabilities {
         hwaccel,
         vmaf_cuda,
         has_mpv,
+        grabber: crate::engine::grab::find_binary().map(|p| p.to_string_lossy().to_string()),
     }
 }
 

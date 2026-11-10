@@ -170,6 +170,9 @@ pub struct Capabilities {
     pub hwaccel: Option<String>,
     pub vmaf_cuda: bool,
     pub has_mpv: bool,
+    /// scopetap's `scopetap_grab`, which timeline mode needs.
+    #[serde(default)]
+    pub grabber: Option<String>,
 }
 
 /// Parameters for checking if a cached analysis exists.

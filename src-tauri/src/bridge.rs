@@ -48,6 +48,16 @@ pub struct AnalyzeParams {
     /// Levels: parallel ffmpeg decodes. None or 0 = auto.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunks: Option<u32>,
+    /// Timeline: video tracks (1-based) to sample.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<Vec<u32>>,
+    /// Timeline: seek + grab only, no compare, nothing saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grab_timeout_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settle_ms: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -237,6 +247,8 @@ pub async fn load_saved_analysis(
 
     if mode == "levels" {
         engine_state.apply_levels_result(&data);
+    } else if mode == "timeline" {
+        engine_state.apply_timeline_result(&data);
     } else if mode == "diff" {
         engine_state.apply_diff_result(&data);
     } else {
@@ -274,6 +286,18 @@ pub async fn analyze(
     let offset = params.offset.unwrap_or(0);
     let save_path = params.log_path.clone();
     let force = params.force.unwrap_or(false);
+
+    // Timeline runs always run: Resolve and the render may have changed since
+    // the last one (saved runs reopen from Recent Analyses).
+    if mode == "timeline" {
+        let process_handle = ffmpeg_handle.0.begin();
+        let job = process_handle.clone();
+        let result = _run_timeline_analysis(app, &params, &engine_state, process_handle).await;
+        if job.is_cancelled() {
+            return Err(CANCELLED.into());
+        }
+        return result;
+    }
 
     // Check cache first
     if let Some(ref sp) = save_path {
@@ -469,6 +493,85 @@ async fn _run_diff_analysis(
 
     engine_state.set_save_path(save_path);
     engine_state.build_summary()
+}
+
+async fn _run_timeline_analysis(
+    app: AppHandle,
+    params: &AnalyzeParams,
+    engine_state: &State<'_, EngineState>,
+    job: ProcessHandle,
+) -> Result<Value, String> {
+    let run_params = engine::timeline_run::RunParams {
+        file: params.reference.clone(),
+        tracks: params.tracks.clone().unwrap_or_default(),
+        offset: params.offset.unwrap_or(0),
+        dry_run: params.dry_run.unwrap_or(false),
+        grab_timeout_ms: params.grab_timeout_ms,
+        settle_ms: params.settle_ms,
+        workers: None,
+        matrix_override: None,
+    };
+    let save_path = if run_params.dry_run {
+        None
+    } else {
+        Some(
+            params
+                .log_path
+                .clone()
+                .unwrap_or_else(|| cache::default_timeline_path(&run_params.file)),
+        )
+    };
+    let app_clone = app.clone();
+    let cancel_check = job.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let app_p = app_clone.clone();
+        let progress = move |p: &engine::timeline_run::Progress| {
+            let _ = app_p.emit("rpc:progress", json!({"current": p.done, "total": p.total}));
+            let _ = app_p.emit("rpc:timeline-progress", p);
+        };
+        let app_d = app_clone.clone();
+        let diagnostics = move |lines: &[String]| {
+            let _ = app_d.emit("rpc:diagnostics", json!({"lines": lines}));
+        };
+        let cb = engine::timeline_run::Callbacks { progress: &progress, diagnostics: &diagnostics };
+        engine::timeline_run::run(&run_params, &job, &cb)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+
+    if cancel_check.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
+    engine_state.apply_timeline_result(&result);
+    if let Some(ref sp) = save_path {
+        cache::save_diff_analysis(&result, sp)?;
+        eprintln!("[vcompare] Saved timeline analysis to {sp}");
+    }
+    engine_state.set_save_path(save_path.clone());
+    let mut summary = engine_state.build_summary()?;
+    summary["save_path"] = json!(save_path);
+    Ok(summary)
+}
+
+/// Video tracks of the timeline open in Resolve, for the track checklist,
+/// plus whether the grabber is installed. Uses a short-lived helper of its
+/// own (independent of cursor sync).
+#[tauri::command]
+pub async fn timeline_tracks() -> Result<Value, String> {
+    tokio::task::spawn_blocking(|| {
+        let mut s = engine::resolve::ResolveSession::connect()?;
+        let t = s.tracks()?;
+        let target = s.target.clone();
+        s.close();
+        Ok(json!({
+            "target": target,
+            "timeline": t.timeline,
+            "tracks": t.tracks,
+            "grabber": engine::grab::find_binary().map(|p| p.to_string_lossy().to_string()),
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
 }
 
 async fn _run_levels_analysis(

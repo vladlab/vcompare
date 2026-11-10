@@ -55,6 +55,9 @@ pub struct Event {
     /// (see `state::EngineState::set_event_review`), keyed by first frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<String>,
+    /// Timeline mode: "<clip> (V<track>, <pos>)", for the list and markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Detector parameters, all in normalized 0..1 units of the signal peak.
@@ -135,6 +138,7 @@ pub fn detect_flashes(
     match mode {
         "levels" => detect_flashes_levels(frames, bit_depth, params),
         "diff" => detect_flashes_diff(frames, bit_depth, params),
+        "timeline" => detect_timeline(frames, bit_depth, params),
         other => Err(format!("Flash detection is not available for {other} mode")),
     }
 }
@@ -248,6 +252,7 @@ pub fn detect_flashes_levels(
                         at_cut,
                         score: round3(score),
                         review: None,
+                        label: None,
                     });
                 }
                 // Resume at the frame after the run. d[b+1] was the "leave"
@@ -337,6 +342,7 @@ pub fn detect_flashes_diff(
                     at_cut: false,
                     score: round3(score),
                     review: None,
+                    label: None,
                 });
                 a = b + 1;
             }
@@ -349,6 +355,94 @@ pub fn detect_flashes_diff(
         threshold: round4(threshold),
         source: "diff_y".into(),
     })
+}
+
+// ─── Timeline mode ──────────────────────────────────────────────────────────
+
+/// Auto threshold floor for timeline samples, normalized to peak (~4 codes
+/// at 10-bit): below this nothing is flagged however clean the run is.
+pub const TIMELINE_FLOOR: f64 = 0.004;
+/// Auto threshold ceiling (~31 codes at 10-bit): anything above it is
+/// flagged even if most of the run is that bad. Without it a fault that
+/// hits every sample (wrong levels, a missing output LUT) would *be* the
+/// median and flag nothing.
+pub const TIMELINE_CEILING: f64 = 0.03;
+/// A run whose median is above this gets a warning: the file differs from
+/// the SDI picture everywhere.
+pub const TIMELINE_MEDIAN_WARN: f64 = 0.015;
+
+/// Flag timeline samples whose `diff_y` stands out, and report samples that
+/// couldn't be measured.
+///
+/// Auto threshold: median + `auto_k` · 1.4826 · MAD of the run's normalized
+/// `diff_y`, clamped to [`TIMELINE_FLOOR`, `TIMELINE_CEILING`]. An explicit
+/// `params.threshold` (normalized) is used as is.
+///
+/// Events: `kind` "mismatch" (subkind = position in the clip: first / mid /
+/// last; `at_cut` for first and last) or "error" (subkind = the row status:
+/// grab_timeout, grab_error, seek_error, compare_error, wrong_tc).
+pub fn detect_timeline(frames: &[Value], bit_depth: u32, params: &DetectParams) -> Result<DetectResult, String> {
+    let peak = ((1u64 << bit_depth.clamp(8, 16)) - 1) as f64;
+    let measured: Vec<(usize, f64)> = frames
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| num(f, "diff_y").map(|y| (i, y / peak)))
+        .collect();
+    let threshold = match params.threshold {
+        Some(t) => t.max(1e-6),
+        None if measured.len() < 3 => TIMELINE_FLOOR,
+        None => {
+            let mut v: Vec<f64> = measured.iter().map(|m| m.1).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = v[v.len() / 2];
+            let mut dev: Vec<f64> = v.iter().map(|x| (x - median).abs()).collect();
+            dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let sigma = 1.4826 * dev[dev.len() / 2];
+            (median + params.auto_k * sigma).clamp(TIMELINE_FLOOR, TIMELINE_CEILING)
+        }
+    };
+    let label = |f: &Value| {
+        format!(
+            "{} (V{}, {})",
+            f.get("clip").and_then(|v| v.as_str()).unwrap_or("?"),
+            f.get("track").and_then(|v| v.as_u64()).unwrap_or(0),
+            f.get("pos").and_then(|v| v.as_str()).unwrap_or("?"),
+        )
+    };
+    let mut events = Vec::new();
+    for f in frames {
+        let status = f.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let pos = f.get("pos").and_then(|v| v.as_str()).unwrap_or("mid");
+        let ev = |kind: &str, subkind: &str, score: f64| Event {
+            frame: frame_num(f),
+            tc: frame_tc(f),
+            length: 1,
+            kind: kind.into(),
+            subkind: subkind.into(),
+            at_cut: pos != "mid",
+            score: round3(score),
+            review: None,
+            label: Some(label(f)),
+        };
+        match status {
+            "ok" => {
+                if let Some(y) = num(f, "diff_y") {
+                    let n = y / peak;
+                    if n > threshold {
+                        let e = ev("mismatch", pos, n / threshold);
+                        if !(e.at_cut && params.exclude_at_cut) {
+                            events.push(e);
+                        }
+                    }
+                }
+            }
+            "grab_timeout" | "grab_error" | "seek_error" | "compare_error" | "wrong_tc" => {
+                events.push(ev("error", status, 0.0));
+            }
+            _ => {}
+        }
+    }
+    Ok(DetectResult { events, threshold: round4(threshold), source: "timeline".into() })
 }
 
 // ─── Resolve marker EDL ─────────────────────────────────────────────────────
@@ -393,22 +487,35 @@ pub fn events_to_resolve_edl(events: &[Event], tc_fmt: &TimecodeFormat, title: &
         let n = i + 1;
         let tc_in = tc_fmt.frame_to_tc(e.frame);
         let tc_out = tc_fmt.frame_to_tc(e.frame + e.length as i64);
-        let color = if e.at_cut {
-            "ResolveColorCyan"
-        } else {
-            match e.subkind.as_str() {
+        let color = match e.kind.as_str() {
+            "error" => "ResolveColorYellow",
+            "mismatch" => "ResolveColorRed",
+            _ if e.at_cut => "ResolveColorCyan",
+            _ => match e.subkind.as_str() {
                 "white" => "ResolveColorYellow",
                 "black" => "ResolveColorPurple",
                 _ => "ResolveColorRed",
-            }
+            },
         };
-        let name = format!(
-            "flash: {} {} fr x{:.1}{}",
-            e.subkind,
-            e.length,
-            e.score,
-            if e.at_cut { " (at cut)" } else { "" }
-        );
+        let name = match e.kind.as_str() {
+            "mismatch" => format!(
+                "mismatch: {} x{:.1}",
+                e.label.as_deref().unwrap_or(&e.subkind),
+                e.score
+            ),
+            "error" => format!(
+                "not checked ({}): {}",
+                e.subkind.replace('_', " "),
+                e.label.as_deref().unwrap_or("")
+            ),
+            _ => format!(
+                "flash: {} {} fr x{:.1}{}",
+                e.subkind,
+                e.length,
+                e.score,
+                if e.at_cut { " (at cut)" } else { "" }
+            ),
+        };
         out.push_str(&format!(
             "{n:0width$}  001      V     C        {tc_in} {tc_out} {tc_in} {tc_out}
 "
@@ -725,7 +832,7 @@ mod tests {
         let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: TcType::NonDrop };
         let ev = |frame: i64, length: u32, subkind: &str, at_cut: bool| Event {
             frame, tc: tc.frame_to_tc(frame), length, kind: "flash".into(),
-            subkind: subkind.into(), at_cut, score: 13.452, review: None,
+            subkind: subkind.into(), at_cut, score: 13.452, review: None, label: None,
         };
         let edl = events_to_resolve_edl(
             &[ev(86400 + 120, 1, "white", false), ev(86400 + 300, 2, "content", true)],
@@ -791,5 +898,52 @@ mod tests {
         let tight = DetectParams { threshold: Some(0.10), ..Default::default() };
         assert_eq!(detect_flashes_levels(&frames, 8, &loose).unwrap().events.len(), 1);
         assert_eq!(detect_flashes_levels(&frames, 8, &tight).unwrap().events.len(), 0);
+    }
+    #[test]
+    fn timeline_detector() {
+        let row = |tc: &str, frame: i64, status: &str, y: Option<f64>, pos: &str| {
+            let mut v = serde_json::json!({"frame": frame, "tc": tc, "status": status,
+                                           "clip": "c", "track": 1, "pos": pos});
+            if let Some(y) = y {
+                v["diff_y"] = serde_json::json!(y);
+            }
+            v
+        };
+        // Ten clean samples around 2 codes (10-bit), one at 60, one timeout,
+        // one outside the file.
+        let mut frames: Vec<Value> = (0..10)
+            .map(|i| row(&format!("01:00:00:{i:02}"), i, "ok", Some(2.0 + (i % 3) as f64 * 0.3), "mid"))
+            .collect();
+        frames.push(row("01:00:01:00", 24, "ok", Some(60.0), "first"));
+        frames.push(row("01:00:01:01", 25, "grab_timeout", None, "mid"));
+        frames.push(row("01:00:01:02", 26, "not_in_file", None, "mid"));
+        let r = detect_timeline(&frames, 10, &DetectParams::default()).unwrap();
+        let got: Vec<(&str, &str, &str, bool)> =
+            r.events.iter().map(|e| (e.tc.as_str(), e.kind.as_str(), e.subkind.as_str(), e.at_cut)).collect();
+        assert_eq!(
+            got,
+            vec![("01:00:01:00", "mismatch", "first", true), ("01:00:01:01", "error", "grab_timeout", false)]
+        );
+        assert_eq!(r.events[0].label.as_deref(), Some("c (V1, first)"));
+        assert!(r.threshold >= TIMELINE_FLOOR && r.threshold < 60.0 / 1023.0);
+        // A fault on every sample: the median is high, but the ceiling still flags it all.
+        let all_bad: Vec<Value> = (0..10)
+            .map(|i| row(&format!("01:00:00:{i:02}"), i, "ok", Some(80.0 + i as f64), "mid"))
+            .collect();
+        let r = detect_timeline(&all_bad, 10, &DetectParams::default()).unwrap();
+        assert_eq!(r.events.len(), 10, "threshold {}", r.threshold);
+        assert_eq!(r.threshold, TIMELINE_CEILING);
+        // Excluding cut-adjacent samples drops first/last mismatches only.
+        let p = DetectParams { exclude_at_cut: true, ..Default::default() };
+        let r = detect_timeline(&frames, 10, &p).unwrap();
+        assert_eq!(r.events.len(), 1);
+        // Markers.
+        let edl = events_to_resolve_edl(
+            &detect_timeline(&frames, 10, &DetectParams::default()).unwrap().events,
+            &crate::engine::timecode::TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::engine::timecode::TcType::NonDrop },
+            "t",
+        );
+        assert!(edl.contains("|C:ResolveColorRed |M:mismatch: c (V1, first) x"), "{edl}");
+        assert!(edl.contains("|C:ResolveColorYellow |M:not checked (grab timeout): c (V1, mid)"), "{edl}");
     }
 }

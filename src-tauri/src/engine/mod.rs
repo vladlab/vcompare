@@ -16,5 +16,6 @@ pub mod testenv;
 pub mod thumbs;
 pub mod timeline;
 pub mod timeline_compare;
+pub mod timeline_run;
 pub mod timecode;
 pub mod types;

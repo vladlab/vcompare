@@ -178,10 +178,9 @@ pub struct Grabber {
     reader: BufReader<ChildStdout>,
     job: Arc<Job>,
     child: Option<ChildId>,
-    /// From READY.
+    /// From READY (the signal's size when the grabber attached).
     pub width: u32,
     pub height: u32,
-    pub fmt: String,
 }
 
 impl Grabber {
@@ -243,7 +242,6 @@ impl Grabber {
             child: Some(id),
             width: kv.get("w").and_then(|v| v.parse().ok()).unwrap_or(0),
             height: kv.get("h").and_then(|v| v.parse().ok()).unwrap_or(0),
-            fmt,
         })
     }
 
