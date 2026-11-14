@@ -368,8 +368,9 @@ other.
 
 ## 7. Not in this plan
 
-- A decode-light "detectors only" pass (lowres J2K etc.): measured as not
-  worth a separate mode; see the note in `native-stats.md` §1.
+- A decode-light "detectors only" pass: the stats are ~10 % of a levels
+  run (`native-stats.md` §1), so a separate mode would save little. A
+  `-lowres` J2K decode is the untested idea to try if IMF scans feel slow.
 - Repeats or matches in diff and timeline modes.
 - Detecting dropped frames (motion discontinuity without a repeat), black
   runs, freeze-at-end: natural next tabs, same scaffolding.
