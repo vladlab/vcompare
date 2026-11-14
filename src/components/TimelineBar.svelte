@@ -11,6 +11,7 @@
 -->
 <script lang="ts">
   import type { FlashEvent } from "../lib/rpc";
+  import { eventColor, eventFaded } from "../lib/eventColors";
 
   interface TimelineInfo {
     ref_start: number;
@@ -196,10 +197,10 @@
     <!-- Event markers (span both bars) -->
     {#each events as e (e.frame)}
       <span
-        class="event-tick {e.subkind}"
-        class:at-cut={e.at_cut}
-        style={barStyle(e.frame, e.frame + e.length)}
-        title="{e.tc} · {e.subkind} · {e.length} fr{e.at_cut ? ' · at cut' : ''}"
+        class="event-tick"
+        class:at-cut={eventFaded(e)}
+        style="{barStyle(e.frame, e.frame + e.length)}; background: {eventColor(e)}"
+        title="{e.tc} · {e.label ?? e.subkind} · {e.length} fr{e.at_cut ? ' · at cut' : ''}"
       ></span>
     {/each}
 
@@ -232,9 +233,6 @@
     pointer-events: none;
     opacity: 0.9;
   }
-  .event-tick.content { background: #e8b830; }
-  .event-tick.white   { background: #ffffff; }
-  .event-tick.black   { background: #9a9a9a; }
   .event-tick.at-cut  { opacity: 0.4; }
 
   .timeline-bar {

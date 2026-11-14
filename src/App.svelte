@@ -8,8 +8,11 @@
     - timeline: a deliverable against Resolve's SDI output, sampled at the
       first / middle / last frame of every clip (needs scopetap_grab)
 
-  Flash-frame detection runs over diff and levels results (EventPanel);
-  in timeline mode the same panel lists the flagged samples.
+  Results: the chart runs full width; below it a tab strip holds the frame
+  table and one tab per detector (flash frames in diff / levels, repeats
+  and image match in levels; in timeline mode the flash tab lists the
+  flagged samples and a Report tab holds the run report). Each event row
+  carries a filmstrip, loaded lazily (lib/thumbLoader.svelte.ts).
 -->
 
 <script lang="ts">
@@ -26,8 +29,9 @@
     type ProgressEvent,
     type DiagnosticsEvent,
     type UnlistenFn,
-    type DetectParams,
     type DetectResult,
+    type DetectorKind,
+    type ImageReference,
     ping,
     detectCapabilities,
     probeFile,
@@ -43,9 +47,12 @@
     exportEventsCsv,
     exportEventsEdl,
     setEventReview,
-    previewFrames,
     type EventReview,
-    type PreviewRow,
+    listReferences,
+    addReferenceFromImage,
+    addReferenceFromFrame,
+    renameReference,
+    deleteReference,
     getRecents,
     addRecent,
     type RecentEntry,
@@ -74,7 +81,10 @@
   import MetricChart from "./components/MetricChart.svelte";
   import FrameTable from "./components/FrameTable.svelte";
   import TimelineBar from "./components/TimelineBar.svelte";
-  import EventPanel from "./components/EventPanel.svelte";
+  import TabStrip from "./components/TabStrip.svelte";
+  import DetectorTab from "./components/DetectorTab.svelte";
+  import { tabsFor, DEFAULT_PARAMS, requestFor, type TabId, type TabItem, type DetectorParams } from "./lib/detectors";
+  import { ThumbLoader, SETTLE_MS, QUICK_MS } from "./lib/thumbLoader.svelte";
   import TimelineSetup from "./components/TimelineSetup.svelte";
   import TimelineReport from "./components/TimelineReport.svelte";
 
@@ -114,6 +124,21 @@
   // Levels: parallel ffmpeg decodes (0 = auto). Lower it for slow disks or
   // network shares, where parallel reads just compete.
   let parallelDecodes: number = $state(0);
+  // Levels: keep per-frame picture signatures for image match (a .sig
+  // sidecar, 864 bytes a frame). Remembered across runs.
+  let keepSignatures: boolean = $state(true);
+  try { keepSignatures = localStorage.getItem("vcompare.keepSignatures") !== "false"; } catch { /* ignore */ }
+  $effect(() => {
+    const v = keepSignatures;
+    try { localStorage.setItem("vcompare.keepSignatures", String(v)); } catch { /* ignore */ }
+  });
+  let signatureSize = $derived.by(() => {
+    if (!refProbe) return "";
+    const frames = refProbe.nb_frames ?? Math.round(refProbe.duration * refProbe.fps);
+    if (!frames) return "";
+    const mb = (frames * 864) / 1e6;
+    return mb >= 1000 ? `~${(mb / 1000).toFixed(1)} GB` : `~${Math.max(1, Math.round(mb))} MB`;
+  });
   const PARALLEL_OPTIONS = [1, 2, 3, 4, 6, 8, 12, 16];
   // Mirrors rawstats::auto_chunks (the engine still falls back to one
   // process for sources that can't be split exactly).
@@ -184,62 +209,55 @@
   let diffviewRunning: boolean = $state(false);
   let diffviewFrame: number = $state(-1);
 
-  // Flash-frame detection
-  let detectParams: DetectParams = $state({ threshold: null, max_run: 3, exclude_at_cut: false });
-  let detectResult: DetectResult | null = $state(null);
-  let detectError: string | null = $state(null);
-  let detectTimer: ReturnType<typeof setTimeout> | null = null;
-  // The event picked last (panel click, strip click, n/N). Stays put while
-  // the cursor shuttles around it, so you don't lose your place.
-  let selectedEventFrame: number | null = $state(null);
-  // Events already visited this session.
-  let seenEvents: Set<number> = $state(new Set());
+  // ── Detectors ──
+  //
+  // One entry per detector: its parameters, last result / error, the event
+  // picked last (it stays put while the cursor shuttles around it) and the
+  // events visited this session.
+  const DETECTORS: DetectorKind[] = ["flash", "repeat", "match"];
+  let detectParams: DetectorParams = $state(structuredClone(DEFAULT_PARAMS));
+  let detectResults: Record<DetectorKind, DetectResult | null> = $state({ flash: null, repeat: null, match: null });
+  let detectErrors: Record<DetectorKind, string | null> = $state({ flash: null, repeat: null, match: null });
+  let selectedEvent: Record<DetectorKind, number | null> = $state({ flash: null, repeat: null, match: null });
+  let seenEvents: Record<DetectorKind, Set<number>> = $state({ flash: new Set(), repeat: new Set(), match: new Set() });
+  let hideRejected: Record<DetectorKind, boolean> = $state({ flash: false, repeat: false, match: false });
+  const detectTimers: Partial<Record<DetectorKind, ReturnType<typeof setTimeout>>> = {};
+  /** Parameters each detector last ran with (JSON), so the re-run effect
+   *  only fires on a real change. */
+  const lastRunParams: Partial<Record<DetectorKind, string>> = {};
 
-  function selectEvent(frame: number) {
-    selectedEventFrame = frame;
-    seenEvents = new Set(seenEvents).add(frame);
+  // Image-match references (stored in the app data dir) and which are ticked
+  let references: ImageReference[] = $state([]);
+  const REF_SELECTION_KEY = "vcompare.matchReferences";
+  try {
+    const saved = JSON.parse(localStorage.getItem(REF_SELECTION_KEY) ?? "null");
+    if (Array.isArray(saved)) detectParams.match.references = saved;
+  } catch { /* storage unavailable */ }
+
+  // Tabs under the chart
+  let activeTab: TabId = $state("frames");
+  /** The detector whose events the chart shows and ↑↓ / y x act on: the
+   *  active tab's, or the last detector tab visited. */
+  let markerDetector: DetectorKind = $state("flash");
+  const tabMemory: Partial<Record<string, TabId>> = {};
+
+  const thumbs = new ThumbLoader();
+  thumbs.onError = (msg) => showStatus(`Preview: ${msg}`);
+
+  function selectEvent(frame: number, kind: DetectorKind = markerDetector) {
+    selectedEvent[kind] = frame;
+    seenEvents[kind] = new Set(seenEvents[kind]).add(frame);
     handleCursorChange(frame);
   }
 
-  // ── Event preview (frame before, the run, frame after) ──
-  const PREVIEW_HEIGHT = 108; // px, shown at half size on HiDPI
-  let eventPreview: PreviewRow[] | null = $state(null);
-  const previewCache = new Map<string, PreviewRow[]>();
-  let previewRequest = 0;
-
-  $effect(() => {
-    const frame = selectedEventFrame;
-    const ev = detectResult?.events.find((e) => e.frame === frame);
-    if (frame == null || !ev) {
-      eventPreview = null;
-      return;
-    }
-    const key = `${frame}:${ev.length}`;
-    const cached = previewCache.get(key);
-    if (cached) {
-      eventPreview = cached;
-      return;
-    }
-    // Not cached: show placeholders (keeping the strip's size) until it lands.
-    eventPreview = null;
-    const req = ++previewRequest;
-    previewFrames(frame - 1, ev.length + 2, PREVIEW_HEIGHT)
-      .then((r) => {
-        previewCache.set(key, r.rows);
-        if (req === previewRequest) eventPreview = r.rows;
-      })
-      .catch((e) => {
-        if (req === previewRequest) showStatus(`Preview: ${e}`);
-      });
-  });
-
-  async function handleReview(frame: number, review: EventReview | null) {
+  async function handleReview(frame: number, review: EventReview | null, kind: DetectorKind = markerDetector) {
     try {
-      const r = await setEventReview(frame, review);
-      if (detectResult) {
-        detectResult = {
-          ...detectResult,
-          events: detectResult.events.map((e) => (e.frame === frame ? { ...e, review } : e)),
+      const r = await setEventReview(kind, frame, review);
+      const res = detectResults[kind];
+      if (res) {
+        detectResults[kind] = {
+          ...res,
+          events: res.events.map((e) => (e.frame === frame ? { ...e, review } : e)),
         };
       }
       if (!r.saved) showStatus("Verdict kept for this session only (analysis has no save path)");
@@ -250,10 +268,11 @@
 
   /** y / x on the picked event. */
   function reviewSelected(review: EventReview) {
-    const frame = selectedEventFrame;
-    const ev = detectResult?.events.find((e) => e.frame === frame);
+    const kind = markerDetector;
+    const frame = selectedEvent[kind];
+    const ev = detectResults[kind]?.events.find((e) => e.frame === frame);
     if (frame == null || !ev) return;
-    handleReview(frame, ev.review === review ? null : review);
+    handleReview(frame, ev.review === review ? null : review, kind);
   }
 
   // Debounced seek — sends to both mpv instances if running
@@ -361,11 +380,7 @@
           cacheInfo = null;
           summary = null;
           metricSeries = {};
-          detectResult = null;
-          detectError = null;
-          selectedEventFrame = null;
-          seenEvents = new Set();
-          previewCache.clear();
+          resetDetectors();
           progressCurrent = 0;
           progressTotal = 0;
           diagnosticLines = [];
@@ -405,88 +420,252 @@
     }
   });
 
-  // ── Flash-frame detection ──
+  // ── Detection ──
 
-  let detectAvailable = $derived(
-    summary?.mode === "levels" || summary?.mode === "diff" ||
-    (summary?.mode === "timeline" && !summary.timeline_run?.dry_run)
-  );
   let isTimeline = $derived(summary?.mode === "timeline");
+  let tabDefs = $derived(tabsFor(summary?.mode));
+  let tabItems: TabItem[] = $derived(
+    summary
+      ? tabDefs.map((t) => ({
+          id: t.id,
+          label: t.label(summary!.mode),
+          count: t.detector ? (detectResults[t.detector]?.events.length ?? null) : null,
+          unavailable: t.unavailable?.(summary!) ?? null,
+        }))
+      : []
+  );
+  /** Detectors with a usable tab in this analysis. */
+  let liveDetectors = $derived(
+    summary
+      ? tabDefs.filter((t) => t.detector && !t.unavailable?.(summary!)).map((t) => t.detector!)
+      : []
+  );
+  let detectAvailable = $derived(liveDetectors.includes("flash"));
+  let markerEvents = $derived(detectResults[markerDetector]?.events ?? []);
+  let previewFiles = $derived(summary?.mode === "diff" || summary?.mode === "vmaf" ? 2 : 1);
 
-  async function runDetection() {
-    if (!detectAvailable) {
-      detectResult = null;
-      detectError = null;
+  function resetDetectors() {
+    for (const k of DETECTORS) {
+      detectResults[k] = null;
+      detectErrors[k] = null;
+      selectedEvent[k] = null;
+      seenEvents[k] = new Set();
+      delete lastRunParams[k];
+    }
+    thumbs.clear();
+  }
+
+  async function runDetection(kind: DetectorKind) {
+    lastRunParams[kind] = JSON.stringify(detectParams[kind]);
+    if (!liveDetectors.includes(kind)) {
+      detectResults[kind] = null;
+      detectErrors[kind] = null;
+      return;
+    }
+    // Image match with nothing ticked: nothing to look for.
+    if (kind === "match" && (detectParams.match.references ?? []).length === 0) {
+      detectResults[kind] = { events: [], threshold: detectParams.match.min_similarity ?? 0.9, source: "signatures", detector: "match" };
+      detectErrors[kind] = null;
       return;
     }
     try {
-      detectResult = await detectEvents({ ...detectParams });
-      detectError = null;
+      detectResults[kind] = await detectEvents(requestFor(kind, $state.snapshot(detectParams[kind])));
+      detectErrors[kind] = null;
     } catch (e) {
-      detectResult = null;
-      detectError = String(e);
+      detectResults[kind] = null;
+      detectErrors[kind] = String(e);
     }
   }
 
-  // Re-run whenever the parameters change (the engine scan is cheap, but
-  // slider drags fire fast, so coalesce).
+  async function runAllDetections() {
+    await Promise.all(liveDetectors.map(runDetection));
+  }
+
+  // Re-run a detector whenever its parameters change (the engine scan is
+  // cheap, but slider drags fire fast, so coalesce). Thumbnails hold back
+  // until things settle.
+  for (const kind of DETECTORS) {
+    $effect(() => {
+      const json = JSON.stringify(detectParams[kind]);
+      if (state !== "ready" || json === lastRunParams[kind]) return;
+      if (detectTimers[kind]) clearTimeout(detectTimers[kind]);
+      thumbs.hold(SETTLE_MS);
+      detectTimers[kind] = setTimeout(() => runDetection(kind), 60);
+    });
+  }
+
+  // Remember which references are ticked, across analyses and restarts.
   $effect(() => {
-    void detectParams;
-    if (state !== "ready" || !detectAvailable) return;
-    if (detectTimer) clearTimeout(detectTimer);
-    detectTimer = setTimeout(runDetection, 60);
+    const ids = $state.snapshot(detectParams.match.references ?? []);
+    try { localStorage.setItem(REF_SELECTION_KEY, JSON.stringify(ids)); } catch { /* ignore */ }
   });
 
-  /** Frame range of the analysed data, for the event overview strip. */
-  let analysedRange = $derived.by((): [number, number] | null => {
-    if (summary?.timeline) {
-      return [summary.timeline.overlap_start, summary.timeline.overlap_end];
-    }
-    const first = Object.values(metricSeries)[0];
-    if (first && first.frames.length > 0) {
-      return [first.frames[0], first.frames[first.frames.length - 1] + 1];
-    }
-    return null;
-  });
+  function selectTab(id: TabId) {
+    activeTab = id;
+    const def = tabDefs.find((t) => t.id === id);
+    if (def?.detector) markerDetector = def.detector;
+    if (summary) tabMemory[summary.mode] = id;
+    thumbs.hold(QUICK_MS);
+  }
 
   /** Jump to the next (dir=1) or previous (dir=-1) event from the cursor. */
   function jumpToEvent(dir: 1 | -1) {
-    const events = detectResult?.events ?? [];
+    const kind = markerDetector;
+    const events = detectResults[kind]?.events ?? [];
     if (events.length === 0) return;
     // Step from the picked event if there is one, so shuttling around it
     // with mpv doesn't change where n/N go next.
-    const from = selectedEventFrame ?? cursorFrame;
+    const from = selectedEvent[kind] ?? cursorFrame;
     let target;
     if (dir === 1) {
       target = events.find((e) => e.frame > from) ?? events[0];
     } else {
       target = [...events].reverse().find((e) => e.frame < from) ?? events[events.length - 1];
     }
-    selectEvent(target.frame);
+    selectEvent(target.frame, kind);
   }
 
-  async function handleExportEdl() {
+  // ── Image-match references ──
+
+  async function refreshReferences() {
+    try {
+      references = await listReferences();
+      // Drop ticks for references that no longer exist.
+      const ids = new Set(references.map((r) => r.id));
+      const ticked = detectParams.match.references ?? [];
+      if (ticked.some((id) => !ids.has(id))) {
+        detectParams.match = { ...detectParams.match, references: ticked.filter((id) => ids.has(id)) };
+      }
+    } catch (e) {
+      showStatus(`References: ${e}`);
+    }
+  }
+
+  function tickReference(id: string) {
+    const cur = detectParams.match.references ?? [];
+    if (!cur.includes(id)) detectParams.match = { ...detectParams.match, references: [...cur, id] };
+  }
+
+  async function handleAddRefImage() {
+    const path = await open({
+      title: "Reference picture (e.g. a still of the offline card)",
+      defaultPath: lastDir,
+      filters: [
+        { name: "Images", extensions: ["png", "jpg", "jpeg", "tif", "tiff", "dpx", "exr", "bmp", "webp"] },
+        { name: "All Files", extensions: ["*"] },
+      ],
+    });
+    if (!path) return;
+    try {
+      showStatus("Adding reference…");
+      const r = await addReferenceFromImage(path as string);
+      await refreshReferences();
+      tickReference(r.id);
+      showStatus(`Reference “${r.name}” added${r.flat ? " (flat colour: matched by colour)" : ""}`);
+    } catch (e) {
+      showStatus(`Reference: ${e}`);
+    }
+  }
+
+  async function handleAddRefFrame() {
+    if (cursorFrame < 0) {
+      showStatus("Put the cursor on the frame to use first");
+      return;
+    }
+    try {
+      const r = await addReferenceFromFrame(cursorFrame);
+      await refreshReferences();
+      tickReference(r.id);
+      showStatus(`Reference “${r.name}” added`);
+    } catch (e) {
+      showStatus(`Reference: ${e}`);
+    }
+  }
+
+  async function handleRenameRef(id: string, name: string) {
+    if (!name.trim()) return;
+    try {
+      await renameReference(id, name);
+      await refreshReferences();
+      runDetection("match");
+    } catch (e) {
+      showStatus(`Reference: ${e}`);
+    }
+  }
+
+  async function handleDeleteRef(id: string) {
+    const r = references.find((x) => x.id === id);
+    if (!r || !confirm(`Delete the reference “${r.name}”? It is removed for every analysis.`)) return;
+    try {
+      await deleteReference(id);
+      await refreshReferences();
+    } catch (e) {
+      showStatus(`Reference: ${e}`);
+    }
+  }
+
+  // ── Chart / tabs split ──
+  const SPLIT_KEY = "vcompare.chartFraction";
+  let chartFraction: number = $state(0.45);
+  try {
+    const v = parseFloat(localStorage.getItem(SPLIT_KEY) ?? "");
+    if (v > 0.1 && v < 0.9) chartFraction = v;
+  } catch { /* storage unavailable */ }
+  let resultsMainEl: HTMLDivElement | undefined = $state();
+
+  function startSplitDrag(e: PointerEvent) {
+    const el = resultsMainEl;
+    if (!el) return;
+    e.preventDefault();
+    const handle = e.currentTarget as HTMLElement;
+    handle.setPointerCapture(e.pointerId);
+    const chartTop = (el.querySelector(".chart-area") as HTMLElement | null)?.getBoundingClientRect().top ?? el.getBoundingClientRect().top;
+    const bottom = el.getBoundingClientRect().bottom;
+    const MIN = 160;
+    const move = (ev: PointerEvent) => {
+      const avail = bottom - chartTop;
+      const h = Math.min(Math.max(ev.clientY - chartTop, MIN), avail - MIN);
+      chartFraction = h / el.clientHeight;
+    };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      try { localStorage.setItem(SPLIT_KEY, String(chartFraction)); } catch { /* ignore */ }
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+  }
+
+  const EXPORT_NAMES: Record<DetectorKind, { what: string; stem: string }> = {
+    flash: { what: "flash frames", stem: "flash" },
+    repeat: { what: "repeated frames", stem: "repeat" },
+    match: { what: "image matches", stem: "match" },
+  };
+
+  async function handleExportEdl(kind: DetectorKind) {
     const stem = refPath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "vcompare";
+    const n = EXPORT_NAMES[kind];
     const result = await save({
-      title: isTimeline ? "Export flagged samples as Resolve marker EDL" : "Export flash frames as Resolve marker EDL",
-      defaultPath: isTimeline ? `${stem}_timeline_markers.edl` : `${stem}_flash_markers.edl`,
+      title: isTimeline ? "Export flagged samples as Resolve marker EDL" : `Export ${n.what} as Resolve marker EDL`,
+      defaultPath: isTimeline ? `${stem}_timeline_markers.edl` : `${stem}_${n.stem}_markers.edl`,
       filters: [{ name: "EDL", extensions: ["edl"] }],
     });
     if (result) {
-      const r = await exportEventsEdl(result as string);
+      const r = await exportEventsEdl(kind, result as string);
       showStatus(`${r.rows} markers written — in Resolve: Timeline › Import › Timeline Markers from EDL`, 10000);
     }
   }
 
-  async function handleExportEvents() {
+  async function handleExportEvents(kind: DetectorKind) {
     const stem = refPath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "vcompare";
+    const n = EXPORT_NAMES[kind];
     const result = await save({
-      title: isTimeline ? "Export flagged samples CSV" : "Export flash frames CSV",
-      defaultPath: isTimeline ? `${stem}_timeline_flags.csv` : `${stem}_flash_frames.csv`,
+      title: isTimeline ? "Export flagged samples CSV" : `Export ${n.what} CSV`,
+      defaultPath: isTimeline ? `${stem}_timeline_flags.csv` : `${stem}_${n.stem}_frames.csv`,
       filters: [{ name: "CSV", extensions: ["csv"] }],
     });
     if (result) {
-      await exportEventsCsv(result as string);
+      await exportEventsCsv(kind, result as string);
     }
   }
 
@@ -670,9 +849,10 @@
     if (token !== jobToken) return;
     summary = result;
     metricSeries = {};
-    selectedEventFrame = null;
-    seenEvents = new Set();
-    previewCache.clear();
+    resetDetectors();
+    activeTab = tabMemory[result.mode] ?? "frames";
+    if (!tabsFor(result.mode).some((t) => t.id === activeTab)) activeTab = "frames";
+    markerDetector = (tabsFor(result.mode).find((t) => t.id === activeTab)?.detector) ?? "flash";
 
     // Fetch series for each available metric
     for (const m of result.metrics_available) {
@@ -704,8 +884,10 @@
     state = "ready";
     if (result.perf) showStatus(result.perf, 20000);
 
-    // Flash-frame detection (levels / diff only)
-    await runDetection();
+    // Every detector with a tab, so the tabs show their counts at once.
+    if (result.mode === "levels") await refreshReferences();
+    await runAllDetections();
+    thumbs.hold(QUICK_MS);
 
     if (result.mode === "timeline") {
       // Where the run was saved (none for a dry run), for recents.
@@ -779,6 +961,7 @@
         ssim: wantSsim,
         subsample,
         chunks: analysisMode === "levels" && parallelDecodes > 0 ? parallelDecodes : undefined,
+        signatures: analysisMode === "levels" ? keepSignatures : undefined,
         log_path: cacheInfo?.path,
         force: true,
       });
@@ -1029,6 +1212,15 @@
       case "0":
         chartComponent?.zoomReset();
         break;
+      case "1":
+      case "2":
+      case "3":
+      case "4":
+      case "5": {
+        const t = tabItems[parseInt(e.key) - 1];
+        if (t) selectTab(t.id);
+        break;
+      }
     }
   }
 
@@ -1260,6 +1452,10 @@
                 {/each}
               </select>
             </label>
+            <label class="checkbox-label" title="Save a tiny picture signature of every frame next to the analysis (a .sig file), so the Image match tab can find frames that look like a reference picture — Media Offline cards, slates, missing renders.">
+              <input type="checkbox" bind:checked={keepSignatures} />
+              Keep frame signatures{signatureSize ? ` (${signatureSize})` : ""}
+            </label>
           </div>
           <button class="primary analyze-btn" onclick={startAnalysis}>
             {cacheInfo?.exists ? "Re-analyze" : "Analyze"}
@@ -1392,9 +1588,9 @@
       </div>
 
     {:else if state === "ready" && activeSeries}
-      <!-- Results view -->
+      <!-- Results view: chart full width, tabs below -->
       <div class="results-layout">
-        <div class="results-main">
+        <div class="results-main" bind:this={resultsMainEl}>
           {#if isTimeline && summary?.timeline_run}
             <TimelineReport report={summary.timeline_run} />
           {/if}
@@ -1402,11 +1598,11 @@
             <TimelineBar
               timeline={summary.timeline}
               tcFormat={summary.tc_format}
-              events={detectResult?.events ?? []}
+              events={markerEvents}
               onSeek={handleCursorChange}
             />
           {/if}
-          <div class="chart-area">
+          <div class="chart-area" style="flex-basis: {chartFraction * 100}%">
             <MetricChart
               bind:this={chartComponent}
               series={displaySeries}
@@ -1415,39 +1611,61 @@
               {cursorFrame}
               onCursorChange={handleCursorChange}
               timeline={summary?.timeline}
-              events={detectResult?.events ?? []}
+              events={markerEvents}
               sparse={isTimeline}
             />
           </div>
-          <div class="table-area">
-            <FrameTable
-              {cursorFrame}
-              metrics={summary?.metrics_available ?? []}
-              mode={summary?.mode ?? "diff"}
-              onFrameSelect={handleCursorChange}
-            />
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div class="split-handle" title="Drag to resize" onpointerdown={startSplitDrag}></div>
+          <TabStrip tabs={tabItems} active={activeTab} onSelect={selectTab} />
+          <div class="tab-body">
+            {#if activeTab === "frames"}
+              <FrameTable
+                {cursorFrame}
+                metrics={summary?.metrics_available ?? []}
+                mode={summary?.mode ?? "diff"}
+                onFrameSelect={handleCursorChange}
+              />
+            {:else if activeTab === "report" && summary?.timeline_run}
+              <div class="report-tab">
+                <TimelineReport report={summary.timeline_run} full />
+              </div>
+            {:else}
+              {@const def = tabDefs.find((t) => t.id === activeTab)}
+              {@const why = def && summary ? def.unavailable?.(summary) : null}
+              {#if def?.detector && why}
+                <p class="tab-unavailable">{why}</p>
+              {:else if def?.detector}
+                {@const kind = def.detector}
+                {#key kind}
+                  <DetectorTab
+                    {kind}
+                    result={detectResults[kind]}
+                    error={detectErrors[kind]}
+                    bind:params={detectParams[kind]}
+                    bind:hideRejected={hideRejected[kind]}
+                    loader={thumbs}
+                    files={previewFiles}
+                    {cursorFrame}
+                    selectedFrame={selectedEvent[kind]}
+                    seen={seenEvents[kind]}
+                    onSelect={(f) => selectEvent(f, kind)}
+                    onReview={(f, r) => handleReview(f, r, kind)}
+                    onExport={() => handleExportEvents(kind)}
+                    onExportEdl={() => handleExportEdl(kind)}
+                    onAdjust={() => thumbs.hold(SETTLE_MS)}
+                    timeline={isTimeline}
+                    {references}
+                    onAddImage={handleAddRefImage}
+                    onAddFrame={handleAddRefFrame}
+                    onRenameRef={handleRenameRef}
+                    onDeleteRef={handleDeleteRef}
+                  />
+                {/key}
+              {/if}
+            {/if}
           </div>
         </div>
-        {#if detectAvailable}
-          <div class="events-area">
-            <EventPanel
-              result={detectResult}
-              error={detectError}
-              bind:params={detectParams}
-              {cursorFrame}
-              selectedFrame={selectedEventFrame}
-              seen={seenEvents}
-              frameRange={analysedRange}
-              onSelect={selectEvent}
-              onReview={handleReview}
-              preview={eventPreview}
-              previewRows={summary?.mode === "levels" || isTimeline ? 1 : 2}
-              onExport={handleExportEvents}
-              onExportEdl={handleExportEdl}
-              timeline={isTimeline}
-            />
-          </div>
-        {/if}
       </div>
 
     {:else if state === "error"}
@@ -1465,8 +1683,9 @@
       <span class="footer-shortcuts">
         <kbd>m</kbd> metric
         <kbd>t</kbd> threshold
-        {#if detectAvailable}
-          <kbd>↑</kbd><kbd>↓</kbd> {isTimeline ? "flagged" : "flash"}
+        <kbd>1</kbd>–<kbd>{tabItems.length}</kbd> tabs
+        {#if liveDetectors.length > 0}
+          <kbd>↑</kbd><kbd>↓</kbd> {isTimeline ? "flagged" : { flash: "flash", repeat: "repeat", match: "match" }[markerDetector]}
           <kbd>y</kbd><kbd>x</kbd> accept/reject
         {/if}
         <kbd>f</kbd> smooth{smoothWindow > 0 ? ` (${smoothWindow})` : ""}
@@ -1747,7 +1966,7 @@
   .results-layout {
     flex: 1;
     display: flex;
-    flex-direction: row;
+    flex-direction: column;
     overflow: hidden;
   }
   .results-main {
@@ -1757,18 +1976,34 @@
     overflow: hidden;
     min-width: 0;
   }
-  .events-area {
-    flex: 0 0 360px;
-    overflow: hidden;
-  }
   .chart-area {
-    flex: 0 0 45%;
-    min-height: 200px;
-    border-bottom: 1px solid var(--border-subtle);
+    flex-grow: 0;
+    flex-shrink: 0;
+    min-height: 160px;
   }
-  .table-area {
+  .split-handle {
+    height: 5px;
+    flex-shrink: 0;
+    cursor: row-resize;
+    background: var(--border-subtle);
+    border-top: 2px solid var(--bg-base);
+    border-bottom: 2px solid var(--bg-base);
+    box-sizing: border-box;
+  }
+  .split-handle:hover { background: var(--text-muted); }
+  .tab-body {
     flex: 1;
+    min-height: 160px;
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .tab-body > :global(*) { flex: 1; min-height: 0; }
+  .report-tab { overflow-y: auto; padding: var(--gap-md); }
+  .tab-unavailable {
+    padding: var(--gap-md);
+    color: var(--text-secondary);
+    font-size: 12px;
   }
 
   /* Error */

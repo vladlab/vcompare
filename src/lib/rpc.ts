@@ -92,6 +92,8 @@ export interface AnalysisSummary {
   timeline_run?: TimelineRunReport;
   /** Timeline mode: where the run was saved (null for a dry run) */
   save_path?: string | null;
+  /** Levels: per-frame picture signatures exist (image match) */
+  has_signatures?: boolean;
   ref_path?: string;
 }
 
@@ -191,19 +193,23 @@ export interface FrameData {
   waited_ms?: number;
 }
 
-// ─── Events (flash frames) ─────────────────────────────────────────────────
+// ─── Events (detectors) ────────────────────────────────────────────────────
+
+/** Which detector produced an event list. Each has its own tab. */
+export type DetectorKind = "flash" | "repeat" | "match";
 
 /** Flashes: black / white / content. Timeline mismatches: the sample's
- *  position in its clip. Timeline errors: the sample's status. */
+ *  position in its clip. Timeline errors: the sample's status. Repeats:
+ *  short / hold / black. Matches: the reference's id. */
 export type EventSubkind = "black" | "white" | "content" | "first" | "mid" | "last" | string;
 
-export interface FlashEvent {
+export interface DetectedEvent {
   /** First frame of the run (display frame number) */
   frame: number;
   tc: string;
   /** Run length in frames */
   length: number;
-  kind: "flash" | "mismatch" | "error";
+  kind: "flash" | "mismatch" | "error" | "repeat" | "match";
   subkind: EventSubkind;
   /** True when the run sits on a cut (neighbours disagree) */
   at_cut: boolean;
@@ -211,18 +217,23 @@ export interface FlashEvent {
   score: number;
   /** The user's verdict, if any */
   review?: "accept" | "reject" | null;
-  /** Timeline mode: "<clip> (V<track>, <pos>)" */
+  /** Timeline: "<clip> (V<track>, <pos>)". Match: the reference's name. */
   label?: string;
 }
 
+/** Old name, from when flash frames were the only events. */
+export type FlashEvent = DetectedEvent;
+
 export type EventReview = "accept" | "reject";
 
-/** Accept / reject (or clear with null) the event starting at `frame`; saved next to the analysis. */
+/** Accept / reject (or clear with null) the event of `detector` starting at
+ *  `frame`; saved next to the analysis. */
 export async function setEventReview(
+  detector: DetectorKind,
   frame: number,
   review: EventReview | null,
-): Promise<{ frame: number; review: EventReview | null; saved: boolean }> {
-  return invoke("set_event_review", { frame, review });
+): Promise<{ detector: DetectorKind; frame: number; review: EventReview | null; saved: boolean }> {
+  return invoke("set_event_review", { detector, frame, review });
 }
 
 export interface PreviewFrame {
@@ -241,7 +252,8 @@ export async function previewFrames(frame: number, count: number, height: number
   return invoke("preview_frames", { frame, count, height });
 }
 
-/** All values normalized 0..1 of signal peak. Omitted fields use engine defaults. */
+/** Flash detector. All values normalized 0..1 of signal peak. Omitted
+ *  fields use engine defaults. */
 export interface DetectParams {
   /** null/undefined = auto (robust estimate from the data) */
   threshold?: number | null;
@@ -252,11 +264,50 @@ export interface DetectParams {
   exclude_at_cut?: boolean;
 }
 
+export type FlashParams = DetectParams;
+
+/** Repeated frames (levels). Tolerance normalized 0..1 of peak; 0 = exact. */
+export interface RepeatParams {
+  tolerance?: number;
+  min_run?: number;
+  max_run?: number;
+  include_long?: boolean;
+  skip_black?: boolean;
+}
+
+/** Image match (levels, needs frame signatures). */
+export interface MatchParams {
+  references?: string[];
+  /** 0..1 */
+  min_similarity?: number;
+  min_run?: number;
+}
+
+export type DetectRequest =
+  | ({ detector: "flash" } & FlashParams)
+  | ({ detector: "repeat" } & RepeatParams)
+  | ({ detector: "match" } & MatchParams);
+
 export interface DetectResult {
-  events: FlashEvent[];
-  /** Threshold actually used */
+  events: DetectedEvent[];
+  /** Threshold actually used (flash: change; repeat: tolerance; match: similarity) */
   threshold: number;
-  source: "levels" | "diff_y" | "timeline";
+  source: "levels" | "diff_y" | "timeline" | "signatures";
+  detector: DetectorKind;
+  /** One line for the toolbar (e.g. a repeat cadence) */
+  note?: string;
+}
+
+/** A stored image-match reference. */
+export interface ImageReference {
+  id: string;
+  name: string;
+  /** Image path, or "<file> @ <timecode>" */
+  source: string;
+  /** data: URI */
+  thumb?: string | null;
+  /** Matched as a pure colour (no structure to correlate) */
+  flat: boolean;
 }
 
 export interface FrameResult {
@@ -309,6 +360,8 @@ export interface AnalyzeParams {
   force?: boolean;
   /** Levels: parallel ffmpeg decodes; omit (or 0) for auto */
   chunks?: number;
+  /** Levels: keep per-frame picture signatures for image match (default true) */
+  signatures?: boolean;
   /** Timeline: video tracks (1-based) to sample */
   tracks?: number[];
   /** Timeline: seek + grab only, nothing compared or saved */
@@ -427,17 +480,40 @@ export async function exportCsv(path?: string): Promise<{ path: string; rows: nu
 
 // ─── Events ────────────────────────────────────────────────────────────────
 
-export async function detectEvents(params?: DetectParams): Promise<DetectResult> {
-  return invoke("detect_events", { params: params ?? null });
+export async function detectEvents(request: DetectRequest): Promise<DetectResult> {
+  return invoke("detect_events", { request });
 }
 
-export async function exportEventsCsv(path?: string): Promise<{ path: string; rows: number }> {
-  return invoke("export_events_csv", { path: path ?? null });
+/** Export one detector's events (or all, with null) as CSV. */
+export async function exportEventsCsv(detector: DetectorKind | null, path?: string): Promise<{ path: string; rows: number }> {
+  return invoke("export_events_csv", { detector, path: path ?? null });
 }
 
 /** Export events as a DaVinci Resolve timeline-marker EDL. */
-export async function exportEventsEdl(path?: string): Promise<{ path: string; rows: number }> {
-  return invoke("export_events_edl", { path: path ?? null });
+export async function exportEventsEdl(detector: DetectorKind | null, path?: string): Promise<{ path: string; rows: number }> {
+  return invoke("export_events_edl", { detector, path: path ?? null });
+}
+
+export async function listReferences(): Promise<ImageReference[]> {
+  return invoke("list_references");
+}
+
+/** A reference from an image file, fitted into the loaded analysis's frame. */
+export async function addReferenceFromImage(path: string, name?: string): Promise<ImageReference> {
+  return invoke("add_reference_from_image", { path, name: name ?? null });
+}
+
+/** A reference from a frame of the loaded levels analysis (exact). */
+export async function addReferenceFromFrame(frame: number, name?: string): Promise<ImageReference> {
+  return invoke("add_reference_from_frame", { frame, name: name ?? null });
+}
+
+export async function renameReference(id: string, name: string): Promise<void> {
+  return invoke("rename_reference", { id, name });
+}
+
+export async function deleteReference(id: string): Promise<void> {
+  return invoke("delete_reference", { id });
 }
 
 // ─── DaVinci Resolve sync ──────────────────────────────────────────────────

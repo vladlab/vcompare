@@ -322,15 +322,7 @@ impl EngineState {
             .as_deref()
             .and_then(|p| std::fs::read_to_string(reviews_path(p)).ok())
             .and_then(|s| serde_json::from_str::<ReviewsFile>(&s).ok())
-            .map(|f| {
-                // Version 1 keyed by bare frame number: those were flash
-                // verdicts (or timeline flags, which the flash detector
-                // reports too).
-                f.reviews
-                    .into_iter()
-                    .map(|(k, v)| if k.contains(':') { (k, v) } else { (format!("flash:{k}"), v) })
-                    .collect()
-            })
+            .map(|f| migrate_review_keys(f.reviews))
             .unwrap_or_default();
         if !state.reviews.is_empty() {
             eprintln!("[vcompare] loaded {} event reviews", state.reviews.len());
@@ -969,6 +961,15 @@ fn export_stem(mode: Option<&str>, detector: Option<Detector>, timeline_suffix: 
     }
 }
 
+/// Version 1 sidecars keyed verdicts by bare frame number: those were flash
+/// verdicts (or timeline flags, which the flash detector reports too).
+fn migrate_review_keys(reviews: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    reviews
+        .into_iter()
+        .map(|(k, v)| if k.contains(':') { (k, v) } else { (format!("flash:{k}"), v) })
+        .collect()
+}
+
 fn review_key(d: Detector, frame: i64) -> String {
     format!("{}:{frame}", d.as_str())
 }
@@ -1021,4 +1022,38 @@ fn build_mpv_context(meta: &AnalysisMeta) -> Option<MpvContext> {
         scale_h: meta.scale_h,
         scale_ref: meta.scale_ref,
     })
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn version_1_review_files_still_load() {
+        let v1 = r#"{"version":1,"ref_path":"/a.mov","reviews":{"86410":"accept","86500":"reject"}}"#;
+        let f: ReviewsFile = serde_json::from_str(v1).unwrap();
+        let m = migrate_review_keys(f.reviews);
+        assert_eq!(m.get("flash:86410").map(String::as_str), Some("accept"));
+        assert_eq!(m.get("flash:86500").map(String::as_str), Some("reject"));
+        let v2 = migrate_review_keys([("repeat:12".to_string(), "accept".to_string())].into());
+        assert!(v2.contains_key("repeat:12"));
+    }
+
+    #[test]
+    fn verdicts_are_per_detector() {
+        let dir = std::env::temp_dir().join(format!("vcompare_reviews_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let analysis = dir.join("x.levels.json").to_string_lossy().to_string();
+        let st = EngineState::new();
+        st.apply_levels_result(&serde_json::json!({"frames": [], "bit_depth": 8}));
+        st.set_save_path(Some(analysis.clone()));
+        st.set_event_review(Detector::Flash, 100, Some("accept")).unwrap();
+        st.set_event_review(Detector::Repeat, 100, Some("reject")).unwrap();
+        let st2 = EngineState::new();
+        st2.set_save_path(Some(analysis));
+        let r = &st2.inner.lock().unwrap().reviews;
+        assert_eq!(r.get("flash:100").map(String::as_str), Some("accept"));
+        assert_eq!(r.get("repeat:100").map(String::as_str), Some("reject"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

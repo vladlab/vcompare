@@ -14,6 +14,7 @@
   import uPlot from "uplot";
   import "uplot/dist/uPlot.min.css";
   import type { MetricSeries, TimelineInfo, FlashEvent } from "../lib/rpc";
+  import { eventColor, eventFaded } from "../lib/eventColors";
 
   // ── Props ──
 
@@ -24,7 +25,7 @@
     cursorFrame: number;
     onCursorChange: (frame: number) => void;
     timeline?: TimelineInfo | null;
-    /** Detected events to mark on the chart (flash frames). */
+    /** Detected events to mark on the chart (the active detector's). */
     events?: FlashEvent[];
     /** Data is a set of samples (timeline mode): draw the points. */
     sparse?: boolean;
@@ -81,15 +82,6 @@
     sat_avg:{ color: "#c070e8", label: "Sat Avg" },
   };
 
-  // Event marker colours by subkind
-  const EVENT_COLORS: Record<string, string> = {
-    black: "#9a9a9a",
-    white: "#ffffff",
-    content: "#e8b830",
-    // timeline mode (by kind)
-    mismatch: "#e5534b",
-    error: "#d29922",
-  };
   const EVENT_AT_CUT_ALPHA = 0.45;
 
   function getColor(): string {
@@ -469,9 +461,8 @@
               const x2 = u.valToPos(ev.frame + ev.length, "x", true);
               if (x2 < left || x1 > right) continue;
 
-              const flash = ev.kind === "flash";
-              const color = (flash ? EVENT_COLORS[ev.subkind] : EVENT_COLORS[ev.kind]) ?? EVENT_COLORS.content;
-              ctx.globalAlpha = flash && ev.at_cut ? EVENT_AT_CUT_ALPHA : 1;
+              const color = eventColor(ev);
+              ctx.globalAlpha = eventFaded(ev) ? EVENT_AT_CUT_ALPHA : 1;
 
               // Band over the run (min 1.5px so it never vanishes)
               const bx1 = Math.max(x1, left);
@@ -481,7 +472,7 @@
               ctx.fillRect(bx1, top, bx2 - bx1, height);
 
               // Tick at the top edge
-              ctx.globalAlpha = flash && ev.at_cut ? EVENT_AT_CUT_ALPHA : 1;
+              ctx.globalAlpha = eventFaded(ev) ? EVENT_AT_CUT_ALPHA : 1;
               ctx.fillStyle = color;
               ctx.fillRect(bx1, top, Math.max(bx2 - bx1, 2 * dpr), tickH);
             }
@@ -772,7 +763,6 @@
       data,
       detailEl
     );
-
     overviewPlot = new uPlot(
       overviewOpts(w, overviewH),
       data,
