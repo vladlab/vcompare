@@ -273,6 +273,8 @@ export interface RepeatParams {
   max_run?: number;
   include_long?: boolean;
   skip_black?: boolean;
+  /** Runs with only frames this still between them are joined (0 = never) */
+  still_tolerance?: number;
 }
 
 /** Image match (levels, needs frame signatures). */

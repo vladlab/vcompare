@@ -38,6 +38,9 @@
     onSelect: (frame: number) => void;
     onReview: (frame: number, review: EventReview | null) => void;
     timeline?: boolean;
+    /** The detector's threshold (0..1), to show flash strength in the
+     *  slider's own units */
+    threshold?: number | null;
     refThumbs?: Record<string, string | null | undefined>;
     empty: string;
   }
@@ -54,6 +57,7 @@
     onSelect,
     onReview,
     timeline = false,
+    threshold = null,
     refThumbs = {},
     empty,
   }: Props = $props();
@@ -126,7 +130,22 @@
     if (e.kind === "error") return "—";
     if (e.kind === "repeat") return e.score >= 1 && Number.isInteger(e.score) ? "" : `×${e.score.toFixed(1)}`;
     if (e.kind === "match") return `×${e.score.toFixed(2)}`;
+    // Flashes and mismatches: the change itself, in the threshold slider's
+    // units (score is change ÷ threshold), so the number doesn't move when
+    // the slider does and reads as "set the slider above this to drop it".
+    if (threshold != null && threshold > 0) {
+      const pct = e.score * threshold * 100;
+      return `${pct.toFixed(pct < 10 ? (timeline ? 2 : 1) : 0)}%`;
+    }
     return `×${e.score.toFixed(1)}`;
+  }
+
+  function scoreTitle(e: DetectedEvent): string {
+    if (e.kind === "flash")
+      return "How big the flash is: the smaller of the change going in and coming out, as % of peak — the same units as the threshold slider. Above the slider = listed.";
+    if (e.kind === "mismatch") return "RMS luma difference from the SDI picture, % of peak (the threshold slider's units)";
+    if (e.kind === "match") return "similarity relative to the minimum";
+    return "";
   }
 
   function roleLabel(role: string, e: DetectedEvent, k: number): string {
@@ -219,7 +238,7 @@
               {/each}
             </div>
 
-            <span class="score mono" title="strength relative to threshold">{score(e)}</span>
+            <span class="score mono" title={scoreTitle(e)}>{score(e)}</span>
             <span class="verdict">
               <button class="v-btn ok" class:set={e.review === "accept"} title="Accept (y)" onclick={(ev) => { ev.stopPropagation(); review(e, "accept"); }}>✓</button>
               <button class="v-btn no" class:set={e.review === "reject"} title="Reject (x) — left out of the EDL" onclick={(ev) => { ev.stopPropagation(); review(e, "reject"); }}>✗</button>

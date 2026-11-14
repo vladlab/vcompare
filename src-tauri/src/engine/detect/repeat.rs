@@ -17,6 +17,16 @@
 //! the first repeated frame (the second showing of the picture) and
 //! `length` counts the repeated frames, so a length-1 event is one picture
 //! shown twice.
+//!
+//! Runs separated only by "still" frames (difference at or under
+//! `still_tolerance`) are one event: a card that sits there with a shimmer,
+//! a slow fade or a logo that barely animates repeats exactly on some
+//! frames and almost on the rest, and would otherwise be chopped into a
+//! scatter of short repeats. Joined, it is one hold (hidden unless holds
+//! are asked for). A cadence in moving footage is unaffected: the frames
+//! between its repeats really move. An isolated repeat is never joined to
+//! anything, however still its surroundings, so a doubled frame in a quiet
+//! shot is still listed.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +51,14 @@ pub struct RepeatParams {
     /// Leave out runs whose picture is black.
     #[serde(default = "default_true")]
     pub skip_black: bool,
+    /// Runs with only frames this still (mean |Δ|, normalized) between
+    /// them are joined into one event. 0 = never join.
+    #[serde(default = "default_still")]
+    pub still_tolerance: f64,
+}
+
+fn default_still() -> f64 {
+    0.001
 }
 
 fn default_min_run() -> u32 {
@@ -61,6 +79,7 @@ impl Default for RepeatParams {
             max_run: default_max_run(),
             include_long: false,
             skip_black: true,
+            still_tolerance: default_still(),
         }
     }
 }
@@ -92,8 +111,8 @@ pub fn detect_repeats(frames: &[Value], bit_depth: u32, params: &RepeatParams) -
     let min_run = params.min_run.max(1) as usize;
     let max_run = params.max_run.max(min_run as u32) as usize;
 
-    let mut events = Vec::new();
-    let mut short_starts = Vec::new();
+    // Raw runs of repeating frames, [a, end).
+    let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut i = 1;
     while i < n {
         if !repeats(i) {
@@ -104,7 +123,23 @@ pub fn detect_repeats(frames: &[Value], bit_depth: u32, params: &RepeatParams) -
         while i < n && repeats(i) {
             i += 1;
         }
-        let len = i - a; // repeated frames a..i
+        runs.push((a, i));
+    }
+    // Join runs with nothing but still frames between them.
+    let still = params.still_tolerance.max(0.0);
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (a, end) in runs {
+        match spans.last_mut() {
+            Some(last) if still > tol && d[last.1..a].iter().all(|&x| x <= still) => last.1 = end,
+            _ => spans.push((a, end)),
+        }
+    }
+
+    let mut events = Vec::new();
+    let mut short_starts = Vec::new();
+    let mut hidden_holds = 0usize;
+    for (a, i) in spans {
+        let len = i - a; // frames a..i: repeats, and any still frames joined in
         if len < min_run {
             continue;
         }
@@ -121,6 +156,7 @@ pub fn detect_repeats(frames: &[Value], bit_depth: u32, params: &RepeatParams) -
             "black"
         } else if len > max_run {
             if !params.include_long {
+                hidden_holds += 1;
                 continue;
             }
             "hold"
@@ -154,7 +190,19 @@ pub fn detect_repeats(frames: &[Value], bit_depth: u32, params: &RepeatParams) -
         threshold: round4(tol),
         source: "levels".into(),
         detector: Detector::Repeat,
-        note: cadence(&short_starts).map(|p| format!("repeats every {p} frames — a cadence, not isolated faults")),
+        note: {
+            let mut notes = Vec::new();
+            if let Some(p) = cadence(&short_starts) {
+                notes.push(format!("repeats every {p} frames — a cadence, not isolated faults"));
+            }
+            if hidden_holds > 0 {
+                notes.push(format!(
+                    "{hidden_holds} hold{} (still pictures) not listed — tick holds to see them",
+                    if hidden_holds == 1 { "" } else { "s" }
+                ));
+            }
+            (!notes.is_empty()).then(|| notes.join(" · "))
+        },
     })
 }
 
@@ -276,6 +324,53 @@ mod tests {
         // isolated repeats: no cadence
         let r = detect_repeats(&frames(&[1, 2, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 12, 13]), 8, &RepeatParams::default()).unwrap();
         assert!(r.note.is_none());
+    }
+
+    /// A card that almost holds still: exact repeats on some frames, a
+    /// shimmer (0.05 % of peak) on the others.
+    fn shimmer_card() -> Vec<Value> {
+        // moving, then 20 frames of card, then moving
+        let mut ids = vec![1, 2, 3];
+        ids.extend([9; 20]);
+        ids.extend([4, 5, 6]);
+        let mut f = frames(&ids);
+        for k in [5, 6, 9, 13, 14, 15, 19] {
+            f[k]["y_dif"] = json!(0.12); // of 255
+        }
+        f
+    }
+
+    #[test]
+    fn shimmering_card_is_one_hold_not_scattered_repeats() {
+        let f = shimmer_card();
+        // Without joining: fragments of 1-3 frames are listed as repeats.
+        let p = RepeatParams { still_tolerance: 0.0, ..Default::default() };
+        assert!(detect_repeats(&f, 8, &p).unwrap().events.len() >= 3);
+        // Joined: one hold, hidden by default and said so…
+        let r = detect_repeats(&f, 8, &RepeatParams::default()).unwrap();
+        assert!(r.events.is_empty(), "{:?}", r.events);
+        assert!(r.note.as_deref().unwrap_or("").contains("1 hold"), "{:?}", r.note);
+        // …and one event with holds on, spanning the card.
+        let p = RepeatParams { include_long: true, ..Default::default() };
+        let got: Vec<_> = detect_repeats(&f, 8, &p).unwrap().events.into_iter().map(|e| (e.frame, e.length, e.subkind)).collect();
+        assert_eq!(got, vec![(104, 19, "hold".into())]);
+    }
+
+    #[test]
+    fn joining_leaves_cadences_and_lone_repeats_alone() {
+        // Cadence in moving footage: frames between repeats move.
+        let r = run(&[1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 8, 9], &RepeatParams::default());
+        assert_eq!(r.len(), 3);
+        // One doubled frame in a very quiet shot stays listed.
+        let mut f = frames(&[1, 2, 3, 4, 4, 5, 6, 7]);
+        for v in f.iter_mut().skip(1) {
+            if v["y_dif"].as_f64() != Some(0.0) {
+                v["y_dif"] = json!(0.1);
+            }
+        }
+        let r = detect_repeats(&f, 8, &RepeatParams::default()).unwrap();
+        assert_eq!(r.events.len(), 1);
+        assert_eq!(r.events[0].length, 1);
     }
 
     #[test]

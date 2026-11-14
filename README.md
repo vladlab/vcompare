@@ -97,7 +97,10 @@ zero (**exact**, right for intra codecs: a frame repeated in the source
 decodes bit-identical) or under a tolerance (long-GOP deliverables repeat to
 *near* zero). By default only short runs are listed (1–5 repeated frames);
 **holds** adds longer ones (freezes, stills, titles), and repeated black is
-skipped unless asked for. When most repeats fall at one interval the tab says
+skipped unless asked for. Runs with only near-still frames between them
+(**join if still ≤**, 0.1 % of peak by default) are joined into one event, so
+a card that shimmers, fades or barely animates is one hold rather than a
+scatter of short repeats; the tab says how many holds it is not listing. When most repeats fall at one interval the tab says
 so ("repeats every 5 frames") — that is a frame-rate conversion or pulldown
 cadence rather than isolated faults. Nothing new is decoded: it uses the
 levels analysis's own frame differences.

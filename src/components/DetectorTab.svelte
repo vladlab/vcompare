@@ -249,6 +249,13 @@
           <input type="checkbox" checked={rp.include_long ?? false} onchange={(e) => { onAdjust(); set({ include_long: (e.target as HTMLInputElement).checked }); }} />
           holds
         </label>
+        <label title="Repeats with only near-still frames between them are joined into one hold, so a card that shimmers, fades or barely animates is one event instead of a scatter of short repeats. This is how different those in-between frames may be (% of peak). Raise it if a static card is still listed in pieces; lower it (or turn it off) if separate faults in a very quiet shot get joined.">
+          join if still ≤
+          <select value={rp.still_tolerance ?? 0.001} onchange={(e) => { onAdjust(); set({ still_tolerance: parseFloat((e.target as HTMLSelectElement).value) }); }}>
+            <option value={0}>off</option>
+            {#each [0.0005, 0.001, 0.002, 0.005, 0.01] as v}<option value={v}>{(v * 100).toFixed(2).replace(/0$/, "")}%</option>{/each}
+          </select>
+        </label>
         <label class="checkbox-label" title="Leave out repeated black frames">
           <input type="checkbox" checked={rp.skip_black ?? true} onchange={(e) => { onAdjust(); set({ skip_black: (e.target as HTMLInputElement).checked }); }} />
           skip black
@@ -342,6 +349,7 @@
       {onSelect}
       {onReview}
       {timeline}
+      threshold={result?.threshold ?? null}
       {refThumbs}
       empty={emptyText()}
     />

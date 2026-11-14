@@ -78,7 +78,7 @@ export interface DetectorParams {
 
 export const DEFAULT_PARAMS: DetectorParams = {
   flash: { threshold: null, max_run: 3, exclude_at_cut: false },
-  repeat: { tolerance: 0, min_run: 1, max_run: 5, include_long: false, skip_black: true },
+  repeat: { tolerance: 0, min_run: 1, max_run: 5, include_long: false, skip_black: true, still_tolerance: 0.001 },
   match: { references: [], min_similarity: 0.9, min_run: 1 },
 };
 
