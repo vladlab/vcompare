@@ -100,6 +100,7 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            app.manage(bridge::ReferenceStore::new(data_dir.clone()));
             app.manage(RecentsState::new(data_dir));
 
             log::info!("vcompare engine ready (native, pid={})", std::process::id());
@@ -120,6 +121,11 @@ pub fn run() {
             bridge::export_events_csv,
             bridge::export_events_edl,
             bridge::set_event_review,
+            bridge::list_references,
+            bridge::add_reference_from_image,
+            bridge::add_reference_from_frame,
+            bridge::rename_reference,
+            bridge::delete_reference,
             bridge::preview_frames,
             bridge::mpv_launch,
             bridge::mpv_seek,

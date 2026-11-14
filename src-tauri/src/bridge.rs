@@ -6,7 +6,8 @@
 use crate::engine;
 use crate::engine::analysis::ProcessHandle;
 use crate::engine::cache;
-use crate::engine::events::{DetectParams, DetectResult};
+use crate::engine::detect::{DetectRequest, DetectResult, Detector};
+pub use crate::engine::references::{ReferenceStore, StoredReference};
 use crate::engine::mpv::{MpvController, ViewMode};
 use crate::engine::pixfmt::choose_diff_pixfmt;
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,10 @@ pub struct AnalyzeParams {
     /// Levels: parallel ffmpeg decodes. None or 0 = auto.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunks: Option<u32>,
+    /// Levels: keep per-frame picture signatures (image match) in a `.sig`
+    /// sidecar. Default on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<bool>,
     /// Timeline: video tracks (1-based) to sample.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracks: Option<Vec<u32>>,
@@ -349,8 +354,9 @@ pub async fn analyze(
 
     let result = if mode == "levels" {
         let chunks = params.chunks.filter(|&n| n > 0);
+        let want_sigs = params.signatures.unwrap_or(true);
         _run_levels_analysis(
-            app, &ref_path, chunks, save_path, &engine_state, process_handle,
+            app, &ref_path, chunks, want_sigs, save_path, &engine_state, process_handle,
         )
         .await
     } else if mode == "vmaf" {
@@ -578,6 +584,7 @@ async fn _run_levels_analysis(
     app: AppHandle,
     file_path: &str,
     chunks: Option<u32>,
+    want_sigs: bool,
     save_path: Option<String>,
     engine_state: &State<'_, EngineState>,
     process_handle: ProcessHandle,
@@ -603,11 +610,12 @@ async fn _run_levels_analysis(
             let _ = app_progress.emit("rpc:progress", json!({"current": current, "total": total}));
         });
 
-        let (frames, perf) = engine::analysis::run_levels_analysis(
+        let (frames, perf, sigs) = engine::analysis::run_levels_analysis(
             &file_path,
             &info,
             hwaccel.as_deref(),
             chunks,
+            want_sigs,
             Some(progress),
             process_handle,
             &mut diagnostics,
@@ -632,12 +640,12 @@ async fn _run_levels_analysis(
             },
         });
 
-        Ok::<(Value, Option<String>, String), String>((result, save_path, perf))
+        Ok::<_, String>((result, save_path, perf, sigs))
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))??;
 
-    let (result_val, save_path, perf) = result;
+    let (result_val, save_path, perf, sigs) = result;
     if cancel_check.is_cancelled() {
         return Err(CANCELLED.into());
     }
@@ -647,7 +655,19 @@ async fn _run_levels_analysis(
     if let Some(ref sp) = save_path {
         cache::save_diff_analysis(&result_val, sp)?;
         eprintln!("[vcompare] Saved levels analysis to {sp}");
+        let sig_path = engine::signatures::sidecar_path(sp);
+        match sigs {
+            Some(ref s) => match s.write(&sig_path) {
+                Ok(()) => eprintln!("[vcompare] Saved {} frame signatures to {sig_path}", s.count()),
+                Err(e) => eprintln!("[vcompare] Could not save frame signatures: {e}"),
+            },
+            // An old sidecar would no longer match this analysis.
+            None => {
+                let _ = std::fs::remove_file(&sig_path);
+            }
+        }
     }
+    engine_state.set_signatures(sigs);
 
     engine_state.set_save_path(save_path);
     // Not part of the stored analysis: only for this run's status line.
@@ -771,11 +791,20 @@ pub async fn get_metric_series(
 /// Pure in-memory scan; cheap enough to call on every slider change.
 #[tauri::command]
 pub async fn detect_events(
-    params: Option<DetectParams>,
+    request: Option<DetectRequest>,
     engine_state: State<'_, EngineState>,
+    references: State<'_, ReferenceStore>,
 ) -> Result<DetectResult, String> {
-    engine_state.detect_events(&params.unwrap_or_default())
+    let request = request.unwrap_or_default();
+    let refs = match request {
+        DetectRequest::Match(ref p) => references.get(&p.references),
+        _ => Vec::new(),
+    };
+    engine_state.detect_events(&request, &refs)
 }
+
+/// At most this many preview extractions run at once.
+static PREVIEW_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
 
 /// Thumbnails of `count` consecutive display frames from `frame`, for each
 /// file of the analysis. `{ rows: [{ label, frames: [{ frame, tc, src }] }] }`.
@@ -786,6 +815,9 @@ pub async fn preview_frames(
     height: u32,
     engine_state: State<'_, EngineState>,
 ) -> Result<Value, String> {
+    // The frontend asks for strips of every visible event; bound the
+    // ffmpeg processes here too, whatever the page does.
+    let _slot = PREVIEW_SLOTS.acquire().await.map_err(|e| e.to_string())?;
     let (sources, fps) = engine_state.preview_sources()?;
     let tcs: Vec<String> = (0..count as i64)
         .map(|k| engine_state.frame_to_tc(frame + k))
@@ -819,27 +851,120 @@ pub async fn preview_frames(
 /// Accept / reject (or clear, with `review: null`) the event at `frame`.
 #[tauri::command]
 pub async fn set_event_review(
+    detector: Option<Detector>,
     frame: i64,
     review: Option<String>,
     engine_state: State<'_, EngineState>,
 ) -> Result<Value, String> {
-    engine_state.set_event_review(frame, review.as_deref())
+    engine_state.set_event_review(detector.unwrap_or(Detector::Flash), frame, review.as_deref())
 }
 
 #[tauri::command]
 pub async fn export_events_edl(
+    detector: Option<Detector>,
     path: Option<String>,
     engine_state: State<'_, EngineState>,
 ) -> Result<Value, String> {
-    engine_state.export_events_edl(path.as_deref())
+    engine_state.export_events_edl(detector, path.as_deref())
 }
 
 #[tauri::command]
 pub async fn export_events_csv(
+    detector: Option<Detector>,
     path: Option<String>,
     engine_state: State<'_, EngineState>,
 ) -> Result<Value, String> {
-    engine_state.export_events_csv(path.as_deref())
+    engine_state.export_events_csv(detector, path.as_deref())
+}
+
+// ─── Image-match references ─────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_references(references: State<'_, ReferenceStore>) -> Result<Vec<StoredReference>, String> {
+    Ok(references.list())
+}
+
+/// Add a reference from an image file, converted into the loaded
+/// analysis's frame size and range.
+#[tauri::command]
+pub async fn add_reference_from_image(
+    path: String,
+    name: Option<String>,
+    engine_state: State<'_, EngineState>,
+    references: State<'_, ReferenceStore>,
+) -> Result<StoredReference, String> {
+    let (sources, _) = engine_state.preview_sources()?;
+    let file = sources.into_iter().next().map(|s| s.1).ok_or("No analysis loaded")?;
+    let r = tokio::task::spawn_blocking(move || -> Result<StoredReference, String> {
+        let mut d = Vec::new();
+        let info = engine::analysis::prepare_single_file(&file, &mut d)?;
+        let sig = engine::references::signature_from_image(&path, info.width, info.height, info.full_range)?;
+        let flat = engine::detect::matcher::Prepared::new(&sig).is_flat();
+        let stem = std::path::Path::new(&path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "reference".into());
+        Ok(StoredReference {
+            id: engine::references::new_id(),
+            name: name.filter(|n| !n.trim().is_empty()).unwrap_or(stem),
+            source: path.clone(),
+            thumb: engine::references::thumbnail_of_image(&path),
+            sig,
+            flat,
+        })
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+    references.save(&r)?;
+    Ok(r)
+}
+
+/// Add a reference from a frame of the loaded (levels) analysis: its
+/// signature is copied from the analysis's signatures, so it is exact.
+#[tauri::command]
+pub async fn add_reference_from_frame(
+    frame: i64,
+    name: Option<String>,
+    engine_state: State<'_, EngineState>,
+    references: State<'_, ReferenceStore>,
+) -> Result<StoredReference, String> {
+    let sigs = engine_state.signatures()?;
+    let sig = sigs.get(frame).ok_or("That frame has no signature")?.to_vec();
+    let tc = engine_state.frame_to_tc(frame)?;
+    let (sources, fps) = engine_state.preview_sources()?;
+    let (_, path, origin) = sources.into_iter().next().ok_or("No analysis loaded")?;
+    let thumb = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || engine::thumbs::extract_frames(&path, fps, frame - origin, 1, 108))
+            .await
+            .map_err(|e| format!("Task join error: {e}"))?
+            .ok()
+            .and_then(|v| v.into_iter().next())
+    };
+    let file_name = std::path::Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let r = StoredReference {
+        id: engine::references::new_id(),
+        name: name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{file_name} {tc}")),
+        source: format!("{file_name} @ {tc}"),
+        flat: engine::detect::matcher::Prepared::new(&sig).is_flat(),
+        sig,
+        thumb,
+    };
+    references.save(&r)?;
+    Ok(r)
+}
+
+#[tauri::command]
+pub async fn rename_reference(id: String, name: String, references: State<'_, ReferenceStore>) -> Result<(), String> {
+    references.rename(&id, &name)
+}
+
+#[tauri::command]
+pub async fn delete_reference(id: String, references: State<'_, ReferenceStore>) -> Result<(), String> {
+    references.delete(&id)
 }
 
 // ─── DaVinci Resolve sync ───────────────────────────────────────────────────

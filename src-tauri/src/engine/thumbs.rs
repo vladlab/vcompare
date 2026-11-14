@@ -47,7 +47,13 @@ pub fn extract_frames(
     args.extend(fps_mode_args());
     args.extend([
         "-frames:v".into(), count.to_string(),
-        "-vf".into(), format!("scale=-2:{height}:flags=bicubic:out_range=pc,format=yuvj422p"),
+        // setpts=N: after a seek some demuxers (Matroska without a parser
+        // for the codec) can hand two frames the same timestamp, which the
+        // MJPEG encoder rejects mid-strip ("Invalid pts"), so renumber,
+        // 100 ms apart: coarser than any frame period, so the stamps stay
+        // strictly increasing in the encoder's (frame-rate) time base. The
+        // frames are already chosen by then; only their stamps change.
+        "-vf".into(), format!("scale=-2:{height}:flags=bicubic:out_range=pc,format=yuvj422p,settb=1/10,setpts=N"),
         "-f".into(), "image2pipe".into(),
         "-c:v".into(), "mjpeg".into(),
         "-q:v".into(), "4".into(),
@@ -105,7 +111,7 @@ fn split_mjpeg(data: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {

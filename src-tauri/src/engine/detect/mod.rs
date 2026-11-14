@@ -1,4 +1,5 @@
-//! Event detection — finds flash frames in per-frame analysis data.
+//! Event detection — finds flash frames, repeated frames and image matches
+//! in per-frame analysis data.
 //!
 //! An *event* is something that spans one or more frames, as opposed to the
 //! per-frame scalar metrics the rest of the engine deals in. Detection is a
@@ -32,6 +33,66 @@ use serde_json::Value;
 
 use crate::engine::timecode::TimecodeFormat;
 
+pub mod flash;
+pub mod matcher;
+pub mod repeat;
+pub mod timeline;
+
+pub use flash::*;
+pub use matcher::{MatchParams, Reference};
+pub use repeat::{detect_repeats, RepeatParams};
+pub use timeline::*;
+
+/// Which detector produced a set of events. Each has its own tab, its own
+/// parameters and its own review verdicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Detector {
+    /// Flash frames (levels / diff), and flagged samples in timeline mode.
+    Flash,
+    /// Repeated frames (levels).
+    Repeat,
+    /// Frames that look like a reference picture (levels, needs signatures).
+    Match,
+}
+
+impl Detector {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Detector::Flash => "flash",
+            Detector::Repeat => "repeat",
+            Detector::Match => "match",
+        }
+    }
+}
+
+/// One detection request: which detector, with its parameters.
+///
+/// JSON: `{ "detector": "flash", "threshold": null, "max_run": 3, … }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "detector", rename_all = "snake_case")]
+pub enum DetectRequest {
+    Flash(FlashParams),
+    Repeat(RepeatParams),
+    Match(MatchParams),
+}
+
+impl DetectRequest {
+    pub fn detector(&self) -> Detector {
+        match self {
+            DetectRequest::Flash(_) => Detector::Flash,
+            DetectRequest::Repeat(_) => Detector::Repeat,
+            DetectRequest::Match(_) => Detector::Match,
+        }
+    }
+}
+
+impl Default for DetectRequest {
+    fn default() -> Self {
+        DetectRequest::Flash(FlashParams::default())
+    }
+}
+
 /// A detected multi-frame event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
@@ -39,11 +100,14 @@ pub struct Event {
     pub frame: i64,
     /// Timecode of the first frame.
     pub tc: String,
-    /// Run length in frames (1..=max_run).
+    /// Run length in frames (flash: 1..=max_run; repeat: repeated frames;
+    /// match: matching frames).
     pub length: u32,
-    /// Event family. Currently always "flash".
+    /// Event family: "flash"; "mismatch" / "error" (timeline); "repeat";
+    /// "match".
     pub kind: String,
-    /// "black" | "white" | "content"
+    /// Flash: "black" | "white" | "content". Repeat: "short" | "hold" |
+    /// "black". Match: the reference's id. Timeline: clip position or error.
     pub subkind: String,
     /// True when the frames on either side of the run differ from each
     /// other (the run sits on a cut) rather than agreeing (flash-and-return).
@@ -60,9 +124,9 @@ pub struct Event {
     pub label: Option<String>,
 }
 
-/// Detector parameters, all in normalized 0..1 units of the signal peak.
+/// Flash detector parameters, all in normalized 0..1 units of the signal peak.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DetectParams {
+pub struct FlashParams {
     /// Minimum frame-to-frame change to count as "sharp". `None` = derive
     /// from the data (robust mean + `auto_k` sigma, floored at `min_threshold`).
     #[serde(default)]
@@ -100,7 +164,7 @@ fn default_neighbour_tol() -> f64 {
     0.06
 }
 
-impl Default for DetectParams {
+impl Default for FlashParams {
     fn default() -> Self {
         Self {
             threshold: None,
@@ -113,343 +177,30 @@ impl Default for DetectParams {
     }
 }
 
+/// Flash parameters under their original name (timeline mode and the tests).
+pub type DetectParams = FlashParams;
+
 /// What the detector returns to the caller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectResult {
     pub events: Vec<Event>,
     /// The threshold actually used (auto-derived or as given).
     pub threshold: f64,
-    /// Which per-frame series the detector ran on ("levels" or "diff_y").
+    /// Which per-frame series the detector ran on ("levels", "diff_y",
+    /// "timeline", "signatures").
     pub source: String,
+    /// Which detector this is.
+    #[serde(default = "default_detector")]
+    pub detector: Detector,
+    /// One line for the tab's toolbar (e.g. a repeat cadence), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
-// ─── Public entry points ────────────────────────────────────────────────────
-
-/// Run the detector appropriate for an analysis mode.
-///
-/// Returns `Err` when the loaded data doesn't carry what the detector needs
-/// (e.g. an old levels cache without `y_dif`).
-pub fn detect_flashes(
-    mode: &str,
-    frames: &[Value],
-    bit_depth: u32,
-    params: &DetectParams,
-) -> Result<DetectResult, String> {
-    match mode {
-        "levels" => detect_flashes_levels(frames, bit_depth, params),
-        "diff" => detect_flashes_diff(frames, bit_depth, params),
-        "timeline" => detect_timeline(frames, bit_depth, params),
-        other => Err(format!("Flash detection is not available for {other} mode")),
-    }
+fn default_detector() -> Detector {
+    Detector::Flash
 }
 
-/// Flash detection over a `levels` analysis.
-pub fn detect_flashes_levels(
-    frames: &[Value],
-    bit_depth: u32,
-    params: &DetectParams,
-) -> Result<DetectResult, String> {
-    let peak = ((1u64 << bit_depth) - 1) as f64;
-    let n = frames.len();
-
-    let has_temporal = frames.iter().any(|f| num(f, "y_dif").is_some());
-    if !has_temporal {
-        return Err(
-            "This levels analysis predates temporal stats — re-run the analysis to enable flash detection"
-                .into(),
-        );
-    }
-
-    // Per-frame "how different from the previous frame" signal.
-    // Chroma gets a little less weight: on 4:2:0 it's a smaller plane and
-    // chroma noise in grainy footage is proportionally larger.
-    let d: Vec<f64> = frames
-        .iter()
-        .map(|f| {
-            let y = num(f, "y_dif").unwrap_or(0.0) / peak;
-            let u = num(f, "u_dif").unwrap_or(0.0) / peak;
-            let v = num(f, "v_dif").unwrap_or(0.0) / peak;
-            y.max(0.75 * u.max(v))
-        })
-        .collect();
-
-    let threshold = resolve_threshold(&d, params);
-
-    let y_avg: Vec<f64> = frames.iter().map(|f| num(f, "y_avg").unwrap_or(0.0) / peak).collect();
-    // Chroma "colour" proxy for the fallback neighbour test: signalstats-era
-    // caches have sat_avg; native ones have u_avg / v_avg.
-    let chroma: Vec<(f64, f64)> = frames
-        .iter()
-        .map(|f| match (num(f, "u_avg"), num(f, "v_avg")) {
-            (Some(u), Some(v)) => (u / peak, v / peak),
-            _ => (num(f, "sat_avg").unwrap_or(0.0) / peak, 0.0),
-        })
-        .collect();
-    let y_min: Vec<f64> = frames.iter().map(|f| num(f, "y_min").unwrap_or(0.0) / peak).collect();
-    let y_max: Vec<f64> = frames.iter().map(|f| num(f, "y_max").unwrap_or(0.0) / peak).collect();
-
-    let mut events = Vec::new();
-    let max_run = params.max_run.max(1) as usize;
-
-    // d[i] is the change going INTO frame i. A run [a..=b] is bounded by
-    // d[a] (enter) and d[b+1] (leave). Frame 0 has no "enter" and the last
-    // frame has no "leave", so runs touching either edge are not flashes.
-    let mut a = 1usize;
-    while a < n {
-        if d[a] <= threshold {
-            a += 1;
-            continue;
-        }
-        let mut matched: Option<usize> = None;
-        for len in 1..=max_run {
-            let b = a + len - 1;
-            if b + 1 >= n {
-                break;
-            }
-            // Inside the run the picture should hold still-ish; if another
-            // big change occurs before we leave, this isn't one flash.
-            if len > 1 && d[b] > threshold {
-                break;
-            }
-            if d[b + 1] > threshold {
-                matched = Some(len);
-                break;
-            }
-        }
-
-        match matched {
-            Some(len) => {
-                let b = a + len - 1;
-                let enter = d[a];
-                let leave = d[b + 1];
-                let score = enter.min(leave) / threshold;
-
-                // Do the neighbours agree? Frames a-1 and b+1 are len+1
-                // apart; the native engine records the thumbnail difference
-                // up to TDIF_DEPTH frames back, which compares the actual
-                // pictures. Otherwise compare average luma and chroma.
-                let at_cut = match tdif(&frames[b + 1], len + 1) {
-                    Some(t) => t > params.neighbour_tol,
-                    None => {
-                        let dy = (y_avg[a - 1] - y_avg[b + 1]).abs();
-                        let (c0, c1) = (chroma[a - 1], chroma[b + 1]);
-                        let dc = (c0.0 - c1.0).abs().max((c0.1 - c1.1).abs());
-                        dy > params.neighbour_tol || dc > params.neighbour_tol * 1.5
-                    }
-                };
-
-                let run_ymax = y_max[a..=b].iter().cloned().fold(f64::MIN, f64::max);
-                let run_ymin = y_min[a..=b].iter().cloned().fold(f64::MAX, f64::min);
-                let subkind = classify_run(run_ymin, run_ymax);
-
-                if !(at_cut && params.exclude_at_cut) {
-                    events.push(Event {
-                        frame: frame_num(&frames[a]),
-                        tc: frame_tc(&frames[a]),
-                        length: len as u32,
-                        kind: "flash".into(),
-                        subkind,
-                        at_cut,
-                        score: round3(score),
-                        review: None,
-                        label: None,
-                    });
-                }
-                // Resume at the frame after the run. d[b+1] was the "leave"
-                // edge of this run — it must not be reused as the "enter"
-                // edge of the next one, so skip past it.
-                a = b + 2;
-            }
-            None => {
-                // A sharp change with no matching exit within max_run: a cut,
-                // or the start of something longer. Move on.
-                a += 1;
-            }
-        }
-    }
-
-    Ok(DetectResult {
-        events,
-        threshold: round4(threshold),
-        source: "levels".into(),
-    })
-}
-
-/// Flash detection over a `diff` analysis (`diff_y` series).
-///
-/// A flash in the distorted file only shows up as a run of `diff_y` values
-/// standing well above both neighbours. Because an encode may have a
-/// non-zero baseline difference everywhere, the test is on the *height
-/// above the neighbours*, not the absolute value.
-pub fn detect_flashes_diff(
-    frames: &[Value],
-    bit_depth: u32,
-    params: &DetectParams,
-) -> Result<DetectResult, String> {
-    let peak = ((1u64 << bit_depth) - 1) as f64;
-    let n = frames.len();
-
-    let v: Vec<f64> = frames.iter().map(|f| num(f, "diff_y").unwrap_or(0.0) / peak).collect();
-    if v.is_empty() {
-        return Err("No diff_y data loaded".into());
-    }
-
-    // Derive the threshold from the first difference of the series so the
-    // auto estimate reflects frame-to-frame noise, not the baseline level.
-    let d: Vec<f64> = std::iter::once(0.0)
-        .chain(v.windows(2).map(|w| (w[1] - w[0]).abs()))
-        .collect();
-    let threshold = resolve_threshold(&d, params);
-
-    let mut events = Vec::new();
-    let max_run = params.max_run.max(1) as usize;
-
-    let mut a = 1usize;
-    while a < n {
-        let mut matched: Option<usize> = None;
-        for len in 1..=max_run {
-            let b = a + len - 1;
-            if b + 1 >= n {
-                break;
-            }
-            let run_min = v[a..=b].iter().cloned().fold(f64::MAX, f64::min);
-            let neighbours = v[a - 1].max(v[b + 1]);
-            if run_min - neighbours > threshold {
-                matched = Some(len);
-                break;
-            }
-            // If the run's low point is already not above the left
-            // neighbour there's no point extending it.
-            if run_min - v[a - 1] <= threshold {
-                break;
-            }
-        }
-
-        match matched {
-            Some(len) => {
-                let b = a + len - 1;
-                let run_min = v[a..=b].iter().cloned().fold(f64::MAX, f64::min);
-                let neighbours = v[a - 1].max(v[b + 1]);
-                let score = (run_min - neighbours) / threshold;
-                events.push(Event {
-                    frame: frame_num(&frames[a]),
-                    tc: frame_tc(&frames[a]),
-                    length: len as u32,
-                    kind: "flash".into(),
-                    // We only know the files differ here; the picture
-                    // content is not available in diff mode.
-                    subkind: "content".into(),
-                    at_cut: false,
-                    score: round3(score),
-                    review: None,
-                    label: None,
-                });
-                a = b + 1;
-            }
-            None => a += 1,
-        }
-    }
-
-    Ok(DetectResult {
-        events,
-        threshold: round4(threshold),
-        source: "diff_y".into(),
-    })
-}
-
-// ─── Timeline mode ──────────────────────────────────────────────────────────
-
-/// Auto threshold floor for timeline samples, normalized to peak (~4 codes
-/// at 10-bit): below this nothing is flagged however clean the run is.
-pub const TIMELINE_FLOOR: f64 = 0.004;
-/// Auto threshold ceiling (~31 codes at 10-bit): anything above it is
-/// flagged even if most of the run is that bad. Without it a fault that
-/// hits every sample (wrong levels, a missing output LUT) would *be* the
-/// median and flag nothing.
-pub const TIMELINE_CEILING: f64 = 0.03;
-/// A run whose median is above this gets a warning: the file differs from
-/// the SDI picture everywhere.
-pub const TIMELINE_MEDIAN_WARN: f64 = 0.015;
-
-/// Flag timeline samples whose `diff_y` stands out, and report samples that
-/// couldn't be measured.
-///
-/// Auto threshold, from the clean end of the run: the lower quartile `q` of
-/// the normalized `diff_y` plus `auto_k` · 1.4826 · MAD of the cleaner half
-/// (values up to the median) around `q`, clamped to [`TIMELINE_FLOOR`,
-/// `TIMELINE_CEILING`]. Faults only ever add difference, so the cleanest
-/// samples say what codec noise looks like; centring on the median instead
-/// would let a fault on most of the run become the baseline (a reel where
-/// two thirds of the clips slipped by a frame flagged only a third of them).
-/// An explicit `params.threshold` (normalized) is used as is.
-///
-/// Events: `kind` "mismatch" (subkind = position in the clip: first / mid /
-/// last; `at_cut` for first and last) or "error" (subkind = the row status:
-/// grab_timeout, grab_error, seek_error, compare_error, wrong_tc).
-pub fn detect_timeline(frames: &[Value], bit_depth: u32, params: &DetectParams) -> Result<DetectResult, String> {
-    let peak = ((1u64 << bit_depth.clamp(8, 16)) - 1) as f64;
-    let measured: Vec<(usize, f64)> = frames
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| num(f, "diff_y").map(|y| (i, y / peak)))
-        .collect();
-    let threshold = match params.threshold {
-        Some(t) => t.max(1e-6),
-        None if measured.len() < 3 => TIMELINE_FLOOR,
-        None => {
-            let mut v: Vec<f64> = measured.iter().map(|m| m.1).collect();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let q = v[(v.len() - 1) / 4];
-            let cleaner = &v[..=v.len() / 2];
-            let mut dev: Vec<f64> = cleaner.iter().map(|x| (x - q).abs()).collect();
-            dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let sigma = 1.4826 * dev[dev.len() / 2];
-            (q + params.auto_k * sigma).clamp(TIMELINE_FLOOR, TIMELINE_CEILING)
-        }
-    };
-    let label = |f: &Value| {
-        format!(
-            "{} (V{}, {})",
-            f.get("clip").and_then(|v| v.as_str()).unwrap_or("?"),
-            f.get("track").and_then(|v| v.as_u64()).unwrap_or(0),
-            f.get("pos").and_then(|v| v.as_str()).unwrap_or("?"),
-        )
-    };
-    let mut events = Vec::new();
-    for f in frames {
-        let status = f.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        let pos = f.get("pos").and_then(|v| v.as_str()).unwrap_or("mid");
-        let ev = |kind: &str, subkind: &str, score: f64| Event {
-            frame: frame_num(f),
-            tc: frame_tc(f),
-            length: 1,
-            kind: kind.into(),
-            subkind: subkind.into(),
-            at_cut: pos != "mid",
-            score: round3(score),
-            review: None,
-            label: Some(label(f)),
-        };
-        match status {
-            "ok" => {
-                if let Some(y) = num(f, "diff_y") {
-                    let n = y / peak;
-                    if n > threshold {
-                        let e = ev("mismatch", pos, n / threshold);
-                        if !(e.at_cut && params.exclude_at_cut) {
-                            events.push(e);
-                        }
-                    }
-                }
-            }
-            "grab_timeout" | "grab_error" | "seek_error" | "compare_error" | "wrong_tc" => {
-                events.push(ev("error", status, 0.0));
-            }
-            _ => {}
-        }
-    }
-    Ok(DetectResult { events, threshold: round4(threshold), source: "timeline".into() })
-}
 
 // ─── Resolve marker EDL ─────────────────────────────────────────────────────
 
@@ -468,7 +219,8 @@ pub fn detect_timeline(frames: &[Value], bit_depth: u32, params: &DetectParams) 
 /// Timecodes are the events' own (the file's embedded TC), so this lines up
 /// when the file was exported from the timeline it's going back into.
 /// Marker colour: content → Red, white → Yellow, black → Purple; events
-/// sitting on a cut get Cyan so they're easy to tell apart.
+/// sitting on a cut get Cyan so they're easy to tell apart. Repeats are
+/// Green, image matches Pink.
 pub fn events_to_resolve_edl(events: &[Event], tc_fmt: &TimecodeFormat, title: &str) -> String {
     use crate::engine::timecode::TcType;
     let mut out = String::new();
@@ -496,6 +248,8 @@ pub fn events_to_resolve_edl(events: &[Event], tc_fmt: &TimecodeFormat, title: &
         let color = match e.kind.as_str() {
             "error" => "ResolveColorYellow",
             "mismatch" => "ResolveColorRed",
+            "repeat" => "ResolveColorGreen",
+            "match" => "ResolveColorPink",
             _ if e.at_cut => "ResolveColorCyan",
             _ => match e.subkind.as_str() {
                 "white" => "ResolveColorYellow",
@@ -513,6 +267,13 @@ pub fn events_to_resolve_edl(events: &[Event], tc_fmt: &TimecodeFormat, title: &
                 "not checked ({}): {}",
                 e.subkind.replace('_', " "),
                 e.label.as_deref().unwrap_or("")
+            ),
+            "repeat" => format!("repeat: {} {} fr", e.subkind, e.length),
+            "match" => format!(
+                "match: {} {} fr x{:.2}",
+                e.label.as_deref().unwrap_or(&e.subkind),
+                e.length,
+                e.score
             ),
             _ => format!(
                 "flash: {} {} fr x{:.1}{}",
@@ -540,7 +301,7 @@ pub fn events_to_resolve_edl(events: &[Event], tc_fmt: &TimecodeFormat, title: &
 /// Auto = median + k · (1.4826 · MAD), floored at `min_threshold`. The
 /// median/MAD are robust to the handful of cuts and flashes we are looking
 /// for, so they measure the "ordinary" frame-to-frame change of the footage.
-fn resolve_threshold(d: &[f64], params: &DetectParams) -> f64 {
+pub(crate) fn resolve_threshold(d: &[f64], params: &DetectParams) -> f64 {
     if let Some(t) = params.threshold {
         return t.max(1e-6);
     }
@@ -557,49 +318,23 @@ fn resolve_threshold(d: &[f64], params: &DetectParams) -> f64 {
     (median + params.auto_k * sigma).max(params.min_threshold)
 }
 
-/// Black / white / content from the run's normalized luma extremes.
-///
-/// Black: even the brightest pixel is near black (a 16/235 legal black in
-/// 8-bit is 0.063). White: even the darkest pixel is near white.
-fn classify_run(run_ymin: f64, run_ymax: f64) -> String {
-    if run_ymax < 0.12 {
-        "black".into()
-    } else if run_ymin > 0.85 {
-        "white".into()
-    } else {
-        "content".into()
-    }
-}
-
-/// Thumbnail difference of this frame against the one `back` frames
-/// earlier, if the analysis recorded it.
-fn tdif(f: &Value, back: usize) -> Option<f64> {
-    match back {
-        1 => num(f, "tdif_1"),
-        2 => num(f, "tdif_2"),
-        3 => num(f, "tdif_3"),
-        4 => num(f, "tdif_4"),
-        _ => None,
-    }
-}
-
-fn num(f: &Value, key: &str) -> Option<f64> {
+pub(crate) fn num(f: &Value, key: &str) -> Option<f64> {
     f.get(key).and_then(|v| v.as_f64())
 }
 
-fn frame_num(f: &Value) -> i64 {
+pub(crate) fn frame_num(f: &Value) -> i64 {
     f.get("frame").and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
-fn frame_tc(f: &Value) -> String {
+pub(crate) fn frame_tc(f: &Value) -> String {
     f.get("tc").and_then(|v| v.as_str()).unwrap_or("").to_string()
 }
 
-fn round3(v: f64) -> f64 {
+pub(crate) fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
-fn round4(v: f64) -> f64 {
+pub(crate) fn round4(v: f64) -> f64 {
     (v * 10000.0).round() / 10000.0
 }
 
@@ -965,3 +700,4 @@ mod tests {
         assert!(edl.contains("|C:ResolveColorYellow |M:not checked (grab timeout): c (V1, mid)"), "{edl}");
     }
 }
+

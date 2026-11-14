@@ -2,15 +2,17 @@
 
 pub mod analysis;
 pub mod cache;
-pub mod events;
+pub mod detect;
 pub mod grab;
 pub mod mpv;
 pub mod pixfmt;
 pub mod process;
 pub mod probe;
 pub mod rawstats;
+pub mod references;
 pub mod resolve;
 pub mod state;
+pub mod signatures;
 pub mod sysenv;
 #[cfg(test)]
 pub mod testenv;

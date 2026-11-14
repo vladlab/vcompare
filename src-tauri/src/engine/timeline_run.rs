@@ -480,7 +480,7 @@ pub fn run(p: &RunParams, job: &Arc<Job>, cb: &Callbacks) -> Result<Value, Strin
             let median = ys[ys.len() / 2];
             let peak = ((1u64 << depth) - 1) as f64;
             diag.push(format!("diff_y median {median:.2} codes ({:.2}% of peak)", median / peak * 100.0));
-            if median / peak > crate::engine::events::TIMELINE_MEDIAN_WARN {
+            if median / peak > crate::engine::detect::TIMELINE_MEDIAN_WARN {
                 diag.push(format!(
                     "warning: the file differs from the SDI picture everywhere (median {median:.1} codes): \
                      check levels, matrix, output LUTs and Resolve's monitoring state"
@@ -675,7 +675,7 @@ mod tests {
         // Detection over the result flags exactly the six bad samples.
         let state = crate::engine::state::EngineState::new();
         state.apply_timeline_result(&v);
-        let det = state.detect_events(&Default::default()).unwrap();
+        let det = state.detect_events(&Default::default(), &[]).unwrap();
         let mut flagged: Vec<&str> = det.events.iter().map(|e| e.tc.as_str()).collect();
         flagged.sort();
         assert_eq!(
@@ -842,7 +842,7 @@ mod tests {
         }
         let state = crate::engine::state::EngineState::new();
         state.apply_timeline_result(&v);
-        let det = state.detect_events(&Default::default()).unwrap();
+        let det = state.detect_events(&Default::default(), &[]).unwrap();
         assert_eq!(det.events.len(), 6, "{:?}", det.events.iter().map(|e| &e.tc).collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
     }

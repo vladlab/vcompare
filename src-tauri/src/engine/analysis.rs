@@ -576,18 +576,21 @@ pub fn run_vmaf_analysis(
 /// frames is retried in software.
 ///
 /// `publish` is called with the diagnostics lines whenever they change so
-/// the progress screen can show them. Returns the frames and a one-line
-/// performance summary (fps and what limited it).
+/// the progress screen can show them. Returns the frames, a one-line
+/// performance summary (fps and what limited it), and — when
+/// `want_signatures` — the per-frame picture signatures (image match).
+#[allow(clippy::too_many_arguments)]
 pub fn run_levels_analysis(
     file_path: &str,
     info: &SingleFileInfo,
     hwaccel_available: Option<&str>,
     requested_chunks: Option<u32>,
+    want_signatures: bool,
     progress: Option<ProgressFn>,
     process_handle: ProcessHandle,
     diagnostics: &mut Vec<String>,
     publish: &dyn Fn(&[String]),
-) -> Result<(Vec<Value>, String), String> {
+) -> Result<(Vec<Value>, String, Option<crate::engine::signatures::Signatures>), String> {
     use crate::engine::rawstats::{chunk_count, choose_hwaccel, ChunkSource, RawFormat};
 
     let fmt = RawFormat::for_source(&info.pix_fmt, info.width, info.height)
@@ -658,7 +661,16 @@ pub fn run_levels_analysis(
     } else {
         report.summary()
     };
-    Ok((frames, summary))
+    let sigs = want_signatures.then(|| {
+        use crate::engine::signatures::{Signatures, SIG_LEN};
+        let mut data = Vec::with_capacity(stats.len() * SIG_LEN);
+        for s in &stats {
+            debug_assert_eq!(s.sig.len(), SIG_LEN);
+            data.extend_from_slice(&s.sig);
+        }
+        Signatures { first_frame: info.start_frame, data }
+    });
+    Ok((frames, summary, sigs))
 }
 
 /// Do `warmup` (a chunk's first frames) repeat the end of `stitched`?
@@ -1297,12 +1309,15 @@ mod tests {
             let info = prepare_single_file(&p, &mut d).unwrap();
             let run = |n: u32| {
                 let mut d = Vec::new();
-                run_levels_analysis(&p, &info, None, Some(n), None,
+                run_levels_analysis(&p, &info, None, Some(n), true, None,
                                     crate::engine::process::standalone_job(), &mut d, &|_| {})
                     .unwrap()
             };
-            let (single, s1) = run(1);
-            let (chunked, s4) = run(4);
+            let (single, s1, sig1) = run(1);
+            let (chunked, s4, sig4) = run(4);
+            let (sig1, sig4) = (sig1.unwrap(), sig4.unwrap());
+            assert_eq!(sig1.count(), single.len(), "{name}: one signature per frame");
+            assert!(sig1 == sig4, "{name}: signatures differ between single and chunked");
             assert!(!s1.contains("parallel"), "{name}: {s1}");
             assert!(s4.starts_with("4 parallel decodes"), "{name} didn't chunk: {s4}");
             assert_eq!(single.len(), chunked.len(), "{name}: frame count");

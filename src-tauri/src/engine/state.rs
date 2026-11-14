@@ -7,7 +7,11 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::engine::events::{self, DetectParams, DetectResult, Event};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::engine::detect::{self as events, DetectRequest, DetectResult, Detector, Event, Reference};
+use crate::engine::signatures::{self, Signatures};
 use crate::engine::timecode::TimecodeFormat;
 use crate::engine::types::TimelineInfo;
 
@@ -41,11 +45,14 @@ struct Inner {
     save_path: Option<String>,
     /// Context for mpv (set after analysis completes)
     mpv_context: Option<MpvContext>,
-    /// Events from the last `detect_events` run on these frames.
-    events: Vec<Event>,
-    /// User verdicts ("accept" / "reject") keyed by event first frame.
-    /// Persisted in a small sidecar next to the analysis JSON.
-    reviews: std::collections::BTreeMap<i64, String>,
+    /// Events from the last `detect_events` run of each detector.
+    events: BTreeMap<Detector, Vec<Event>>,
+    /// User verdicts ("accept" / "reject") keyed by `"<detector>:<first
+    /// frame>"`. Persisted in a small sidecar next to the analysis JSON.
+    reviews: BTreeMap<String, String>,
+    /// Picture signatures of a levels analysis (image match). Set straight
+    /// after a run, or read lazily from the `.sig` sidecar.
+    signatures: Option<Arc<Signatures>>,
     /// Timeline mode: the run's report (Resolve target, SDI signal, counts,
     /// timing, diagnostics), passed through to the summary as `timeline_run`.
     run_report: Option<Value>,
@@ -95,8 +102,9 @@ impl EngineState {
                 meta: AnalysisMeta::default(),
                 save_path: None,
                 mpv_context: None,
-                events: Vec::new(),
+                events: BTreeMap::new(),
                 reviews: Default::default(),
+                signatures: None,
                 run_report: None,
             }),
         }
@@ -108,6 +116,7 @@ impl EngineState {
     pub fn apply_diff_result(&self, result: &Value) {
         let mut state = self.inner.lock().unwrap();
         state.events.clear();
+        state.signatures = None;
         state.run_report = None;
         state.frames = result
             .get("frames")
@@ -175,6 +184,7 @@ impl EngineState {
     ) {
         let mut state = self.inner.lock().unwrap();
         state.events.clear();
+        state.signatures = None;
         state.run_report = None;
 
         let has_vmaf = frames
@@ -215,6 +225,7 @@ impl EngineState {
     pub fn apply_levels_result(&self, result: &Value) {
         let mut state = self.inner.lock().unwrap();
         state.events.clear();
+        state.signatures = None;
         state.run_report = None;
         state.frames = result
             .get("frames")
@@ -264,6 +275,7 @@ impl EngineState {
     pub fn apply_timeline_result(&self, result: &Value) {
         let mut state = self.inner.lock().unwrap();
         state.events.clear();
+        state.signatures = None;
         state.frames = result
             .get("frames")
             .and_then(|v| v.as_array())
@@ -310,34 +322,47 @@ impl EngineState {
             .as_deref()
             .and_then(|p| std::fs::read_to_string(reviews_path(p)).ok())
             .and_then(|s| serde_json::from_str::<ReviewsFile>(&s).ok())
-            .map(|f| f.reviews)
+            .map(|f| {
+                // Version 1 keyed by bare frame number: those were flash
+                // verdicts (or timeline flags, which the flash detector
+                // reports too).
+                f.reviews
+                    .into_iter()
+                    .map(|(k, v)| if k.contains(':') { (k, v) } else { (format!("flash:{k}"), v) })
+                    .collect()
+            })
             .unwrap_or_default();
         if !state.reviews.is_empty() {
             eprintln!("[vcompare] loaded {} event reviews", state.reviews.len());
         }
         let st = &mut *state;
-        for e in st.events.iter_mut() {
-            e.review = st.reviews.get(&e.frame).cloned();
+        for (d, evs) in st.events.iter_mut() {
+            for e in evs.iter_mut() {
+                e.review = st.reviews.get(&review_key(*d, e.frame)).cloned();
+            }
         }
         st.save_path = path;
     }
 
     /// Record (or clear, with `None`) the verdict on the event starting at
     /// `frame`, and save the verdicts next to the analysis.
-    pub fn set_event_review(&self, frame: i64, review: Option<&str>) -> Result<Value, String> {
+    pub fn set_event_review(&self, detector: Detector, frame: i64, review: Option<&str>) -> Result<Value, String> {
         let mut state = self.inner.lock().unwrap();
+        let key = review_key(detector, frame);
         match review {
             Some(r) if r == "accept" || r == "reject" => {
-                state.reviews.insert(frame, r.to_string());
+                state.reviews.insert(key, r.to_string());
             }
             Some(other) => return Err(format!("unknown review {other:?}")),
             None => {
-                state.reviews.remove(&frame);
+                state.reviews.remove(&key);
             }
         }
-        for e in state.events.iter_mut() {
-            if e.frame == frame {
-                e.review = review.map(String::from);
+        if let Some(evs) = state.events.get_mut(&detector) {
+            for e in evs.iter_mut() {
+                if e.frame == frame {
+                    e.review = review.map(String::from);
+                }
             }
         }
         if let Some(ref sp) = state.save_path {
@@ -346,7 +371,7 @@ impl EngineState {
                 let _ = std::fs::remove_file(&path);
             } else {
                 let file = ReviewsFile {
-                    version: 1,
+                    version: 2,
                     ref_path: state.meta.ref_path.clone(),
                     reviews: state.reviews.clone(),
                 };
@@ -356,6 +381,7 @@ impl EngineState {
             }
         }
         Ok(serde_json::json!({
+            "detector": detector,
             "frame": frame,
             "review": review,
             "saved": state.save_path.is_some(),
@@ -373,6 +399,7 @@ impl EngineState {
         state.save_path = None;
         state.mpv_context = None;
         state.events.clear();
+        state.signatures = None;
         state.run_report = None;
     }
 
@@ -457,6 +484,15 @@ impl EngineState {
         if let Some(ref r) = state.run_report {
             summary["timeline_run"] = r.clone();
             summary["ref_path"] = serde_json::json!(meta.ref_path);
+        }
+
+        if mode == "levels" {
+            let on_disk = state
+                .save_path
+                .as_deref()
+                .map(|p| std::path::Path::new(&signatures::sidecar_path(p)).is_file())
+                .unwrap_or(false);
+            summary["has_signatures"] = serde_json::json!(state.signatures.is_some() || on_disk);
         }
 
         // Add timeline info if available
@@ -684,30 +720,94 @@ impl EngineState {
 
     // ─── Events ─────────────────────────────────────────────────────────
 
-    /// Run flash detection over the loaded frames and remember the result.
-    pub fn detect_events(&self, params: &DetectParams) -> Result<DetectResult, String> {
+    /// Run one detector over the loaded frames and remember its events.
+    /// `refs`: the reference pictures a match request names (the caller
+    /// loads them; unused by the other detectors).
+    pub fn detect_events(&self, request: &DetectRequest, refs: &[Reference]) -> Result<DetectResult, String> {
         let mut state = self.inner.lock().unwrap();
         let mode = state
             .analysis_mode
             .clone()
             .ok_or("No analysis loaded")?;
         let bit_depth = state.meta.bit_depth.unwrap_or(8);
-        let result = events::detect_flashes(&mode, &state.frames, bit_depth, params)?;
+        let mut result = match request {
+            DetectRequest::Flash(p) => events::detect_flashes(&mode, &state.frames, bit_depth, p)?,
+            DetectRequest::Repeat(p) => {
+                if mode != "levels" {
+                    return Err(format!("Repeated-frame detection is not available for {mode} mode"));
+                }
+                events::detect_repeats(&state.frames, bit_depth, p)?
+            }
+            DetectRequest::Match(p) => {
+                if mode != "levels" {
+                    return Err(format!("Image match is not available for {mode} mode"));
+                }
+                let sigs = Self::signatures_locked(&mut state)?;
+                events::matcher::detect_matches(&state.frames, &sigs, refs, p)?
+            }
+        };
+        let detector = request.detector();
         eprintln!(
-            "[vcompare] detect_events({mode}): {} events, threshold={}",
+            "[vcompare] detect_events({mode}, {}): {} events, threshold={}",
+            detector.as_str(),
             result.events.len(),
             result.threshold
         );
-        let mut result = result;
         for e in result.events.iter_mut() {
-            e.review = state.reviews.get(&e.frame).cloned();
+            e.review = state.reviews.get(&review_key(detector, e.frame)).cloned();
         }
-        state.events = result.events.clone();
+        state.events.insert(detector, result.events.clone());
         Ok(result)
     }
 
+    /// Keep the signatures a levels run just computed.
+    pub fn set_signatures(&self, sigs: Option<Signatures>) {
+        self.inner.lock().unwrap().signatures = sigs.map(Arc::new);
+    }
+
+    /// The signatures of the loaded levels analysis, reading the sidecar
+    /// on first use.
+    pub fn signatures(&self) -> Result<Arc<Signatures>, String> {
+        let mut state = self.inner.lock().unwrap();
+        Self::signatures_locked(&mut state)
+    }
+
+    fn signatures_locked(state: &mut Inner) -> Result<Arc<Signatures>, String> {
+        if let Some(ref s) = state.signatures {
+            return Ok(s.clone());
+        }
+        let path = state
+            .save_path
+            .as_deref()
+            .map(signatures::sidecar_path)
+            .ok_or("This analysis has no frame signatures — re-run it with \"keep frame signatures\" on")?;
+        if !std::path::Path::new(&path).is_file() {
+            return Err("This analysis has no frame signatures — re-run it with \"keep frame signatures\" on".into());
+        }
+        let sigs = Signatures::read(&path)?;
+        let first = state.frames.first().and_then(|f| f.get("frame")).and_then(|v| v.as_i64());
+        if first != Some(sigs.first_frame) || sigs.count() != state.frames.len() {
+            return Err("The frame signatures are out of date — re-run the analysis".into());
+        }
+        let sigs = Arc::new(sigs);
+        state.signatures = Some(sigs.clone());
+        Ok(sigs)
+    }
+
+    /// Events of `detector`, or of every detector (sorted by frame) for `None`.
+    fn events_for(state: &Inner, detector: Option<Detector>) -> Vec<Event> {
+        match detector {
+            Some(d) => state.events.get(&d).cloned().unwrap_or_default(),
+            None => {
+                let mut all: Vec<Event> = state.events.values().flatten().cloned().collect();
+                all.sort_by_key(|e| e.frame);
+                all
+            }
+        }
+    }
+
     /// Export the current events to CSV.
-    pub fn export_events_csv(&self, path: Option<&str>) -> Result<Value, String> {
+    pub fn export_events_csv(&self, detector: Option<Detector>, path: Option<&str>) -> Result<Value, String> {
         let state = self.inner.lock().unwrap();
         if state.frames.is_empty() {
             return Err("No analysis loaded".into());
@@ -724,15 +824,16 @@ impl EngineState {
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf();
-                let what = if state.analysis_mode.as_deref() == Some("timeline") { "timeline_flags" } else { "flash_frames" };
+                let what = export_stem(state.analysis_mode.as_deref(), detector, "flags", "frames");
                 dir.join(format!("{stem}_{what}.csv"))
                     .to_string_lossy()
                     .to_string()
             }
         };
 
+        let events = Self::events_for(&state, detector);
         let mut csv = String::from("frame,timecode,length,kind,subkind,at_cut,score,review,label\n");
-        for e in &state.events {
+        for e in &events {
             csv.push_str(&format!(
                 "{},{},{},{},{},{},{:.3},{},{}\n",
                 e.frame, e.tc, e.length, e.kind, e.subkind, e.at_cut, e.score,
@@ -746,12 +847,12 @@ impl EngineState {
 
         Ok(serde_json::json!({
             "path": output_path,
-            "rows": state.events.len(),
+            "rows": events.len(),
         }))
     }
 
     /// Export the current events as a DaVinci Resolve marker EDL.
-    pub fn export_events_edl(&self, path: Option<&str>) -> Result<Value, String> {
+    pub fn export_events_edl(&self, detector: Option<Detector>, path: Option<&str>) -> Result<Value, String> {
         let state = self.inner.lock().unwrap();
         if state.frames.is_empty() {
             return Err("No analysis loaded".into());
@@ -773,20 +874,21 @@ impl EngineState {
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf();
-                let what = if state.analysis_mode.as_deref() == Some("timeline") { "timeline_markers" } else { "flash_markers" };
+                let what = export_stem(state.analysis_mode.as_deref(), detector, "markers", "markers");
                 dir.join(format!("{stem}_{what}.edl"))
                     .to_string_lossy()
                     .to_string()
             }
         };
 
-        let edl = events::events_to_resolve_edl(&state.events, &tc_fmt, &stem);
+        let events = Self::events_for(&state, detector);
+        let edl = events::events_to_resolve_edl(&events, &tc_fmt, &stem);
         std::fs::write(&output_path, edl.as_bytes())
             .map_err(|e| format!("Failed to write EDL: {e}"))?;
 
         Ok(serde_json::json!({
             "path": output_path,
-            "rows": state.events.len(),
+            "rows": events.len(),
         }))
     }
 
@@ -854,7 +956,21 @@ fn round4(v: f64) -> f64 {
 struct ReviewsFile {
     version: u32,
     ref_path: String,
-    reviews: std::collections::BTreeMap<i64, String>,
+    reviews: BTreeMap<String, String>,
+}
+
+/// Default export file name part: `timeline_flags`, `flash_frames`,
+/// `repeat_frames`, `match_frames`, `all_events` (CSV) / `…_markers` (EDL).
+fn export_stem(mode: Option<&str>, detector: Option<Detector>, timeline_suffix: &str, suffix: &str) -> String {
+    match (mode, detector) {
+        (Some("timeline"), _) => format!("timeline_{timeline_suffix}"),
+        (_, None) => if suffix == "frames" { "all_events".into() } else { "all_markers".into() },
+        (_, Some(d)) => format!("{}_{suffix}", d.as_str()),
+    }
+}
+
+fn review_key(d: Detector, frame: i64) -> String {
+    format!("{}:{frame}", d.as_str())
 }
 
 /// `X.levels.json` → `X.levels.reviews.json` (same for `.vcompare.json`).

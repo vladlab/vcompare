@@ -218,6 +218,9 @@ pub struct FrameStats {
     /// Thumbnail difference vs frame i-1 … i-4 (normalized 0..1); 0 when
     /// that frame doesn't exist.
     pub tdif: [f64; TDIF_DEPTH],
+    /// Picture signature (`engine::signatures`, SIG_LEN bytes). Not part
+    /// of the frame JSON; written to the analysis's `.sig` sidecar.
+    pub sig: Vec<u8>,
 }
 
 /// Sample counts outside the legal range for one frame.
@@ -491,43 +494,7 @@ fn plane_absdiff_sum(a: &[u8], b: &[u8], two_byte: bool) -> u64 {
 
 /// Box-average a luma plane onto the THUMB_W × THUMB_H grid, normalized 0..1.
 fn luma_thumbnail(plane: &[u8], w: usize, h: usize, two_byte: bool, peak: f64) -> Vec<f32> {
-    let mut sums = vec![0u64; THUMB_CELLS];
-    let mut counts = vec![0u64; THUMB_CELLS];
-
-    // Cell boundaries along x, so each cell's row segment is a contiguous
-    // slice (which keeps the inner sum a simple vectorizable loop).
-    let mut xb = [0usize; THUMB_W + 1];
-    for (tx, b) in xb.iter_mut().enumerate() {
-        *b = tx * w / THUMB_W;
-    }
-
-    let bps = if two_byte { 2 } else { 1 };
-    for y in 0..h {
-        let ty = y * THUMB_H / h;
-        let row = &plane[y * w * bps..(y + 1) * w * bps];
-        for tx in 0..THUMB_W {
-            let (x0, x1) = (xb[tx], xb[tx + 1]);
-            if x1 <= x0 {
-                continue;
-            }
-            let seg = &row[x0 * bps..x1 * bps];
-            let s: u64 = if two_byte {
-                seg.chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]) as u64)
-                    .sum()
-            } else {
-                seg.iter().map(|&v| v as u64).sum()
-            };
-            let cell = ty * THUMB_W + tx;
-            sums[cell] += s;
-            counts[cell] += (x1 - x0) as u64;
-        }
-    }
-
-    sums.iter()
-        .zip(&counts)
-        .map(|(&s, &c)| if c == 0 { 0.0 } else { (s as f64 / c as f64 / peak) as f32 })
-        .collect()
+    crate::engine::signatures::grid_average(plane, w, h, two_byte, peak, THUMB_W, THUMB_H)
 }
 
 fn thumb_distance(a: &[f32], b: &[f32]) -> f64 {
@@ -597,6 +564,16 @@ fn compute_frame(fmt: &RawFormat, frame: &[u8], prev: Option<&[u8]>) -> (FrameSt
 
     let (yw, yh) = fmt.plane_dims(0);
     let thumb = luma_thumbnail(&frame[fmt.plane_range(0)], yw, yh, two, fmt.peak());
+    let (cw, ch) = fmt.plane_dims(1);
+    let sig = crate::engine::signatures::build(
+        &thumb,
+        &frame[fmt.plane_range(1)],
+        &frame[fmt.plane_range(2)],
+        cw,
+        ch,
+        two,
+        fmt.peak(),
+    );
 
     let stats = FrameStats {
         y_min: py.min,
@@ -619,6 +596,7 @@ fn compute_frame(fmt: &RawFormat, frame: &[u8], prev: Option<&[u8]>) -> (FrameSt
         u_dif: difs[1],
         v_dif: difs[2],
         tdif: [0.0; TDIF_DEPTH],
+        sig,
     };
     (stats, thumb)
 }
