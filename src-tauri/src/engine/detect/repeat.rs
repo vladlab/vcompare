@@ -283,4 +283,36 @@ mod tests {
         let f = vec![json!({"frame": 0, "y_max": 200.0})];
         assert!(detect_repeats(&f, 8, &RepeatParams::default()).is_err());
     }
+
+    /// End to end: a ProRes clip with one frame doubled (as a bad retime or
+    /// a conform slip leaves it), through the levels engine.
+    #[test]
+    fn finds_doubled_frame_in_analysed_clip() {
+        let dir = std::env::temp_dir().join(format!("vcompare_repeat_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("dup.mov").to_string_lossy().to_string();
+        let ok = crate::engine::sysenv::command("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=3",
+                   "-vf", "loop=loop=1:size=1:start=30,setpts=N/24/TB", "-frames:v", "72",
+                   "-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le", &clip])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("ffmpeg unavailable; skipping");
+            return;
+        }
+        let mut d = Vec::new();
+        let info = crate::engine::analysis::prepare_single_file(&clip, &mut d).unwrap();
+        let (frames, _, _) = crate::engine::analysis::run_levels_analysis(
+            &clip, &info, None, Some(1), false, None, crate::engine::process::standalone_job(), &mut d, &|_| {},
+        )
+        .unwrap();
+        let r = detect_repeats(&frames, info.bit_depth, &RepeatParams::default()).unwrap();
+        let got: Vec<(i64, u32)> = r.events.iter().map(|e| (e.frame - info.start_frame, e.length)).collect();
+        // ffmpeg's loop filter repeats the frame *before* `start` here:
+        // framemd5 shows frames 29 and 30 identical, so the repeat is 30.
+        assert_eq!(got, vec![(30, 1)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

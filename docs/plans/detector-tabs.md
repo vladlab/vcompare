@@ -1,7 +1,31 @@
 # Plan: full-width chart, tabs below, and more detectors
 
 Branch: `detector-tabs` (off `timeline-compare` at `7a03e1e`). **Status:
-plan only, nothing built.**
+§1–§5 built (2026-11-14).** Every gate that can pass without real footage
+and the real app has: 119 engine tests (including end to end through the
+levels engine: a card spliced into a ProRes clip found as one event from a
+PNG of it; a doubled frame found where framemd5 says it is; signatures
+identical between single and chunked runs on MOV / MXF / MKV), and the UI
+driven in a browser against a mocked engine (levels, diff, timeline: tab
+counts, settle delay — first strip 2.5 s after release, none while
+dragging — at most 3 strips in flight, keyboard review, split persisted).
+Still open, needs the office machine: §2's timing on a real 90-minute
+ProRes and an IMF, §4 and §5's gates on real deliverables (Resolve and Avid
+offline cards through the output transform), the look in WebKitGTK.
+
+Differences from the plan, found while building:
+- Reviews are keyed by *detector* (`flash:123`), not kind: timeline flags
+  come from the flash detector, so a v1 bare key is simply `flash:<n>`.
+- Repeat: no `tdif_1` guard. A mean |Δ| is zero only for identical frames;
+  the guard could only matter for rounding, where the coarser thumbnail
+  can't help.
+- Match strips show prev + the first matching frames (+n), not first / last
+  / next: one contiguous seek per strip.
+- `thumbs::extract_frames` renumbers timestamps after the seek
+  (`settb=1/10,setpts=N`). Under load, ffmpeg 6.1 sometimes handed the
+  MJPEG encoder two frames with the same pts after a seek in Matroska and
+  dropped the rest of the strip ("Invalid pts"); in-row thumbnails made
+  that load the normal case.
 
 Five parts. 1–3 are one piece of work (the UI rework and the engine
 scaffolding it needs). 4 and 5 are new detectors that drop into it; 5 needs

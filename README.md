@@ -9,7 +9,7 @@ engine driving ffmpeg.
 |------|--------|----------------|---------|
 | `diff` | reference + distorted | `psnr` (+ optional `ssim`) | `diff_y/u/v` (RMS pixel difference), `ssim*` |
 | `vmaf` | reference + distorted | `libvmaf` / `libvmaf_cuda` | `vmaf`, `psnr` |
-| `levels` | single file | native stats (ffmpeg decode → raw pipe) | `y/u/v_min/max`, `y/u/v_avg`, `y/u/v_dif` |
+| `levels` | single file | native stats (ffmpeg decode → raw pipe) | `y/u/v_min/max`, `y/u/v_avg`, `y/u/v_dif` (+ frame signatures for image match) |
 | `timeline` | single file + Resolve's SDI output | `psnr` per sample | `diff_y/u/v` at the first / middle / last frame of every clip |
 
 Both comparison modes sync the two files by start-of-file or by embedded
@@ -43,6 +43,42 @@ Results are cached as `.vcompare.json` next to the reference file and can be
 reopened from the Recent Analyses list, exported to CSV, and scrubbed in mpv
 (side-by-side or difference view).
 
+### Results layout
+
+The chart runs the full width of the window. Below it (drag the handle
+between them to resize; the split is remembered) a tab strip holds the frame
+table and one tab per detector, each full width:
+
+| Tab | Modes | Finds |
+|-----|-------|-------|
+| Frames | all | the per-frame table |
+| Flash frames | `levels`, `diff` | stray 1–3 frame flashes (below) |
+| Mismatches | `timeline` | flagged samples (see Timeline mode) |
+| Repeats | `levels` | frames identical (or nearly) to the one before |
+| Image match | `levels` | frames that look like a reference picture |
+| Report | `timeline` | the run report |
+
+Detector tabs carry a count; every detector runs when an analysis opens. A
+tab that can't run on an older cache stays visible, greyed, with the reason.
+The chart and timeline-bar markers show the active detector tab's events (or
+the last one visited, while on Frames), and `↑` / `↓`, `y` / `x` act on it.
+`1`–`5` switch tabs.
+
+Every event row carries a filmstrip: the frame before, the event's frames
+(long runs are capped, with "+n") and the frame after; both files side by
+side in a comparison, the reference picture first in Image match. Strips
+load lazily — only for rows on screen, three at a time, and only once a
+detector's settings have been left alone for 2.5 s, so dragging a threshold
+never starts an ffmpeg. They are cached, so events that survive a threshold
+change keep theirs.
+
+Each event can be accepted or rejected (`y` / `x`); verdicts are saved per
+detector in `<analysis>.reviews.json` next to the analysis and come back when
+it's reopened. Each tab exports its events as CSV (with the verdict) or as a
+DaVinci Resolve marker EDL (Timeline › Import › Timeline Markers from EDL;
+rejected events are left out). Marker colours: flashes by look (content red,
+white yellow, black purple, cyan at a cut), repeats green, matches pink.
+
 ### Flash-frame detection
 
 `levels` and `diff` analyses feed an event detector that finds flash frames:
@@ -51,17 +87,40 @@ neighbours agree with each other (which is what separates a flash from a cut).
 Flashes are sub-classified as black, white, or content. For native levels
 analyses, whether the neighbours agree is judged from small luma thumbnails
 of the frames on either side; older caches fall back to average luma and
-chroma. Detection runs over
-the cached per-frame stats, so sensitivity can be tuned live without
-re-running ffmpeg. Events are shown as markers on the timeline and chart,
-listed in a panel, and navigable with `↑` / `↓` (which also seeks mpv). The
-event you picked stays highlighted while you shuttle around it, with a
-filmstrip of the frame before, the flash frame(s) and the frame after (both
-files in a comparison). Each event can be accepted or rejected (`y` / `x`);
-verdicts are saved in `<analysis>.reviews.json` next to the analysis and come
-back when it's reopened. Events export as CSV (with the verdict) or as a
-DaVinci Resolve marker EDL (Timeline › Import › Timeline Markers from EDL;
-colour by kind, cyan for at-cut; rejected events are left out).
+chroma. Detection runs over the cached per-frame stats, so sensitivity can
+be tuned live without re-running ffmpeg.
+
+### Repeated frames
+
+A repeat is a frame whose recorded difference from the previous frame is
+zero (**exact**, right for intra codecs: a frame repeated in the source
+decodes bit-identical) or under a tolerance (long-GOP deliverables repeat to
+*near* zero). By default only short runs are listed (1–5 repeated frames);
+**holds** adds longer ones (freezes, stills, titles), and repeated black is
+skipped unless asked for. When most repeats fall at one interval the tab says
+so ("repeats every 5 frames") — that is a frame-rate conversion or pulldown
+cadence rather than isolated faults. Nothing new is decoded: it uses the
+levels analysis's own frame differences.
+
+### Image match
+
+Finds frames that look like a reference picture: Resolve's Media Offline,
+Avid's offline slide, a slate, a missing-render card. A levels analysis keeps
+a tiny signature of every frame (32×18 luma and 16×9 chroma averages, 864
+bytes a frame, in `<analysis>.sig` next to the analysis; **Keep frame
+signatures** in the levels options, on by default — a 2-hour feature at 24
+fps is about 150 MB). Matching is a correlation of those grids, so a card
+that went through a LUT, a range change or an HDR output transform still
+matches; a flat-colour reference is matched by colour instead. Runs of
+matching frames are one event each.
+
+References are added once and offered for every analysis (they live in the
+app's data directory): **+ image…** fits an image file into the analysed
+file's frame (scaled to fit, centred on black, converted the way the file is
+encoded), **+ this frame** takes the signature of the frame under the cursor —
+exact, and the reliable route when a still of the card doesn't look like what
+the deliverable carries. None are shipped: Resolve's and Avid's cards are
+theirs. Tick the references to look for; double-click a name to rename it.
 
 ### DaVinci Resolve sync
 
@@ -155,7 +214,15 @@ src-tauri/
 │   └── engine/
 │       ├── analysis.rs        ffmpeg command construction + stats parsing
 │       ├── rawstats.rs        Native per-frame stats over a rawvideo pipe
-│       ├── events.rs          Flash-frame / spike detection over series
+│       ├── detect/            Event detectors over per-frame data
+│       │   ├── mod.rs         Event, DetectRequest, Resolve marker EDL
+│       │   ├── flash.rs       Flash frames (levels, diff)
+│       │   ├── repeat.rs      Repeated frames (levels)
+│       │   ├── matcher.rs     Image match over frame signatures
+│       │   └── timeline.rs    Timeline mode: flagged samples
+│       ├── signatures.rs      Per-frame picture signatures + .sig sidecar
+│       ├── references.rs      Image-match reference store
+│       ├── thumbs.rs          Event filmstrips (ffmpeg → JPEG)
 │       ├── state.rs           In-memory analysis results, queries, CSV export
 │       ├── cache.rs           .vcompare.json load/save
 │       ├── probe.rs           ffprobe, capability detection
@@ -175,11 +242,16 @@ scripts/dev/                   fake_scopetap_grab.py, fake_timeline_demo.sh
 src/
 ├── App.svelte                 State machine: pick → analyze → view
 ├── lib/rpc.ts                 Typed invoke() wrappers + event listeners
+├── lib/detectors.ts           Tab registry, detector defaults, strip spans
+├── lib/thumbLoader.svelte.ts  Lazy, bounded filmstrip loading
+├── lib/eventColors.ts         Marker colours shared by chart, bar, lists
 └── components/
     ├── MetricChart.svelte     uPlot detail + overview minimap
     ├── TimelineBar.svelte     Ref/dist overlap + event markers
     ├── FrameTable.svelte      Virtual-scrolled frame table
-    ├── EventPanel.svelte      Flash-frame detector controls + event list
+    ├── TabStrip.svelte        Tabs under the chart
+    ├── DetectorTab.svelte     A detector's toolbar + list (+ references)
+    ├── EventList.svelte       Virtualised event rows with filmstrips
     ├── TimelineSetup.svelte   Timeline mode: Resolve tracks, start
     └── TimelineReport.svelte  Timeline mode: what a run looked at
 ```
@@ -225,7 +297,8 @@ install them from your distribution.
 |-----|--------|
 | `m` | cycle active metric |
 | `t` / `T` | auto-threshold from active metric / clear threshold |
-| `↑` / `↓` (or `n` / `N`) | previous / next flash event |
+| `1`–`5` | switch tab under the chart |
+| `↑` / `↓` (or `n` / `N`) | previous / next event of the active detector |
 | `y` / `x` | accept / reject the picked event |
 | `r` | toggle DaVinci Resolve playhead sync |
 | `Esc` | cancel the running analysis (nothing is saved) |

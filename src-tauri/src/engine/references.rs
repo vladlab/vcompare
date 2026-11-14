@@ -240,4 +240,50 @@ mod tests {
         assert!(store.list().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// End to end: a clip with an offline-style card spliced in, analysed
+    /// by the levels engine, matched against a PNG of the card (made
+    /// separately, RGB, another size) — found as one event, nothing else.
+    #[test]
+    fn finds_spliced_card_in_analysed_clip() {
+        if !ffmpeg_ok() {
+            eprintln!("ffmpeg unavailable; skipping");
+            return;
+        }
+        use crate::engine::detect::matcher::detect_matches;
+        use crate::engine::detect::MatchParams;
+        let dir = std::env::temp_dir().join(format!("vcompare_card_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let card = "color=c=0x8a1010:s=640x360,drawbox=x=200:y=140:w=240:h=80:color=white:t=fill,\
+                    drawbox=x=0:y=300:w=640:h=8:color=0x404040:t=fill";
+        let png = make_png(&dir, "card.png", &card.replace("640x360", "1280x720").replace("x=200:y=140:w=240:h=80", "x=400:y=280:w=480:h=160").replace("y=300:w=640:h=8", "y=600:w=1280:h=16"));
+        let clip = dir.join("reel.mov").to_string_lossy().to_string();
+        let graph = format!(
+            "testsrc2=s=640x360:r=24:d=2[a];{card},trim=duration=1,fps=24[b];mandelbrot=s=640x360:r=24,trim=duration=2[c];[a][b][c]concat=n=3:v=1:a=0,format=yuv422p10le"
+        );
+        let ok = crate::engine::sysenv::command("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-y", "-filter_complex", &graph, "-c:v", "prores_ks", "-profile:v", "3", &clip])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "could not make the clip");
+
+        let mut d = Vec::new();
+        let info = crate::engine::analysis::prepare_single_file(&clip, &mut d).unwrap();
+        let (frames, _, sigs) = crate::engine::analysis::run_levels_analysis(
+            &clip, &info, None, Some(1), true, None, crate::engine::process::standalone_job(), &mut d, &|_| {},
+        )
+        .unwrap();
+        let sigs = sigs.unwrap();
+        let reference = Reference {
+            id: "card".into(),
+            name: "card".into(),
+            sig: signature_from_image(&png, info.width, info.height, info.full_range).unwrap(),
+        };
+        let r = detect_matches(&frames, &sigs, &[reference], &MatchParams::default()).unwrap();
+        let got: Vec<(i64, u32)> = r.events.iter().map(|e| (e.frame - info.start_frame, e.length)).collect();
+        eprintln!("matches: {got:?} (scores {:?})", r.events.iter().map(|e| e.score).collect::<Vec<_>>());
+        assert_eq!(got, vec![(48, 24)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
