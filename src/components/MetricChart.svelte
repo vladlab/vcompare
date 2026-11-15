@@ -230,11 +230,37 @@
 
   // ── Y-axis range logic ──
 
+  // Min / max of the series, found once per series: uPlot asks for the
+  // y-range on every zoom step. (A loop, not Math.min(...values): spreading
+  // a feature's worth of frames is slow and can overflow the stack.)
+  let extent = $derived.by(() => {
+    let min = Infinity, max = -Infinity;
+    for (const v of series?.values ?? []) {
+      if (v == null) continue;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    return min <= max ? { min, max } : { min: 0, max: 0 };
+  });
+
+  /** Index of `frame` in the (ascending) series, or -1. */
+  function indexOfFrame(frame: number): number {
+    const f = series?.frames;
+    if (!f) return -1;
+    let lo = 0, hi = f.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (f[mid] === frame) return mid;
+      if (f[mid] < frame) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return -1;
+  }
+
   function yRange(): [number, number] {
     if (metric === "vmaf") return [0, 100];
     if (series && series.values.length > 0) {
-      const min = Math.min(...series.values);
-      const max = Math.max(...series.values);
+      const { min, max } = extent;
       if (metric.startsWith("diff")) {
         const pad = max * 0.05 || 0.5;
         return [0, max + pad];
@@ -421,7 +447,7 @@
             ctx.lineTo(x, u.bbox.top + u.bbox.height);
             ctx.stroke();
 
-            const idx = series.frames.indexOf(cursorFrame);
+            const idx = indexOfFrame(cursorFrame);
             if (idx >= 0 && idx < series.values.length) {
               const y = u.valToPos(series.values[idx], "y", true);
               ctx.fillStyle = PLAYHEAD_DOT_COLOR;

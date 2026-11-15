@@ -146,7 +146,10 @@
 
   // Analysis results
   let summary: AnalysisSummary | null = $state(null);
-  let metricSeries: Record<string, MetricSeries> = $state({});
+  // Raw, not deep-reactive: the chart reads every point of these on every
+  // redraw, and a reactive proxy makes each read many times slower. Replace
+  // the object to update it.
+  let metricSeries: Record<string, MetricSeries> = $state.raw({});
 
   // Progress
   let progressCurrent: number = $state(0);
@@ -268,6 +271,7 @@
 
   /** y / x on the picked event. */
   function reviewSelected(review: EventReview) {
+    if (!activeDetector) return;
     const kind = markerDetector;
     const frame = selectedEvent[kind];
     const ev = detectResults[kind]?.events.find((e) => e.frame === frame);
@@ -441,7 +445,13 @@
       : []
   );
   let detectAvailable = $derived(liveDetectors.includes("flash"));
-  let markerEvents = $derived(detectResults[markerDetector]?.events ?? []);
+  /** On a detector tab: its detector. On Frames / Report: none, so the
+   *  chart shows the signal alone and the event keys do nothing. */
+  let activeDetector = $derived(tabDefs.find((t) => t.id === activeTab)?.detector ?? null);
+  // A plain copy: the chart walks these on every redraw.
+  let markerEvents = $derived(
+    activeDetector ? $state.snapshot(detectResults[activeDetector]?.events ?? []) : []
+  );
   let previewFiles = $derived(summary?.mode === "diff" || summary?.mode === "vmaf" ? 2 : 1);
 
   function resetDetectors() {
@@ -510,6 +520,7 @@
 
   /** Jump to the next (dir=1) or previous (dir=-1) event from the cursor. */
   function jumpToEvent(dir: 1 | -1) {
+    if (!activeDetector) return;
     const kind = markerDetector;
     const events = detectResults[kind]?.events ?? [];
     if (events.length === 0) return;
@@ -820,8 +831,15 @@
   let jobToken = 0;
   let cancelling: boolean = $state(false);
 
-  function beginJob(): number {
+  /** The "analyzing" state is also used while a saved analysis is read
+   *  back in; the progress view words itself by this. */
+  let loadingSaved: string | null = $state(null);
+
+  function beginJob(loading: string | null = null): number {
     cancelling = false;
+    loadingSaved = loading;
+    progressCurrent = 0;
+    progressTotal = 0;
     return ++jobToken;
   }
 
@@ -857,7 +875,9 @@
     // Fetch series for each available metric
     for (const m of result.metrics_available) {
       try {
-        metricSeries[m] = await getMetricSeries(m);
+        const s = await getMetricSeries(m);
+        if (token !== jobToken) return;
+        metricSeries = { ...metricSeries, [m]: s };
       } catch (e) {
         console.error(`Failed to fetch series for ${m}:`, e);
       }
@@ -975,7 +995,7 @@
 
   async function loadCached() {
     if (!cacheInfo?.path) return;
-    const token = beginJob();
+    const token = beginJob(cacheInfo.path);
     state = "analyzing";
     try {
       const result = await loadSavedAnalysis(cacheInfo.path);
@@ -996,7 +1016,7 @@
     }
     // Set cacheInfo so finishAnalysis can record it back to recents
     cacheInfo = { exists: true, path: entry.cache_path, frame_count: entry.frame_count, mode: entry.mode };
-    const token = beginJob();
+    const token = beginJob(entry.cache_path);
     state = "analyzing";
     try {
       const result = await loadSavedAnalysis(entry.cache_path);
@@ -1539,17 +1559,21 @@
       <!-- Progress view -->
       <div class="progress-panel">
         <h2>
-          {#if analysisMode === "timeline"}
+          {#if loadingSaved}
+            Opening saved analysis…
+          {:else if analysisMode === "timeline"}
             Checking the timeline…
           {:else}
             Analyzing… ({analysisMode === "diff" ? "pixel diff" : analysisMode === "levels" ? "levels" : "VMAF"})
           {/if}
         </h2>
         <div class="progress-bar-container">
-          <div class="progress-bar" style="width: {progressPct}%"></div>
+          <div class="progress-bar" class:indeterminate={!!loadingSaved} style="width: {loadingSaved ? 100 : progressPct}%"></div>
         </div>
         <div class="progress-label mono">
-          {#if analysisMode === "timeline" && timelineProgress}
+          {#if loadingSaved}
+            Reading {loadingSaved.split("/").pop()} — nothing is being re-analysed
+          {:else if analysisMode === "timeline" && timelineProgress}
             sample {timelineProgress.done.toLocaleString()} / {timelineProgress.total.toLocaleString()}
             {#if timelineProgress.tc}· {timelineProgress.tc} · {timelineProgress.clip}{/if}
             {#if timelineProgress.eta_s != null && timelineProgress.done < timelineProgress.total}· ~{fmtDuration(timelineProgress.eta_s)} left{/if}
@@ -1566,10 +1590,10 @@
             Starting FFmpeg…
           {/if}
         </div>
-        {#if diagnosticLines.length > 0}
+        {#if diagnosticLines.length > 0 && !loadingSaved}
           <pre class="diagnostics mono">{diagnosticLines.join("\n")}</pre>
         {/if}
-        <div class="progress-actions">
+        <div class="progress-actions" class:hidden={!!loadingSaved}>
           <button class="cancel-btn" onclick={handleCancel} disabled={cancelling} title="Stop the analysis (Esc). Nothing is saved.">
             {cancelling ? "Cancelling…" : "Cancel"}
           </button>
@@ -1684,7 +1708,7 @@
         <kbd>m</kbd> metric
         <kbd>t</kbd> threshold
         <kbd>1</kbd>–<kbd>{tabItems.length}</kbd> tabs
-        {#if liveDetectors.length > 0}
+        {#if activeDetector}
           <kbd>↑</kbd><kbd>↓</kbd> {isTimeline ? "flagged" : { flash: "flash", repeat: "repeat", match: "match" }[markerDetector]}
           <kbd>y</kbd><kbd>x</kbd> accept/reject
         {/if}
@@ -1916,6 +1940,15 @@
     transition: width 0.2s ease;
     border-radius: 3px;
   }
+  .progress-bar.indeterminate {
+    opacity: 0.5;
+    animation: loading-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes loading-pulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 0.6; }
+  }
+  .progress-actions.hidden { display: none; }
   .progress-label {
     color: var(--text-secondary);
     font-size: 12px;

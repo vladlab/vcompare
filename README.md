@@ -60,8 +60,9 @@ table and one tab per detector, each full width:
 
 Detector tabs carry a count; every detector runs when an analysis opens. A
 tab that can't run on an older cache stays visible, greyed, with the reason.
-The chart and timeline-bar markers show the active detector tab's events (or
-the last one visited, while on Frames), and `↑` / `↓`, `y` / `x` act on it.
+The chart and timeline-bar markers show the active detector tab's events, and
+`↑` / `↓`, `y` / `x` act on it; on Frames (and Report) the chart shows the
+signal alone.
 `1`–`5` switch tabs.
 
 Every event row carries a filmstrip: the frame before, the event's frames
