@@ -31,7 +31,7 @@ refresh() {
 
 if [ "${1:-}" = "--uninstall" ]; then
     rm -f "$BIN_DIR/vcompare" "$DESKTOP"
-    for s in 32 128 256; do rm -f "$ICON_ROOT/${s}x${s}/apps/vcompare.png"; done
+    for s in 32 128 256 512; do rm -f "$ICON_ROOT/${s}x${s}/apps/vcompare.png"; done
     refresh
     echo "vcompare removed."
     exit 0
@@ -50,6 +50,8 @@ for s in 32 128 256; do
     mkdir -p "$ICON_ROOT/${s}x${s}/apps"
     install -m 644 "src-tauri/icons/${s}x${s}.png" "$ICON_ROOT/${s}x${s}/apps/vcompare.png"
 done
+mkdir -p "$ICON_ROOT/512x512/apps"
+install -m 644 src-tauri/icons/icon.png "$ICON_ROOT/512x512/apps/vcompare.png"
 
 cat > "$DESKTOP" <<EOF
 [Desktop Entry]
