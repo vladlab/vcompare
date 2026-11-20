@@ -1093,7 +1093,7 @@
   function isTextEntry(target: EventTarget | null): boolean {
     const el = target as HTMLElement | null;
     if (!el) return false;
-    if (el.isContentEditable || el.tagName === "TEXTAREA" || el.tagName === "SELECT") return true;
+    if (el.isContentEditable || el.tagName === "TEXTAREA") return true;
     if (el.tagName === "INPUT") {
       const type = (el as HTMLInputElement).type;
       // Sliders, checkboxes and buttons keep focus after a click but don't
@@ -1120,6 +1120,13 @@
     }
     if (state !== "ready") return;
     if (isTextEntry(e.target)) return;
+    // A dropdown keeps keyboard focus after you pick from it (its popup is
+    // where arrows and letters matter, and that is closed by now). Left
+    // alone it swallowed every shortcut until something else was clicked.
+    if ((e.target as HTMLElement | null)?.tagName === "SELECT" && !e.ctrlKey && !e.metaKey && !e.altKey && e.key !== "Tab") {
+      (e.target as HTMLElement).blur();
+      e.preventDefault(); // no type-ahead / arrow change on the dropdown
+    }
 
     switch (e.key) {
       case "m":
