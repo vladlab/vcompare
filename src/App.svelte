@@ -313,7 +313,8 @@
 
     const { listen } = await import("@tauri-apps/api/event");
     unlisteners.push(
-      await listen("rpc:mpv-exited", () => {
+      await listen<{ error?: string | null }>("rpc:mpv-exited", (ev) => {
+        if (ev.payload?.error) showStatus(ev.payload.error, 15000);
         mpvRunning = false;
         mpvAutoSeek = false;
         mpvFrame = -1;
@@ -326,7 +327,8 @@
       })
     );
     unlisteners.push(
-      await listen("rpc:diffview-exited", () => {
+      await listen<{ error?: string | null }>("rpc:diffview-exited", (ev) => {
+        if (ev.payload?.error) showStatus(`difference view — ${ev.payload.error}`, 15000);
         diffviewRunning = false;
         diffviewFrame = -1;
       })

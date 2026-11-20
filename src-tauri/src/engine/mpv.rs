@@ -14,6 +14,37 @@ use std::process::{Child, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// The first few error / fatal lines of an mpv log file, as "module: text".
+/// Video-output lines are left out: mpv probes several outputs at start-up
+/// and logs each one that doesn't apply as an error.
+fn log_errors(log: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in log.lines() {
+        // "[   0.031][e][file] Cannot open file …"
+        let mut parts = line.splitn(4, ']');
+        let (Some(_time), Some(level), Some(module), Some(text)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if level != "[e" && level != "[f" {
+            continue;
+        }
+        let module = module.trim_start_matches('[');
+        if module.starts_with("vo/") {
+            continue;
+        }
+        let msg = format!("{module}: {}", text.trim());
+        if !out.contains(&msg) {
+            out.push(msg);
+        }
+        if out.len() == 3 {
+            break;
+        }
+    }
+    out
+}
+
 use crate::engine::timecode::TimecodeFormat;
 use crate::engine::types::TimelineInfo;
 
@@ -56,6 +87,8 @@ pub struct MpvController {
     scale_ref: bool,
     process: Mutex<Option<Child>>,
     sock_path: PathBuf,
+    /// mpv's own log (`--log-file`), read back if it quits with an error
+    log_path: PathBuf,
     /// Temp EDL file path (cleaned up on kill)
     edl_path: Mutex<Option<PathBuf>>,
 }
@@ -86,6 +119,7 @@ impl MpvController {
             scale_h,
             scale_ref,
             process: Mutex::new(None),
+            log_path: std::env::temp_dir().join(format!("vcompare_mpv_{pid}_{suffix}.log")),
             sock_path,
             edl_path: Mutex::new(None),
         }
@@ -114,8 +148,19 @@ impl MpvController {
             return Some("mpv already running".into());
         }
 
-        // Clean up any stale socket / EDL
+        // mpv itself only says "cannot open" in a log nobody sees, then
+        // quits: check the files first and say which one is missing.
+        for p in [&self.ref_path, &self.dist_path] {
+            if !p.is_empty() && !Path::new(p).exists() {
+                return Some(format!(
+                    "file not found: {p} — moved, renamed, or its volume isn't mounted?"
+                ));
+            }
+        }
+
+        // Clean up any stale socket / EDL / log
         let _ = std::fs::remove_file(&self.sock_path);
+        let _ = std::fs::remove_file(&self.log_path);
         {
             let mut edl = self.edl_path.lock().unwrap();
             if let Some(ref p) = *edl {
@@ -175,6 +220,7 @@ impl MpvController {
             .arg("--osd-fractions")
             .arg(title)
             .arg("--no-terminal")
+            .arg(format!("--log-file={}", self.log_path.to_string_lossy()))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
@@ -190,6 +236,12 @@ impl MpvController {
         for _ in 0..50 {
             if self.sock_path.exists() {
                 return None; // Success
+            }
+            if !self.is_running() {
+                return Some(
+                    self.exit_report()
+                        .unwrap_or_else(|| "mpv quit as soon as it started".into()),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -404,6 +456,31 @@ impl MpvController {
         self.send_command(&["cycle", "pause"]).is_some()
     }
 
+    /// Why mpv went away, if it wasn't asked to: `None` after `kill()` or a
+    /// normal quit (window closed); otherwise the first errors from its log
+    /// (a file it could not open, a filter graph it rejected, …).
+    pub fn exit_report(&self) -> Option<String> {
+        let code = {
+            let mut proc = self.process.lock().unwrap();
+            let status = proc.as_mut()?.try_wait().ok().flatten()?;
+            if status.success() {
+                return None;
+            }
+            status.code()
+        };
+        let errors = std::fs::read_to_string(&self.log_path)
+            .map(|log| log_errors(&log))
+            .unwrap_or_default();
+        Some(if errors.is_empty() {
+            match code {
+                Some(c) => format!("mpv quit with an error (exit code {c}); its log has no error lines: {}", self.log_path.display()),
+                None => "mpv was killed by a signal (crashed?)".into(),
+            }
+        } else {
+            format!("mpv quit: {}", errors.join(" · "))
+        })
+    }
+
     /// Terminate mpv and clean up.
     pub fn kill(&self) {
         let _ = self.send_command(&["quit"]);
@@ -436,5 +513,67 @@ impl MpvController {
 impl Drop for MpvController {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(test)]
+mod exit_report_tests {
+    use super::*;
+
+    #[test]
+    fn log_errors_picks_the_cause() {
+        let log = "[   0.012][v][cplayer] mpv 0.37.0\n\
+[   0.160][e][file] Cannot open file '/x/b.mov': No such file or directory\n\
+[   0.160][e][stream] Failed to open /x/b.mov.\n\
+[   0.160][e][cplayer] Can not open external file /x/b.mov.\n\
+[   0.282][e][vo/gpu/drm] Can't open TTY for VT control\n\
+[   0.300][e][ffmpeg] later noise\n";
+        assert_eq!(
+            log_errors(log),
+            vec![
+                "file: Cannot open file '/x/b.mov': No such file or directory",
+                "stream: Failed to open /x/b.mov.",
+                "cplayer: Can not open external file /x/b.mov.",
+            ]
+        );
+        assert!(log_errors("[   0.2][e][vo/gpu/drm] probing\n[  0.3][w][x] warn\n").is_empty());
+    }
+
+    #[test]
+    fn missing_file_is_reported_before_launch() {
+        let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::engine::timecode::TcType::NonDrop };
+        let m = MpvController::new("/nonexistent/a.mov".into(), String::new(), tc, 0, None, ViewMode::Single, 0, 0, false);
+        let err = m.launch().unwrap();
+        assert!(err.contains("file not found: /nonexistent/a.mov"), "{err}");
+    }
+
+    /// A file that exists but isn't video: mpv starts, fails to load it and
+    /// quits. That used to be silent. Needs mpv and a display (xvfb-run).
+    #[test]
+    fn unplayable_file_is_explained() {
+        let have_mpv = crate::engine::sysenv::command("mpv").arg("--version").output().is_ok();
+        if !have_mpv || std::env::var_os("DISPLAY").is_none() {
+            eprintln!("mpv or a display unavailable; skipping");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("vcompare_notvideo_{}.mov", std::process::id()));
+        std::fs::write(&path, b"this is not a movie").unwrap();
+        let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::engine::timecode::TcType::NonDrop };
+        let m = MpvController::new(path.to_string_lossy().into(), String::new(), tc, 0, None, ViewMode::Single, 0, 0, false);
+        let report = match m.launch() {
+            Some(err) => err, // quit before its socket appeared
+            None => {
+                let t = std::time::Instant::now();
+                while m.is_running() && t.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert!(!m.is_running(), "mpv should have quit");
+                m.exit_report().expect("a report")
+            }
+        };
+        eprintln!("report: {report}");
+        assert!(report.starts_with("mpv quit"), "{report}");
+        m.kill();
+        let _ = std::fs::remove_file(&path);
     }
 }

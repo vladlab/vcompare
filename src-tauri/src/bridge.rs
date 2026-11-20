@@ -1078,8 +1078,9 @@ pub async fn mpv_launch(
         let mut last_frame: Option<i64> = None;
         loop {
             if !poll_mpv.is_running() {
-                eprintln!("[vcompare] mpv process exited");
-                let _ = app_poll.emit("rpc:mpv-exited", json!({"reason": "closed"}));
+                let error = poll_mpv.exit_report();
+                eprintln!("[vcompare] mpv process exited{}", error.as_deref().map(|e| format!(": {e}")).unwrap_or_default());
+                let _ = app_poll.emit("rpc:mpv-exited", json!({"reason": if error.is_some() { "error" } else { "closed" }, "error": error}));
                 break;
             }
             if let Some(frame) = poll_mpv.get_frame() {
@@ -1187,8 +1188,9 @@ pub async fn diffview_launch(
         let mut last_frame: Option<i64> = None;
         loop {
             if !poll_mpv.is_running() {
-                eprintln!("[vcompare] diffview process exited");
-                let _ = app_poll.emit("rpc:diffview-exited", json!({"reason": "closed"}));
+                let error = poll_mpv.exit_report();
+                eprintln!("[vcompare] diffview process exited{}", error.as_deref().map(|e| format!(": {e}")).unwrap_or_default());
+                let _ = app_poll.emit("rpc:diffview-exited", json!({"reason": if error.is_some() { "error" } else { "closed" }, "error": error}));
                 break;
             }
             if let Some(frame) = poll_mpv.get_frame() {
