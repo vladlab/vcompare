@@ -84,6 +84,8 @@ impl FrameTable {
 
         let mut tb = TableBuilder::new(ui)
             .striped(true)
+            // Jump, don't glide: a jump across a feature would take seconds.
+            .animate_scrolling(false)
             .sense(Sense::click())
             .resizable(false)
             .cell_layout(egui::Layout::right_to_left(Align::Center))

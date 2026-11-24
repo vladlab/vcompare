@@ -191,8 +191,11 @@ impl Chart {
         let mresp = ui.interact(overview, id.with("overview"), Sense::click_and_drag());
         let mframe = |x: f32| b.0 + ((x - overview.left()) / overview.width()).clamp(0.0, 1.0) as f64 * (b.1 - b.0);
         let mut selecting: Option<(f64, f64)> = None;
+        // Anchor drags where the button went down, not where egui decided
+        // it was a drag (a few px later), and follow the latest pointer.
+        let (press, latest) = ui.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()));
         if mresp.drag_started() {
-            if let Some(pp) = mresp.interact_pointer_pos() {
+            if let Some(pp) = press.or(mresp.interact_pointer_pos()) {
                 let f = mframe(pp.x);
                 self.mini_drag = Some(if self.is_zoomed(b) && f >= v0 && f <= v1 {
                     MiniDrag::Pan { grab: f - v0 }
@@ -201,7 +204,7 @@ impl Chart {
                 });
             }
         }
-        if let (Some(d), Some(pp)) = (self.mini_drag, mresp.interact_pointer_pos()) {
+        if let (Some(d), Some(pp)) = (self.mini_drag, latest.filter(|_| mresp.dragged() || mresp.drag_stopped())) {
             let f = mframe(pp.x);
             match d {
                 MiniDrag::Pan { grab } => {
@@ -239,12 +242,12 @@ impl Chart {
         if zoomed {
             let bresp = ui.interact(bar, id.with("bar"), Sense::click_and_drag());
             if bresp.drag_started() {
-                if let Some(pp) = bresp.interact_pointer_pos() {
+                if let Some(pp) = press.or(bresp.interact_pointer_pos()) {
                     let grab = if thumb.contains(pp) { pp.x } else { thumb.center().x };
                     self.bar_drag = Some((grab, v0));
                 }
             }
-            if let (Some((x0, start)), Some(pp)) = (self.bar_drag, bresp.interact_pointer_pos()) {
+            if let (Some((x0, start)), Some(pp)) = (self.bar_drag, latest.filter(|_| bresp.dragged() || bresp.drag_stopped())) {
                 let df = (pp.x - x0) as f64 / (bar.width() - thumb.width()).max(1.0) as f64 * (total - (v1 - v0));
                 let r = v1 - v0;
                 self.set_range(b, start + df, start + df + r);

@@ -316,6 +316,7 @@ as well, with only Rust and gcc:
 cargo build --release -p vcompare-egui
 ./target/release/vcompare-egui path/to/clip.levels.json      # or Ctrl+O / drop a file
 VCOMPARE_RENDERER=wgpu ./target/release/vcompare-egui …      # default: glow (OpenGL)
+VCOMPARE_VSYNC=0 ./target/release/vcompare-egui …            # vsync off (less lag, may tear)
 ```
 
 The binary links only glibc. X11 / Wayland, OpenGL (or Vulkan for wgpu)

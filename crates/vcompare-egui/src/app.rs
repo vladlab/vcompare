@@ -50,6 +50,7 @@ pub struct VcApp {
     detect_gen: u64,
     ui_times: VecDeque<f32>,
     show_perf: bool,
+    show_keys: bool,
 }
 
 impl VcApp {
@@ -84,6 +85,7 @@ impl VcApp {
             detect_gen: 0,
             ui_times: VecDeque::new(),
             show_perf: true,
+            show_keys: false,
         };
         if let Some(p) = open {
             app.open(&cc.egui_ctx, p);
@@ -179,6 +181,14 @@ impl VcApp {
                 }
                 continue;
             }
+            if key == Key::F1 {
+                self.show_keys = !self.show_keys;
+                continue;
+            }
+            if key == Key::Escape && self.show_keys {
+                self.show_keys = false;
+                continue;
+            }
             let (Some(loaded), Some(series)) = (self.loaded.as_ref(), self.series.as_ref()) else { continue };
             let tl = loaded.timeline.as_ref();
             match key {
@@ -267,17 +277,14 @@ impl VcApp {
             if ui.button("Open…").on_hover_text("Open a saved analysis (Ctrl+O)").clicked() {
                 self.pick_file(&ctx);
             }
+            let mut name = None;
             if let Some(l) = &self.loaded {
-                ui.separator();
-                ui.label(RichText::new(l.file_name()).strong());
-                let depth = l.summary["bit_depth"].as_u64().map(|b| format!(" · {b}-bit")).unwrap_or_default();
-                ui.label(RichText::new(format!("{}{depth} · {} frames", l.mode, l.rows.frames.len())).color(theme::TEXT_DIM));
                 ui.separator();
                 let current = self.series.as_ref().map(|s| s.metric.clone()).unwrap_or_default();
                 let mut pick = current.clone();
                 egui::ComboBox::from_id_salt("metric")
                     .selected_text(theme::metric_label(&current))
-                    .width(190.0)
+                    .width(170.0)
                     .show_ui(ui, |ui| {
                         for m in &l.metrics {
                             ui.selectable_value(&mut pick, m.clone(), theme::metric_label(m));
@@ -304,20 +311,57 @@ impl VcApp {
                         self.chart.reset();
                     }
                 }
+                ui.separator();
+                let depth = l.summary["bit_depth"].as_u64().map(|b| format!(" · {b}-bit")).unwrap_or_default();
+                name = Some((l.file_name(), format!("{}{depth} · {} frames", l.mode, l.rows.frames.len()), l.path.clone()));
             }
+            // Right side first, so the file name gets what's left and
+            // truncates instead of pushing anything off the window.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("?").color(theme::TEXT_MUTED)).on_hover_text(
-                    "Keys\n\
-                     = / -  zoom in / out on the playhead,  0  show all\n\
-                     . ,  → ←  step a frame\n\
-                     n N  ↓ ↑  next / previous event\n\
-                     y x  accept / reject the picked event\n\
-                     m M  next / previous metric\n\
-                     1 2  Frames / Flash tab\n\
-                     Ctrl+O  open,  F12  timings\n\n\
-                     Chart: wheel zooms on the mouse, drag scrubs, double-click shows all.\n\
-                     Minimap: drag the window to pan, drag elsewhere to zoom to a range.",
-                );
+                if ui.button("Keys").on_hover_text("Keyboard and mouse shortcuts (F1)").clicked() {
+                    self.show_keys = !self.show_keys;
+                }
+                if let Some((file, info, path)) = name {
+                    ui.add(egui::Label::new(RichText::new(info).color(theme::TEXT_DIM)).truncate());
+                    ui.add(egui::Label::new(RichText::new(file).strong()).truncate()).on_hover_text(path);
+                }
+            });
+        });
+    }
+
+    fn keys_window(&mut self, ctx: &egui::Context) {
+        let rows: &[(&str, &str)] = &[
+            ("= / -", "zoom in / out on the playhead"),
+            ("0", "show all"),
+            (". ,   → ←", "step a frame"),
+            ("n N   ↓ ↑", "next / previous event"),
+            ("y  x", "accept / reject the picked event"),
+            ("m  M", "next / previous metric"),
+            ("1  2", "Frames / Flash tab"),
+            ("Ctrl+O", "open an analysis (or drop a file on the window)"),
+            ("F1", "this panel"),
+            ("F12", "frame timings in the status line"),
+        ];
+        let mouse: &[(&str, &str)] = &[
+            ("wheel", "zoom on the mouse"),
+            ("drag", "scrub"),
+            ("double-click", "show all"),
+            ("minimap drag", "on the window: pan; elsewhere: zoom to that range"),
+        ];
+        egui::Window::new("Keys").open(&mut self.show_keys).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Grid::new("keys_grid").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
+                for (k, what) in rows {
+                    ui.label(RichText::new(*k).monospace());
+                    ui.label(*what);
+                    ui.end_row();
+                }
+                ui.label(RichText::new("Chart").strong());
+                ui.end_row();
+                for (k, what) in mouse {
+                    ui.label(RichText::new(*k).monospace());
+                    ui.label(*what);
+                    ui.end_row();
+                }
             });
         });
     }
@@ -377,6 +421,7 @@ impl eframe::App for VcApp {
             self.open(&ctx, p);
         }
 
+        self.keys_window(&ctx);
         egui::Panel::top("top").frame(egui::Frame::side_top_panel(ui.style()).fill(theme::BG_RAISED)).show(ui, |ui| {
             ui.add_space(4.0);
             self.top_bar(ui);

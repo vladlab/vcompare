@@ -250,6 +250,22 @@ both renderers (`glow`; `wgpu` via lavapipe):
 - the look next to the Svelte build on Color 02;
 - scroll and keyboard feel.
 
+### Spike feedback (Vladimir, 2026-11-24): runs; small fixes done
+
+- **Frames table:** scrolled (animated) to the cursor, too slow across a
+  feature. Now jumps (`animate_scrolling(false)`).
+- **Minimap range select lagged the mouse.** The drag was anchored where
+  egui recognised it (a few px after the press) and followed
+  `interact_pointer_pos`. It's now anchored at `press_origin` and follows
+  `latest_pos`, and the scrollbar does the same. For the rest of the
+  pipeline: wgpu keeps 1 frame in flight; `VCOMPARE_VSYNC=0` turns vsync
+  off for comparison (may tear).
+- **Top bar:** `+` / `fit` fell off at the default size. Controls now come
+  first, the file name truncates, and it fits down to the 800 pt minimum
+  width (checked at 1× and 1.5× scale).
+- **The "?" corner:** it was only a hover tooltip. Now a **Keys** button
+  (or F1) opens a shortcuts panel; Esc closes it.
+
 ## 3. Pick and analyse
 
 - **Screens** as an `enum Screen { Pick, Analyzing, Ready }` in the eframe
