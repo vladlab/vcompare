@@ -17,6 +17,7 @@ wgpu = ["eframe/wgpu"]
 
 [dependencies]
 vcompare-service = { path = "../vcompare-service" }
+serde.workspace = true
 serde_json.workspace = true
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "x11", "wayland", "accesskit"] }
 egui_extras = { version = "0.37", default-features = false }

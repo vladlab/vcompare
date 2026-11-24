@@ -12,6 +12,8 @@ pub const BG_ACTIVE: Color32 = Color32::from_rgb(0x36, 0x36, 0x36);
 pub const TEXT: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xe8);
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0x99, 0x99, 0x99);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x66, 0x66, 0x66);
+pub const ACCENT: Color32 = Color32::from_rgb(0x5a, 0x8f, 0xd4);
+pub const WARNING: Color32 = Color32::from_rgb(0xe8, 0xb8, 0x30);
 pub const THRESHOLD: Color32 = Color32::from_rgb(0xe5, 0x45, 0x45);
 pub const SUCCESS: Color32 = Color32::from_rgb(0x4e, 0xc9, 0x66);
 

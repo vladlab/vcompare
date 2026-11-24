@@ -301,27 +301,34 @@ the usual WebKitGTK workaround env vars automatically.
 ## Native UI (egui) — in progress
 
 `crates/vcompare-egui` is the native UI that will replace the Tauri/Svelte
-one (see `docs/plans/egui-port.md`). For now it only **opens a saved
-analysis** (`.levels.json` / `.vcompare.json`). Analysing a file still goes
-through the Tauri app, or headless:
-
-```bash
-cargo run --release -p vcompare-service --example analyze -- levels clip.mov
-```
+one (see `docs/plans/egui-port.md`). It runs levels, pixel diff (± SSIM)
+and VMAF analyses and opens saved ones: chart, frame table and the Flash
+tab. Not there yet: the repeat / image-match tabs, mpv, Resolve sync and
+timeline mode (use the Tauri app for those).
 
 It needs no WebKit and no `-devel` packages, so it builds on Rocky / RHEL 9
 as well, with only Rust and gcc:
 
 ```bash
 cargo build --release -p vcompare-egui
-./target/release/vcompare-egui path/to/clip.levels.json      # or Ctrl+O / drop a file
+./target/release/vcompare-egui                               # start screen
+./target/release/vcompare-egui ref.mov dist.mov              # files filled in
+./target/release/vcompare-egui clip.levels.json              # open an analysis
 VCOMPARE_RENDERER=wgpu ./target/release/vcompare-egui …      # default: glow (OpenGL)
 VCOMPARE_VSYNC=0 ./target/release/vcompare-egui …            # vsync off (less lag, may tear)
 ```
 
 The binary links only glibc. X11 / Wayland, OpenGL (or Vulkan for wgpu)
 and xkbcommon are loaded at runtime from the desktop's own libraries.
-F12 shows per-frame timings in the status line.
+File dialogs go through the desktop portal (`xdg-desktop-portal`, part of
+GNOME and KDE); without one, drop files on the window or pass them on the
+command line. F1 lists the shortcuts.
+
+Headless, without any UI:
+
+```bash
+cargo run --release -p vcompare-service --example analyze -- levels clip.mov
+```
 
 ## Building and installing
 

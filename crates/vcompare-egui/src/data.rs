@@ -82,7 +82,11 @@ impl FrameRows {
 }
 
 pub struct Loaded {
+    /// The analysis file (cache) it lives in; empty for a dry run.
     pub path: String,
+    /// The media: reference (or the one file) and distorted ("" for one-file modes).
+    pub ref_path: String,
+    pub dist_path: String,
     pub summary: Value,
     pub mode: String,
     pub metrics: Vec<String>,
@@ -93,8 +97,15 @@ pub struct Loaded {
 }
 
 impl Loaded {
+    /// Read a saved analysis.
     pub fn open(svc: &Service, path: &str) -> Result<(Loaded, Series), String> {
         let summary = svc.load_saved_analysis(path)?;
+        Self::from_summary(svc, summary, path)
+    }
+
+    /// Build from what the engine has loaded (after `analyze` or
+    /// `load_saved_analysis`).
+    pub fn from_summary(svc: &Service, summary: Value, path: &str) -> Result<(Loaded, Series), String> {
         let mode = summary["mode"].as_str().unwrap_or("diff").to_string();
         let metrics: Vec<String> = summary["metrics_available"]
             .as_array()
@@ -107,16 +118,27 @@ impl Loaded {
             .and_then(|t| serde_json::from_value::<TimelineInfo>(t.clone()).ok())
             // Timeline (Resolve) mode reuses the field for something else.
             .filter(|_| mode != "timeline");
+        let (ref_path, dist_path) = svc
+            .engine()
+            .mpv_context()
+            .map(|c| (c.ref_path, c.dist_path))
+            .unwrap_or_default();
         let rows = FrameRows::load(svc, &metrics)?;
         let series = Series::load(svc, &first)?;
         let files = if mode == "levels" || mode == "timeline" { 1 } else { 2 };
-        Ok((Loaded { path: path.to_string(), summary, mode, metrics, timeline, rows, files }, series))
+        Ok((Loaded { path: path.to_string(), ref_path, dist_path, summary, mode, metrics, timeline, rows, files }, series))
     }
 
-    pub fn file_name(&self) -> String {
-        std::path::Path::new(&self.path)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.path.clone())
+    /// "a.mov" or "a.mov vs b.mov"; the analysis file's name if the media
+    /// isn't known.
+    pub fn title(&self) -> String {
+        let name = |p: &str| {
+            std::path::Path::new(p).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.to_string())
+        };
+        match (self.ref_path.is_empty(), self.dist_path.is_empty()) {
+            (true, _) => name(&self.path),
+            (false, true) => name(&self.ref_path),
+            (false, false) => format!("{} vs {}", name(&self.ref_path), name(&self.dist_path)),
+        }
     }
 }

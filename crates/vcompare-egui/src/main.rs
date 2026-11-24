@@ -1,6 +1,7 @@
-//! vcompare, native UI (egui). Spike: opens a saved analysis.
+//! vcompare, native UI (egui).
 //!
-//! `vcompare-egui [analysis.json]`
+//! `vcompare-egui [analysis.json | media file(s)]`: an analysis opens;
+//! media fills the start screen (two files: reference, distorted).
 //!
 //! VCOMPARE_RENDERER=glow|wgpu picks the renderer (default glow);
 //! VCOMPARE_VSYNC=0 turns vsync off.
@@ -9,7 +10,10 @@ mod app;
 mod chart;
 mod data;
 mod flash;
+mod pick;
+mod progress;
 mod pyramid;
+mod settings;
 mod table;
 mod theme;
 mod thumbs;
@@ -33,7 +37,7 @@ fn renderer() -> eframe::Renderer {
 }
 
 fn main() -> eframe::Result {
-    let open = std::env::args().nth(1);
+    let open: Vec<String> = std::env::args().skip(1).collect();
     let renderer = renderer();
     eprintln!("[vcompare] renderer: {renderer:?}");
     // VCOMPARE_VSYNC=0: present without waiting for vblank (less latency,

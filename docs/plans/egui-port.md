@@ -1,8 +1,8 @@
 # Plan: port the UI from Tauri/Svelte to egui
 
 Branch: `egui-port` (off `detector-tabs` at `1572726`). **Status: §1 built
-and checked by Vladimir (2026-11-24); §2 spike built, see its status
-note.** §1: Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
+and checked by Vladimir (2026-11-24); §2 spike built and accepted (go);
+§3 built, see its status note.** §1: Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
 Resolve): 131 tests from the workspace root (126 engine, 5 service, three
 of them end to end through `Service` on a generated clip); every
 `invoke()` in `rpc.ts` matched to a command with the same argument names
@@ -282,6 +282,67 @@ both renderers (`glow`; `wgpu` via lavapipe):
   messages that time out.
 - **Gate:** levels, diff (± SSIM), vmaf and IMF / concat inputs run
   end-to-end and produce caches that load in both UIs.
+
+### §3 status (2026-11-24): built
+
+Vladimir said go after the spike. Built in `crates/vcompare-egui`:
+- **Pick screen** (`pick.rs`):
+  - mode: diff / vmaf / levels; timeline is listed but disabled until §5;
+  - file buttons, with probing on a worker and a probe line per file;
+  - drops follow the web UI's slot rules, and media can come from the
+    command line (`vcompare-egui ref.mov dist.mov`);
+  - fps-mismatch warning;
+  - options: sync, SSIM; for VMAF hwaccel, PSNR and subsample; for levels
+    parallel decodes and keep-signatures with its size estimate;
+  - cache row with Load cached / Re-analyze.
+  - Mode, last folder and keep-signatures persist in
+    `com.vcompare.app/egui-settings.json`.
+- **Working screen** (`progress.rs`):
+  - progress bar, frames, fps and ETA over a 3 s window;
+  - the engine's diagnostics;
+  - Cancel / Esc. Its token drops the late result; nothing is saved.
+  - Opening a saved analysis shows an indeterminate bar and says nothing
+    is being re-analysed.
+- **Error screen:** the first line says what failed; the rest (ffmpeg's
+  output) scrolls; Copy and Back.
+- **File menu:**
+  - New, Open, Recent…, Export CSV…, Quit (Ctrl+N / O / Shift+O /
+    Shift+E / Q).
+  - Recents are a modal; a missing analysis shows greyed out; Clear.
+  - Recents are recorded after every finished job, in the same file as
+    the Tauri app's.
+- **File dialogs** run on a worker thread so the window keeps painting.
+- **Results** got:
+  - the web UI's summary line (mode, depth, frames, fps, metric μ and
+    range, diff identical / major);
+  - the threshold line: diff and vmaf open with mean ± σ; `t` sets it
+    from the metric, `T` clears it;
+  - `e` exports CSV; the perf line shows in the status bar for 20 s.
+- **Tests:** drop slot rules, analyse params per mode, probe formatting,
+  rate / ETA window, threshold direction, dates.
+
+**Gate, run in the sandbox under Xvfb with xdotool:**
+- **diff + SSIM:** a 720-frame ProRes pair; then Load cached, which opens
+  with the 14.9 threshold line.
+- **levels on a concat list:** `ffconcat` of two ProRes parts; the
+  planted flash is found.
+- **levels cancel:** Esc 5 s into the 130k-frame clip; ffmpeg gone; the
+  existing cache's mtime and size unchanged.
+- **VMAF:** only the failure path. This ffmpeg has no libvmaf, and
+  running a downloaded static ffmpeg wasn't allowed here. The error
+  screen ends with "No such filter: 'libvmaf'" and the cache is left as
+  it was.
+- **Recents, File menu, New Analysis:** work.
+- **Not tested here:**
+  - **VMAF success** and **IMF CPL** inputs: check on a real machine;
+  - **file dialogs:** there is no portal in the sandbox; rfd returns at
+    once and the UI keeps working.
+
+**Existing behaviour kept, worth deciding later (both UIs):**
+- **Shared cache file.** Diff and VMAF of the same pair share one file
+  name (`<ref>_vs_<dist>.vcompare.json`). So VMAF mode offers the diff
+  cache as "Load cached", and Re-analyze in one mode overwrites the
+  other's.
 
 ## 4. Detector tabs complete
 
