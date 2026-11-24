@@ -23,10 +23,7 @@ fn main() {
 
     let log_path = out.unwrap_or_else(|| match mode.as_str() {
         "levels" => cache::default_levels_path(&reference),
-        _ => cache::check_cache(&reference, distorted.as_deref().unwrap_or_default(), None)["path"]
-            .as_str()
-            .unwrap_or("analysis.vcompare.json")
-            .to_string(),
+        m => cache::default_compare_path(&reference, distorted.as_deref().unwrap_or_default(), m),
     });
 
     let sink = |e: UiEvent| {

@@ -817,7 +817,7 @@
       } else if (analysisMode === "levels" && refPath) {
         cacheInfo = await checkLevelsCache(refPath);
       } else if (refPath && distPath) {
-        cacheInfo = await checkCache(refPath, distPath);
+        cacheInfo = await checkCache(refPath, distPath, analysisMode === "vmaf" ? "vmaf" : "diff");
       } else {
         cacheInfo = null;
       }

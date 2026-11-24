@@ -1,4 +1,6 @@
-//! Analysis cache — save, load, and check .vcompare.json files.
+//! Analysis cache — save, load, and check analysis files
+//! (`….diff.json`, `….vmaf.json`, `….levels.json`, `….timeline.json`, and
+//! the older shared `….vcompare.json`).
 
 use serde_json::Value;
 use std::path::Path;
@@ -24,6 +26,31 @@ pub fn default_log_path(ref_path: &str, dist_path: &str) -> String {
         .join(format!("{ref_stem}_vs_{dist_stem}.vcompare.json"))
         .to_string_lossy()
         .to_string()
+}
+
+/// Cache path for a comparison in one mode:
+/// `{ref_dir}/{ref_stem}_vs_{dist_stem}.{mode}.json` (`diff`, `vmaf`), so
+/// the modes of one pair don't overwrite each other.
+pub fn default_compare_path(ref_path: &str, dist_path: &str, mode: &str) -> String {
+    let legacy = default_log_path(ref_path, dist_path);
+    let stem = legacy.strip_suffix(".vcompare.json").unwrap_or(&legacy);
+    format!("{stem}.{mode}.json")
+}
+
+/// `check_cache` for one comparison mode. Looks for the mode's own file
+/// first, then for an older shared `….vcompare.json` made in this mode.
+/// A shared file from the other mode is ignored, so this mode's run goes
+/// to its own file instead of overwriting it.
+pub fn check_compare_cache(ref_path: &str, dist_path: &str, mode: &str) -> Value {
+    let own = default_compare_path(ref_path, dist_path, mode);
+    if Path::new(&own).is_file() {
+        return check_cache(ref_path, dist_path, Some(&own));
+    }
+    let legacy = check_cache(ref_path, dist_path, None);
+    if legacy["exists"].as_bool() == Some(true) && legacy["mode"].as_str() == Some(mode) {
+        return legacy;
+    }
+    check_cache(ref_path, dist_path, Some(&own))
 }
 
 /// Default cache path for levels analysis: `{dir}/{stem}.levels.json`
@@ -269,3 +296,40 @@ pub fn save_vmaf_analysis(
         .map_err(|e| format!("Failed to serialize: {e}"))?;
     write_atomic(path, content.as_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compare_modes_get_their_own_files() {
+        use super::{check_compare_cache, default_compare_path};
+        let dir = std::env::temp_dir().join(format!("vcompare_cache_modes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = dir.join("ref.mov").to_string_lossy().to_string();
+        let d = dir.join("dist.mov").to_string_lossy().to_string();
+        let p = |name: &str| dir.join(name).to_string_lossy().to_string();
+        let write = |path: &str, mode: &str| {
+            std::fs::write(path, serde_json::json!({"mode": mode, "frames": [1, 2, 3]}).to_string()).unwrap()
+        };
+
+        assert_eq!(default_compare_path(&r, &d, "diff"), p("ref_vs_dist.diff.json"));
+        // Nothing yet: each mode points at its own new file.
+        let c = check_compare_cache(&r, &d, "vmaf");
+        assert_eq!((c["exists"].as_bool(), c["path"].as_str()), (Some(false), Some(p("ref_vs_dist.vmaf.json").as_str())));
+
+        // An old shared diff cache: offered to diff, not to vmaf.
+        write(&p("ref_vs_dist.vcompare.json"), "diff");
+        let c = check_compare_cache(&r, &d, "diff");
+        assert_eq!((c["exists"].as_bool(), c["path"].as_str()), (Some(true), Some(p("ref_vs_dist.vcompare.json").as_str())));
+        let c = check_compare_cache(&r, &d, "vmaf");
+        assert_eq!((c["exists"].as_bool(), c["path"].as_str()), (Some(false), Some(p("ref_vs_dist.vmaf.json").as_str())));
+
+        // The mode's own file wins over the shared one.
+        write(&p("ref_vs_dist.diff.json"), "diff");
+        let c = check_compare_cache(&r, &d, "diff");
+        assert_eq!(c["path"].as_str(), Some(p("ref_vs_dist.diff.json").as_str()));
+        assert_eq!(c["frame_count"].as_u64(), Some(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

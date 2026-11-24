@@ -195,8 +195,14 @@ impl Service {
         engine::probe::probe_file(path)
     }
 
-    pub fn check_cache(&self, reference: &str, distorted: &str) -> Value {
-        cache::check_cache(reference, distorted, None)
+    /// Cached comparison for this pair. With `mode` ("diff" / "vmaf"), that
+    /// mode's own file (see `cache::check_compare_cache`); without, the
+    /// older shared `….vcompare.json`.
+    pub fn check_cache(&self, reference: &str, distorted: &str, mode: Option<&str>) -> Value {
+        match mode {
+            Some(m) => cache::check_compare_cache(reference, distorted, m),
+            None => cache::check_cache(reference, distorted, None),
+        }
     }
 
     pub fn check_levels_cache(&self, reference: &str) -> Value {

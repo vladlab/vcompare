@@ -338,11 +338,16 @@ Vladimir said go after the spike. Built in `crates/vcompare-egui`:
   - **file dialogs:** there is no portal in the sandbox; rfd returns at
     once and the UI keeps working.
 
-**Existing behaviour kept, worth deciding later (both UIs):**
-- **Shared cache file.** Diff and VMAF of the same pair share one file
-  name (`<ref>_vs_<dist>.vcompare.json`). So VMAF mode offers the diff
-  cache as "Load cached", and Re-analyze in one mode overwrites the
-  other's.
+**Shared cache file: fixed (Vladimir: each mode gets its own file).**
+- **New names.** Diff and VMAF now save to `<ref>_vs_<dist>.diff.json` /
+  `.vmaf.json` (`cache::default_compare_path`), next to `.levels.json` /
+  `.timeline.json`.
+- **Old caches still work.** `cache::check_compare_cache` looks for the
+  mode's own file first, then for an older shared `….vcompare.json` made
+  in the same mode. A shared file from the other mode is ignored, so the
+  run goes to the new file instead of overwriting it.
+- **Both UIs.** The Tauri `check_cache` command and `rpc.ts checkCache`
+  take the mode; App.svelte passes it.
 
 ## 4. Detector tabs complete
 

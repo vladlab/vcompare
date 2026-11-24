@@ -44,8 +44,8 @@ pub async fn probe_file(path: String, svc: Svc<'_>) -> Result<engine::types::Pro
 }
 
 #[tauri::command]
-pub async fn check_cache(reference: String, distorted: String, svc: Svc<'_>) -> Result<Value, String> {
-    Ok(svc.check_cache(&reference, &distorted))
+pub async fn check_cache(reference: String, distorted: String, mode: Option<String>, svc: Svc<'_>) -> Result<Value, String> {
+    Ok(svc.check_cache(&reference, &distorted, mode.as_deref()))
 }
 
 #[tauri::command]

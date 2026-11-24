@@ -405,8 +405,9 @@ export async function probeFile(path: string): Promise<FileProbe> {
   return invoke("probe_file", { path });
 }
 
-export async function checkCache(reference: string, distorted: string): Promise<CacheCheck> {
-  return invoke("check_cache", { reference, distorted });
+/** The cached analysis for this pair in this mode (each mode has its own file). */
+export async function checkCache(reference: string, distorted: string, mode: "diff" | "vmaf"): Promise<CacheCheck> {
+  return invoke("check_cache", { reference, distorted, mode });
 }
 
 export async function checkLevelsCache(reference: string): Promise<CacheCheck> {

@@ -314,7 +314,7 @@ impl VcApp {
             return;
         }
         self.spawn(ctx, move |svc| {
-            let v = if mode == "levels" { svc.check_levels_cache(&r) } else { svc.check_cache(&r, &d) };
+            let v = if mode == "levels" { svc.check_levels_cache(&r) } else { svc.check_cache(&r, &d, Some(&mode)) };
             Msg::Cache(key, v)
         });
     }
