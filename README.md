@@ -298,6 +298,30 @@ cargo test --workspace   # engine + service unit tests
 Set `RUST_LOG=debug` for verbose logging. On NVIDIA / Wayland the app sets
 the usual WebKitGTK workaround env vars automatically.
 
+## Native UI (egui) — in progress
+
+`crates/vcompare-egui` is the native UI that will replace the Tauri/Svelte
+one (see `docs/plans/egui-port.md`). For now it only **opens a saved
+analysis** (`.levels.json` / `.vcompare.json`). Analysing a file still goes
+through the Tauri app, or headless:
+
+```bash
+cargo run --release -p vcompare-service --example analyze -- levels clip.mov
+```
+
+It needs no WebKit and no `-devel` packages, so it builds on Rocky / RHEL 9
+as well, with only Rust and gcc:
+
+```bash
+cargo build --release -p vcompare-egui
+./target/release/vcompare-egui path/to/clip.levels.json      # or Ctrl+O / drop a file
+VCOMPARE_RENDERER=wgpu ./target/release/vcompare-egui …      # default: glow (OpenGL)
+```
+
+The binary links only glibc. X11 / Wayland, OpenGL (or Vulkan for wgpu)
+and xkbcommon are loaded at runtime from the desktop's own libraries.
+F12 shows per-frame timings in the status line.
+
 ## Building and installing
 
 ```bash

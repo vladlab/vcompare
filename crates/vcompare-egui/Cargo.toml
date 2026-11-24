@@ -1,0 +1,24 @@
+[package]
+name = "vcompare-egui"
+description = "vcompare native UI (egui)"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vcompare-egui"
+path = "src/main.rs"
+
+[features]
+# Both renderers are built so they can be compared on the same binary
+# (VCOMPARE_RENDERER=glow|wgpu); one will be dropped after the spike.
+default = ["glow", "wgpu"]
+glow = ["eframe/glow"]
+wgpu = ["eframe/wgpu"]
+
+[dependencies]
+vcompare-service = { path = "../vcompare-service" }
+serde_json.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "x11", "wayland", "accesskit"] }
+egui_extras = { version = "0.37", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+rfd = "0.18"

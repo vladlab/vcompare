@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vcompare-engine", "crates/vcompare-service", "src-tauri"]
+members = ["crates/vcompare-engine", "crates/vcompare-service", "crates/vcompare-egui", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

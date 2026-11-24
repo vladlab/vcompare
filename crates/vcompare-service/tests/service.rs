@@ -198,3 +198,46 @@ fn missing_file_is_an_error() {
     assert_eq!(v["exists"], false);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn typed_accessors_match_the_json_ones() {
+    let dir = tmp("typed");
+    let Some(clip) = make_clip(&dir) else {
+        eprintln!("no ffmpeg; skipping");
+        return;
+    };
+    let svc = Service::new(dir.join("data"), Arc::new(vcompare_service::NullSink));
+    let summary = svc
+        .analyze(&AnalyzeParams {
+            reference: clip.to_string_lossy().to_string(),
+            mode: Some("levels".into()),
+            log_path: Some(dir.join("t.levels.json").to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    let metrics: Vec<String> = summary["metrics_available"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect();
+
+    for m in &metrics {
+        let j = svc.get_metric_series(m).unwrap();
+        let (f, v) = svc.metric_series(m).unwrap();
+        let jf: Vec<i64> = j["frames"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
+        let jv: Vec<f64> = j["values"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        assert_eq!((f, v), (jf, jv), "{m}");
+    }
+
+    let cols = svc.frame_columns(&metrics).unwrap();
+    let rows = svc.get_frames(&GetFramesParams { sort: Some("frame".into()), ..Default::default() }).unwrap();
+    let rows = rows["frames"].as_array().unwrap();
+    assert_eq!(cols.frames.len(), rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        assert_eq!(cols.frames[i], r["frame"].as_i64().unwrap());
+        assert_eq!(cols.tcs[i], r["tc"].as_str().unwrap());
+        for (m, col) in &cols.columns {
+            match r.get(m).and_then(|x| x.as_f64()) {
+                Some(x) => assert_eq!(col[i], x, "{m} @ {i}"),
+                None => assert!(col[i].is_nan()),
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

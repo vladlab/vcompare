@@ -87,7 +87,16 @@ const LEVELS_METRICS: &[&str] = &[
     "sat_avg",
 ];
 
-/// Thread-safe engine state, managed as Tauri state.
+/// Table data as columns (see `EngineState::frame_columns`).
+#[derive(Debug, Clone, Default)]
+pub struct FrameColumns {
+    pub frames: Vec<i64>,
+    pub tcs: Vec<String>,
+    /// (metric, value per frame), NaN where missing.
+    pub columns: Vec<(String, Vec<f64>)>,
+}
+
+/// Thread-safe engine state, shared by the UI's threads.
 pub struct EngineState {
     inner: Mutex<Inner>,
 }
@@ -617,6 +626,59 @@ impl EngineState {
             "frames": frame_nums,
             "values": values,
         }))
+    }
+
+    /// One metric as typed arrays (what `get_metric_series` returns as
+    /// JSON), for native UIs: frames with a value, and the values.
+    pub fn metric_series(&self, metric: &str) -> Result<(Vec<i64>, Vec<f64>), String> {
+        let state = self.inner.lock().unwrap();
+        if state.frames.is_empty() {
+            return Err("No analysis loaded".into());
+        }
+        let mut frames = Vec::with_capacity(state.frames.len());
+        let mut values = Vec::with_capacity(state.frames.len());
+        for f in &state.frames {
+            if let (Some(val), Some(frame)) = (
+                f.get(metric).and_then(|v| v.as_f64()),
+                f.get("frame").and_then(|v| v.as_i64()),
+            ) {
+                frames.push(frame);
+                values.push(round4(val));
+            }
+        }
+        Ok((frames, values))
+    }
+
+    /// Every frame in frame order as columns: frame numbers, timecodes, and
+    /// one column per requested metric (NaN where a frame has no value).
+    /// For native UIs; avoids building the whole table as JSON.
+    pub fn frame_columns(&self, metrics: &[String]) -> Result<FrameColumns, String> {
+        let state = self.inner.lock().unwrap();
+        if state.frames.is_empty() {
+            return Err("No analysis loaded".into());
+        }
+        let n = state.frames.len();
+        let mut order: Vec<(i64, usize)> = state
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.get("frame").and_then(|v| v.as_i64()).unwrap_or(0), i))
+            .collect();
+        order.sort_unstable();
+        let mut out = FrameColumns {
+            frames: Vec::with_capacity(n),
+            tcs: Vec::with_capacity(n),
+            columns: metrics.iter().map(|m| (m.clone(), Vec::with_capacity(n))).collect(),
+        };
+        for (frame, i) in order {
+            let f = &state.frames[i];
+            out.frames.push(frame);
+            out.tcs.push(f.get("tc").and_then(|v| v.as_str()).unwrap_or_default().to_string());
+            for (m, col) in out.columns.iter_mut() {
+                col.push(f.get(m.as_str()).and_then(|v| v.as_f64()).unwrap_or(f64::NAN));
+            }
+        }
+        Ok(out)
     }
 
     /// Export analysis to CSV.

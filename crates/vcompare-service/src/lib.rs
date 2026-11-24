@@ -614,6 +614,16 @@ impl Service {
         self.engine.get_metric_series(metric)
     }
 
+    /// `get_metric_series` as typed arrays (frames, values).
+    pub fn metric_series(&self, metric: &str) -> Result<(Vec<i64>, Vec<f64>), String> {
+        self.engine.metric_series(metric)
+    }
+
+    /// Every frame as columns, in frame order (native table).
+    pub fn frame_columns(&self, metrics: &[String]) -> Result<engine::state::FrameColumns, String> {
+        self.engine.frame_columns(metrics)
+    }
+
     /// Run event detection over the loaded analysis. Pure in-memory scan;
     /// cheap enough to call on every slider change.
     pub fn detect_events(&self, request: &DetectRequest) -> Result<DetectResult, String> {

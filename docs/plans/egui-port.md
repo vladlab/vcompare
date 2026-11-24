@@ -1,7 +1,8 @@
 # Plan: port the UI from Tauri/Svelte to egui
 
 Branch: `egui-port` (off `detector-tabs` at `1572726`). **Status: §1 built
-(2026-11-23).** Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
+and checked by Vladimir (2026-11-24); §2 spike built, see its status
+note.** §1: Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
 Resolve): 131 tests from the workspace root (126 engine, 5 service, three
 of them end to end through `Service` on a generated clip); every
 `invoke()` in `rpc.ts` matched to a command with the same argument names
@@ -184,6 +185,70 @@ and how it does under Reemo.
 **If no-go:** keep §1 (it's useful anyway) and put the Svelte UI on top of
 `vcompare-service` behind a local axum HTTP/WebSocket server instead. That
 needs no WebKit and keeps all of the existing UI.
+
+### Spike status (2026-11-24): built, waiting on Vladimir's go / no-go
+
+`crates/vcompare-egui` opens a saved analysis and has the three pieces
+above. Also built while doing it:
+- **Headless analysis example.**
+  `cargo run --release -p vcompare-service --example analyze -- levels <file>`
+  makes test caches without the web UI, and doubles as a CLI later.
+- **Typed engine accessors.** `EngineState::metric_series` and
+  `frame_columns` (with a test that they match the JSON forms), so the
+  native UI doesn't build the whole table as JSON.
+
+**Test material:** a synthetic 130,000-frame clip (90 min at 24 fps,
+96×54 10-bit 4:2:2 FFV1) with planted 1-frame white flashes, 2-frame
+black flashes and 1-frame content inserts, analysed with `levels`.
+
+**Measured in the sandbox:** Ubuntu 24.04, 2 cores, Xvfb, Mesa
+llvmpipe (software GL), release build. Real GPUs will only be faster.
+- **Chart paint:** 0.8–2 ms CPU per frame, the same zoomed out over the
+  whole 130k frames as zoomed in. A full 3840-column redraw is 0.43 ms of
+  pyramid queries.
+- **Whole UI:** 2–4 ms per frame on average while wheel-zooming,
+  scrubbing and switching tabs; worst 6–8 ms after load.
+- **Open:** 3.7 s from launch to chart drawn and flash detection done.
+  Almost all of it is the engine parsing the 42 MB cache, the same in
+  both UIs.
+- **Memory:** 1.05 GB resident. Of that, ~920 MB is the engine holding
+  130k frames as JSON objects, which the Tauri app pays too; ~120 MB is
+  the empty UI (fonts, GL); the chart, table and pyramid add little.
+  Possible follow-up for both UIs: store frames typed instead of as
+  `serde_json::Value`.
+
+**Checked by driving it under Xvfb with xdotool and screenshots**, with
+both renderers (`glow`; `wgpu` via lavapipe):
+- wheel zoom on the mouse; `=` `-` `0` on the playhead;
+- click-drag scrub; double-click shows all;
+- minimap drag-to-range and drag-to-pan; scrollbar;
+- playhead auto-follow;
+- `n`/`N` and `↑`/`↓` events; `y`/`x` reviews, saved to the analysis's
+  reviews file and shown again on reopen;
+- the Frames table following the cursor and sorting by header click;
+- thumbnail strips loading after the settle delay.
+
+**Not in the spike:**
+- smoothing (`f`) and the metric threshold line (`t`/`T`);
+- the repeat / match / timeline tabs and the summary header;
+- mpv, Resolve and analysis runs (that's §3–§5);
+- timeline-mode details (TimelineBar, report).
+
+**Findings:**
+- **Fonts.** egui's default fonts have no ✓ ✗ ▲ glyphs. Those are
+  painted shapes now; bundle Inter / JetBrains Mono in §6 if the text
+  should look like the web UI.
+- **Column widths.** egui lays cells out to their content, so fixed
+  columns need an explicitly sized child `Ui` (`flash::fixed`).
+- **Build.** The binary links only glibc; X11/Wayland, GL/EGL, Vulkan
+  and xkbcommon are loaded at runtime. No `-devel` packages and no
+  pkg-config/cmake in the dependency tree, so building on Rocky 9 should
+  need only Rust and gcc. Not tried on Rocky yet.
+
+**Still to judge on real machines (Vladimir):**
+- glow vs wgpu on Color 01 under Reemo: tearing, latency;
+- the look next to the Svelte build on Color 02;
+- scroll and keyboard feel.
 
 ## 3. Pick and analyse
 
