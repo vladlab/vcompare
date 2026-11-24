@@ -138,3 +138,38 @@ pub fn event_color(e: &Event) -> Color32 {
 pub fn event_faded(e: &Event) -> bool {
     e.kind == "flash" && e.at_cut
 }
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::{epaint::text::{FontDefinitions, Fonts, TextOptions}, FontId};
+
+    /// Every non-ASCII character in this crate's sources must be in the
+    /// built-in proportional font, or it shows as a box. Arrows are only
+    /// in the monospace font: use them in monospace text only (the Keys
+    /// panel).
+    #[test]
+    fn every_glyph_we_use_exists() {
+        let mut fonts = Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let mut missing = std::collections::BTreeMap::new();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            for line in text.lines() {
+                // Comments may use anything.
+                let code = line.split("//").next().unwrap_or("");
+                for c in code.chars().filter(|c| !c.is_ascii()) {
+                    let f = if "←↑→↓".contains(c) { FontId::monospace(12.0) } else { FontId::proportional(12.0) };
+                    if !fonts.has_glyph(&f, c) {
+                        missing.entry(c).or_insert_with(Vec::new).push(path.file_name().unwrap().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        for v in missing.values_mut() {
+            v.sort();
+            v.dedup();
+        }
+        assert!(missing.is_empty(), "glyphs missing from the built-in fonts: {missing:?}");
+    }
+}

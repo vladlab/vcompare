@@ -2,7 +2,7 @@
 
 Branch: `egui-port` (off `detector-tabs` at `1572726`). **Status: §1 built
 and checked by Vladimir (2026-11-24); §2 spike built and accepted (go);
-§3 and §4 built, see their status notes.** §1: Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
+§3, §4 and §5 built, see their status notes.** §1: Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
 Resolve): 131 tests from the workspace root (126 engine, 5 service, three
 of them end to end through `Service` on a generated clip); every
 `invoke()` in `rpc.ts` matched to a command with the same argument names
@@ -441,6 +441,65 @@ Vladimir said go after the spike. Built in `crates/vcompare-egui`:
   handling a shortcut.
 - **Exit cleanup:** kill children in `App::on_exit` and in a `Drop` on
   `Service`.
+
+### §5 status (2026-11-24): built
+
+- **Players:**
+  - `p` / `P` mpv, `d` / `D` the difference view; launched on a worker
+    and started at the cursor.
+  - A cursor the user moves seeks the players, debounced 50 ms. `s`
+    seeks now.
+  - `a` auto-seek: mpv's position moves the cursor without seeking mpv
+    back.
+  - With a player open, `.` / `,` step the players; otherwise they step
+    the cursor (a native-UI extra; arrows always step the cursor). Space
+    pauses.
+  - Badges in the top bar ("mpv · sync=fwd|bidi", "diff view"). An exit
+    with an error goes to the status line for 15 s.
+- **Resolve sync:**
+  - `r` / the top-bar button; the status text next to it (connecting,
+    target, seek failed, failed).
+  - User cursor moves are sent to Resolve (newest only, engine-side).
+  - After a real timeline run it switches itself on unless the operator
+    turned it off.
+- **Timeline mode** (`timeline.rs`):
+  - **Setup:** Connect / Refresh from Resolve; track checklist,
+    newest first, ticks kept across refreshes; clip and sample counts;
+    offset; dry run; grabber line; Start with the blocker reason; the
+    "before you run" checklist.
+  - **Progress:** sample n / N · TC · clip · ETA.
+  - **Results:** the compact report above the chart; sparse points;
+    "Mismatches" tab (0.1–10 % slider, hide cut frames, mismatch / error
+    rows, "sample" tiles) and a Report tab.
+  - **Dry run** (or nothing compared): its own report screen.
+- **Diff / VMAF:** the REF / DIST timeline bar above the chart: timecode
+  axis, overlap, event ticks, cursor, click / drag to move the cursor.
+- **Smoothing (`f`):** off / 5 / 11 / 21 / 51, a running median (same
+  result as the web UI's), computed on a worker, with its own pyramid.
+- **Exit:** `App::on_exit` calls `Service::shutdown` (ffmpeg, players,
+  Resolve helper).
+- **Fixed on the way:**
+  - **Levels y range.** It came from the series' max (over 255 →
+    1023), so a smoothed 10-bit series dropped to 0–255. It now comes
+    from the analysis's bit depth. The web UI has the same bug, not fixed
+    there.
+  - **Glyph test.** A new test checks every non-ASCII character in the
+    crate's code against egui's built-in fonts. The ones that were boxes
+    (▸ ▾ → ⚠ ✕ ■ ⌘) are replaced; arrows are allowed in monospace text
+    only.
+- **Gate, under Xvfb:**
+  - **Timeline** against the repo's fake Resolve + fake grabber
+    (`scripts/dev/fake_timeline_demo.sh`): connect lists V1 and V2;
+    Check timeline runs 21 samples with live progress; the result shows
+    the report, Mismatches (6) for the planted faults and Report; Resolve
+    sync switched on by itself, and `n` moved the fake playhead
+    (01:00:04:00 → 01:00:04:23).
+  - **Dry run:** the report screen; nothing saved.
+  - **mpv** (installed in the sandbox): `p` opened side by side; a chart
+    click seeked it; `a` + 5 × `.` moved the cursor 87043 → 87048; `P`
+    closed it. `d` / `D` likewise.
+  - **Ctrl+Q with both open:** no mpv left.
+  - **Smoothing:** spikes gone at 5, axis stays at the bit depth's peak.
 
 ## 6. Handoff and removal
 

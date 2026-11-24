@@ -301,11 +301,12 @@ the usual WebKitGTK workaround env vars automatically.
 ## Native UI (egui) — in progress
 
 `crates/vcompare-egui` is the native UI that will replace the Tauri/Svelte
-one (see `docs/plans/egui-port.md`). It runs levels, pixel diff (± SSIM)
-and VMAF analyses and opens saved ones: chart, frame table and the Flash
-frames, Repeats and Image match tabs (with reviews, EDL / CSV export and
-reference pictures). Not there yet: mpv, Resolve sync and timeline mode
-(use the Tauri app for those).
+one (see `docs/plans/egui-port.md`). It does everything the web UI does:
+levels, pixel diff (± SSIM), VMAF and timeline (vs. Resolve SDI) analyses;
+the chart, frame table and the Flash / Mismatches, Repeats and Image match
+tabs with reviews and EDL / CSV export; mpv side by side and the difference
+view; DaVinci Resolve playhead sync. Still to come: a settings window for
+tool paths, and packaging.
 
 It needs no WebKit and no `-devel` packages, so it builds on Rocky / RHEL 9
 as well, with only Rust and gcc:

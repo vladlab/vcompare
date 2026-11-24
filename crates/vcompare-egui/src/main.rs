@@ -17,6 +17,7 @@ mod settings;
 mod table;
 mod theme;
 mod thumbs;
+mod timeline;
 
 fn renderer() -> eframe::Renderer {
     let want = std::env::var("VCOMPARE_RENDERER").unwrap_or_default();

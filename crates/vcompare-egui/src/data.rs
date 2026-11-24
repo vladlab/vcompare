@@ -19,6 +19,11 @@ pub struct Series {
 impl Series {
     pub fn load(svc: &Service, metric: &str) -> Result<Series, String> {
         let (frames, values) = svc.metric_series(metric)?;
+        Ok(Series::from_arrays(metric.to_string(), frames, values))
+    }
+
+    /// A series from arrays (min / max and pyramid computed).
+    pub fn from_arrays(metric: String, frames: Vec<i64>, values: Vec<f64>) -> Series {
         let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
         for &x in &values {
             if x.is_finite() {
@@ -30,7 +35,13 @@ impl Series {
             (min, max) = (0.0, 0.0);
         }
         let pyramid = Pyramid::new(&values);
-        Ok(Series { metric: metric.to_string(), frames, values, pyramid, min, max })
+        Series { metric, frames, values, pyramid, min, max }
+    }
+
+    /// The same series through a running median of `window` points (odd;
+    /// <= 1 = unchanged). App.svelte's `f` smoothing.
+    pub fn smoothed(&self, window: usize) -> Series {
+        Series::from_arrays(self.metric.clone(), self.frames.clone(), running_median(&self.values, window))
     }
 
     /// Index of the first point at or after `frame`.
@@ -59,6 +70,26 @@ impl Series {
     pub fn value_at(&self, frame: i64) -> Option<f64> {
         self.frames.binary_search(&frame).ok().map(|i| self.values[i])
     }
+}
+
+/// Median of each point's neighbourhood (`window` points centred on it,
+/// clipped at the ends). Same result as App.svelte's `runningMedian`.
+pub fn running_median(values: &[f64], window: usize) -> Vec<f64> {
+    if window <= 1 {
+        return values.to_vec();
+    }
+    let half = (window - 1) / 2;
+    let mut buf = Vec::with_capacity(window);
+    (0..values.len())
+        .map(|i| {
+            let lo = i.saturating_sub(half);
+            let hi = (i + half).min(values.len() - 1);
+            buf.clear();
+            buf.extend_from_slice(&values[lo..=hi]);
+            let mid = buf.len() / 2;
+            *buf.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1
+        })
+        .collect()
 }
 
 /// Every frame's row for the table, column-wise.
@@ -140,5 +171,24 @@ impl Loaded {
             (false, true) => name(&self.ref_path),
             (false, false) => format!("{} vs {}", name(&self.ref_path), name(&self.dist_path)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn running_median_matches_the_web_ui() {
+        // JS: sort the clipped window, take slice[floor(len / 2)].
+        let v = [1.0, 9.0, 2.0, 8.0, 3.0, 7.0, 4.0];
+        assert_eq!(running_median(&v, 1), v.to_vec());
+        assert_eq!(running_median(&v, 3), vec![9.0, 2.0, 8.0, 3.0, 7.0, 4.0, 7.0]);
+        assert_eq!(running_median(&v, 5)[0], 2.0);
+        assert_eq!(running_median(&[], 5), Vec::<f64>::new());
+        // A single-frame spike disappears.
+        let mut s = vec![10.0; 50];
+        s[25] = 900.0;
+        assert!(running_median(&s, 5).iter().all(|&x| x == 10.0));
     }
 }

@@ -30,6 +30,9 @@ pub struct ChartProps<'a> {
     pub threshold: Option<f64>,
     pub timeline: Option<&'a TimelineInfo>,
     pub sparse: bool,
+    /// Signal peak (2^bit_depth − 1) for the levels y range; without it the
+    /// peak is guessed from the data, which a smoothed series can fool.
+    pub peak: Option<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -263,7 +266,7 @@ impl Chart {
         let ppp = ui.ctx().pixels_per_point();
         let (color, _) = theme::metric_style(&s.metric);
         let label = theme::metric_label(&s.metric);
-        let (y0, y1) = y_range(&s.metric, s);
+        let (y0, y1) = y_range(&s.metric, s, p.peak);
 
         painter.rect_filled(full, 0.0, theme::BG_SURFACE);
         // Grid + axes
@@ -368,7 +371,7 @@ fn is_levels(m: &str) -> bool {
 }
 
 /// Y range per metric (MetricChart.svelte `yRange`).
-fn y_range(metric: &str, s: &Series) -> (f64, f64) {
+fn y_range(metric: &str, s: &Series, peak: Option<f64>) -> (f64, f64) {
     if metric == "vmaf" {
         return (0.0, 100.0);
     }
@@ -385,7 +388,7 @@ fn y_range(metric: &str, s: &Series) -> (f64, f64) {
         return ((min - pad).max(0.0), (max + pad).min(1.0));
     }
     if is_levels(metric) {
-        return (0.0, if max > 255.0 { 1023.0 } else { 255.0 });
+        return (0.0, peak.unwrap_or(if max > 255.0 { 1023.0 } else { 255.0 }));
     }
     let pad = if (max - min) * 0.05 != 0.0 { (max - min) * 0.05 } else { 1.0 };
     (min - pad, max + pad)

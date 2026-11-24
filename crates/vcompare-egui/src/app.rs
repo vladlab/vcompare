@@ -15,6 +15,7 @@ use crate::settings::Settings;
 use crate::table::FrameTable;
 use crate::theme;
 use crate::thumbs::{ThumbLoader, QUICK, SETTLE};
+use crate::timeline;
 use eframe::egui::{self, Key, RichText, TextureHandle, Ui};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -24,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vcompare_service::engine::detect::{DetectResult, Detector};
 use vcompare_service::engine::references::StoredReference;
+use vcompare_service::engine::resolve::ResolveStatus;
 use vcompare_service::engine::types::{Capabilities, ProbeResult};
 use vcompare_service::{AnalyzeParams, RecentEntry, Service, UiEvent};
 
@@ -40,6 +42,15 @@ enum Msg {
         perf: Option<String>,
     },
     Series(Result<Series, String>),
+    /// A smoothed copy of the shown series (generation, series).
+    Smoothed(u64, Series),
+    /// A timeline run with nothing to chart (dry run, or nothing compared).
+    TimelineOnly { token: u64, summary: Value },
+    /// `timeline_tracks` (timeline mode's Connect to Resolve).
+    Tracks(Result<Value, String>),
+    /// mpv (false) or the difference view (true) launched, or not.
+    PlayerLaunched(bool, Result<&'static str, String>),
+    ResolveConnected(Result<ResolveStatus, String>),
     Detected(Detector, u64, Result<DetectResult, String>),
     Exported(Result<String, String>),
     /// An events export finished: (rows written, path) or error; EDL or CSV.
@@ -67,12 +78,17 @@ enum Dialog {
 enum Tab {
     Frames,
     Det(Detector),
+    /// Timeline mode: the run report.
+    Report,
 }
 
 enum Screen {
     Pick,
     Working(Job),
     Results,
+    /// A timeline run with nothing to chart: its report (dry run, or
+    /// every sample failed).
+    TimelineReport(Value),
     Error(String),
 }
 
@@ -106,6 +122,28 @@ pub struct VcApp {
     show_perf: bool,
     show_keys: bool,
     recents: Option<Vec<RecentEntry>>,
+    // ── Players (mpv side-by-side / single, difference view) ──
+    mpv: bool,
+    diffview: bool,
+    /// mpv's frame; followed by the cursor when `auto_seek` (bidirectional).
+    auto_seek: bool,
+    /// The cursor last sent to players / Resolve.
+    synced_cursor: i64,
+    /// The cursor moved because mpv did (auto-seek): don't seek mpv back.
+    cursor_from_player: bool,
+    /// Debounced player seek: (frame, when).
+    pending_seek: Option<(i64, Instant)>,
+    // ── DaVinci Resolve playhead sync ──
+    resolve_on: bool,
+    resolve_busy: bool,
+    resolve_status: ResolveStatus,
+    /// Set once the operator turns sync off, so a later timeline run
+    /// doesn't switch it back on.
+    resolve_declined: bool,
+    // ── Smoothing (f) ──
+    smooth: usize,
+    smoothed: Option<Series>,
+    smooth_gen: u64,
     /// A file dialog is open (they run on a worker thread so the window
     /// keeps painting); others wait.
     dialog_open: bool,
@@ -156,6 +194,19 @@ impl VcApp {
             show_perf: false,
             show_keys: false,
             recents: None,
+            mpv: false,
+            diffview: false,
+            auto_seek: false,
+            synced_cursor: -1,
+            cursor_from_player: false,
+            pending_seek: None,
+            resolve_on: false,
+            resolve_busy: false,
+            resolve_status: ResolveStatus::Disconnected,
+            resolve_declined: false,
+            smooth: 0,
+            smoothed: None,
+            smooth_gen: 0,
             dialog_open: false,
             quit: false,
         };
@@ -202,12 +253,21 @@ impl VcApp {
         self.save_settings();
         let mode = params.mode.clone().unwrap_or_default();
         let token = self.begin(JobKind::Analyze { mode });
+        let timeline = params.mode.as_deref() == Some("timeline");
         self.spawn(ctx, move |svc| {
             let r = svc.analyze(&params);
             let perf = r.as_ref().ok().and_then(|s| s["perf"].as_str().map(String::from));
-            let path = params.log_path.clone().unwrap_or_default();
+            if let Ok(summary) = &r {
+                let nothing = summary["metrics_available"].as_array().is_none_or(|a| a.is_empty()) || summary["frame_count"].as_u64() == Some(0);
+                if timeline && nothing {
+                    return Msg::TimelineOnly { token, summary: summary.clone() };
+                }
+            }
+            // Timeline runs say where they saved (none for a dry run).
+            let path = params.log_path.clone().or_else(|| r.as_ref().ok().and_then(|s| s["save_path"].as_str().map(String::from))).unwrap_or_default();
             let result = r.and_then(|summary| Loaded::from_summary(svc, summary, &path));
-            Msg::Finished { token, result, what: "Analysis failed", perf }
+            let what = if timeline { "Timeline check failed" } else { "Analysis failed" };
+            Msg::Finished { token, result, what, perf }
         });
     }
 
@@ -280,9 +340,22 @@ impl VcApp {
             _ => None,
         };
         let mode = loaded.mode.clone();
+        let dry = loaded.summary["timeline_run"]["dry_run"].as_bool() == Some(true);
+        self.dets[det::index(Detector::Flash)].timeline = mode == "timeline";
         self.loaded = Some(loaded);
         self.series = Some(series);
+        self.smoothed = None;
+        self.smooth_gen += 1;
         self.screen = Screen::Results;
+        if self.smooth > 0 {
+            self.resmooth(ctx);
+        }
+        // Reviewing a flagged sample means seeing it on the reference
+        // monitor: follow the cursor in Resolve unless the operator turned
+        // that off.
+        if mode == "timeline" && !dry && !self.resolve_on && !self.resolve_busy && !self.resolve_declined {
+            self.toggle_resolve(ctx);
+        }
         if !self.tabs().contains(&self.tab) {
             self.tab = Tab::Frames;
         }
@@ -300,6 +373,9 @@ impl VcApp {
         let mode = self.loaded.as_ref().map(|l| l.mode.as_str()).unwrap_or("");
         let mut t = vec![Tab::Frames];
         t.extend(det::ALL.iter().filter(|k| det::in_mode(**k, mode)).map(|k| Tab::Det(*k)));
+        if mode == "timeline" {
+            t.push(Tab::Report);
+        }
         t
     }
 
@@ -346,6 +422,147 @@ impl VcApp {
         self.pick.clear_files();
         self.screen = Screen::Pick;
         self.recents = None;
+        self.kill_players();
+    }
+
+    // ── Players ──
+
+    fn kill_players(&mut self) {
+        if self.mpv {
+            self.svc.mpv_kill();
+        }
+        if self.diffview {
+            self.svc.diffview_kill();
+        }
+        self.mpv = false;
+        self.diffview = false;
+        self.auto_seek = false;
+        self.pending_seek = None;
+    }
+
+    fn launch_player(&mut self, ctx: &egui::Context, diff: bool) {
+        if (diff && self.diffview) || (!diff && self.mpv) {
+            return;
+        }
+        self.spawn(ctx, move |svc| Msg::PlayerLaunched(diff, if diff { svc.diffview_launch() } else { svc.mpv_launch() }));
+    }
+
+    fn kill_player(&mut self, diff: bool) {
+        if diff {
+            self.svc.diffview_kill();
+            self.diffview = false;
+        } else {
+            self.svc.mpv_kill();
+            self.mpv = false;
+            self.auto_seek = false;
+        }
+    }
+
+    /// Something every running player does: seek, step, pause.
+    fn players(&self, ctx: &egui::Context, f: impl Fn(&Service, bool) + Send + Sync + 'static) {
+        let (mpv, diff) = (self.mpv, self.diffview);
+        if !mpv && !diff {
+            return;
+        }
+        let (svc, ctx) = (self.svc.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            if mpv {
+                f(&svc, false);
+            }
+            if diff {
+                f(&svc, true);
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn seek_players(&self, ctx: &egui::Context, frame: i64) {
+        self.players(ctx, move |svc, diff| {
+            let _ = if diff { svc.diffview_seek(frame) } else { svc.mpv_seek(frame) };
+        });
+    }
+
+    // ── Resolve ──
+
+    fn toggle_resolve(&mut self, ctx: &egui::Context) {
+        if self.resolve_busy {
+            return;
+        }
+        if self.resolve_on {
+            self.resolve_on = false;
+            self.resolve_declined = true;
+            self.resolve_status = ResolveStatus::Disconnected;
+            self.spawn(ctx, |svc| {
+                svc.resolve_disconnect();
+                Msg::ResolveConnected(Ok(ResolveStatus::Disconnected))
+            });
+            return;
+        }
+        self.resolve_busy = true;
+        self.resolve_status = ResolveStatus::Connecting;
+        self.spawn(ctx, |svc| Msg::ResolveConnected(svc.resolve_connect()));
+    }
+
+    fn resolve_text(&self) -> Option<(String, egui::Color32)> {
+        match &self.resolve_status {
+            ResolveStatus::Connecting => Some(("connecting…".into(), theme::TEXT_DIM)),
+            ResolveStatus::Connected { target } => Some((target.clone(), theme::TEXT_DIM)),
+            ResolveStatus::SeekFailed { message } => Some((format!("seek failed: {message}"), theme::WARNING)),
+            ResolveStatus::Failed { message } => Some((format!("failed: {message}"), theme::THRESHOLD)),
+            ResolveStatus::Disconnected => None,
+        }
+    }
+
+    /// After a frame: send a cursor the user moved to the players
+    /// (debounced 50 ms) and to Resolve (the engine sends the newest only).
+    fn sync_cursor(&mut self, ctx: &egui::Context) {
+        if self.cursor != self.synced_cursor {
+            if !self.cursor_from_player && self.cursor >= 0 && matches!(self.screen, Screen::Results) {
+                if self.mpv || self.diffview {
+                    self.pending_seek = Some((self.cursor, Instant::now() + Duration::from_millis(50)));
+                }
+                if self.resolve_on {
+                    let f = self.cursor;
+                    let svc = self.svc.clone();
+                    std::thread::spawn(move || {
+                        let _ = svc.resolve_seek(f);
+                    });
+                }
+            }
+            self.synced_cursor = self.cursor;
+            self.cursor_from_player = false;
+        }
+        if let Some((f, at)) = self.pending_seek {
+            let now = Instant::now();
+            if now >= at {
+                self.pending_seek = None;
+                self.seek_players(ctx, f);
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
+    }
+
+    // ── Smoothing ──
+
+    const SMOOTH: [usize; 5] = [0, 5, 11, 21, 51];
+
+    fn resmooth(&mut self, ctx: &egui::Context) {
+        self.smooth_gen += 1;
+        self.smoothed = None;
+        let w = Self::SMOOTH[self.smooth];
+        let Some(s) = self.series.as_ref() else { return };
+        if w <= 1 {
+            return;
+        }
+        let g = self.smooth_gen;
+        let (frames, values, metric) = (s.frames.clone(), s.values.clone(), s.metric.clone());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let raw = Series::from_arrays(metric, frames, values);
+            let _ = tx.send(Msg::Smoothed(g, raw.smoothed(w)));
+            ctx.request_repaint();
+        });
     }
 
     // ── Pick screen plumbing ──
@@ -378,6 +595,7 @@ impl VcApp {
                 PickAction::Analyze(p) => self.analyze(ctx, p),
                 PickAction::LoadCached(p) => self.open_saved(ctx, p, "Failed to load cached analysis"),
                 PickAction::ModeChanged => self.save_settings(),
+                PickAction::TimelineConnect => self.spawn(ctx, |svc| Msg::Tracks(svc.timeline_tracks())),
             }
         }
     }
@@ -390,7 +608,7 @@ impl VcApp {
         self.pick.cache = None;
         let key = self.cache_key();
         let (mode, r, d) = key.clone();
-        if r.is_empty() || (mode != "levels" && d.is_empty()) {
+        if r.is_empty() || mode == "timeline" || (mode != "levels" && d.is_empty()) {
             return;
         }
         self.spawn(ctx, move |svc| {
@@ -491,7 +709,59 @@ impl VcApp {
                         Err(e) => self.screen = Screen::Error(format!("{what}: {e}")),
                     }
                 }
-                Msg::Series(Ok(s)) => self.series = Some(s),
+                Msg::Series(Ok(s)) => {
+                    self.series = Some(s);
+                    self.resmooth(ctx);
+                }
+                Msg::Smoothed(g, s) => {
+                    if g == self.smooth_gen {
+                        self.smoothed = Some(s);
+                    }
+                }
+                Msg::TimelineOnly { token, summary } => {
+                    if token == self.job_token {
+                        self.screen = Screen::TimelineReport(summary);
+                    }
+                }
+                Msg::Tracks(r) => self.pick.timeline.connected(r),
+                Msg::PlayerLaunched(diff, r) => match r {
+                    Ok(_) => {
+                        if diff {
+                            self.diffview = true;
+                        } else {
+                            self.mpv = true;
+                        }
+                        // Start where the cursor is.
+                        if self.cursor >= 0 {
+                            let f = self.cursor;
+                            self.spawn(ctx, move |svc| {
+                                let _ = if diff { svc.diffview_seek(f) } else { svc.mpv_seek(f) };
+                                Msg::Service(UiEvent::Diagnostics(vec![]))
+                            });
+                        }
+                    }
+                    Err(e) => self.say(if diff { format!("difference view: {e}") } else { format!("mpv: {e}") }, true),
+                },
+                Msg::ResolveConnected(r) => {
+                    self.resolve_busy = false;
+                    match r {
+                        Ok(st) => {
+                            self.resolve_on = matches!(st, ResolveStatus::Connected { .. });
+                            self.resolve_status = st;
+                            if self.resolve_on && self.cursor >= 0 {
+                                let (f, svc) = (self.cursor, self.svc.clone());
+                                std::thread::spawn(move || {
+                                    let _ = svc.resolve_seek(f);
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            self.resolve_on = false;
+                            self.resolve_status = ResolveStatus::Failed { message: e.clone() };
+                            self.status = Some((format!("Resolve: {e}"), Instant::now(), Duration::from_secs(12), true));
+                        }
+                    }
+                }
                 Msg::Series(Err(e)) => self.say(e, true),
                 Msg::Detected(k, g, r) if g == self.detect_gen[det::index(k)] => {
                     let d = &mut self.dets[det::index(k)];
@@ -582,15 +852,52 @@ impl VcApp {
                 }
                 Msg::Exported(Ok(p)) => self.say(format!("Exported {p}"), false),
                 Msg::Exported(Err(e)) => self.say(format!("Export failed: {e}"), true),
-                Msg::Service(e) => {
-                    if let Screen::Working(job) = &mut self.screen {
-                        match e {
-                            UiEvent::Progress { current, total } => job.progress(current, total),
-                            UiEvent::Diagnostics(lines) => job.diagnostics = lines,
-                            _ => {}
+                Msg::Service(e) => match e {
+                    UiEvent::Progress { current, total } => {
+                        if let Screen::Working(job) = &mut self.screen {
+                            job.progress(current, total);
                         }
                     }
-                }
+                    UiEvent::Diagnostics(lines) => {
+                        if let Screen::Working(job) = &mut self.screen {
+                            if !lines.is_empty() {
+                                job.diagnostics = lines;
+                            }
+                        }
+                    }
+                    UiEvent::TimelineProgress(p) => {
+                        if let Screen::Working(job) = &mut self.screen {
+                            job.timeline = Some(p);
+                        }
+                    }
+                    UiEvent::MpvPosition(f) => {
+                        if self.auto_seek && self.mpv && matches!(self.screen, Screen::Results) && f != self.cursor {
+                            self.cursor = f;
+                            self.cursor_from_player = true;
+                        }
+                    }
+                    UiEvent::DiffviewPosition(_) => {}
+                    UiEvent::MpvExited(x) => {
+                        self.mpv = false;
+                        self.auto_seek = false;
+                        if let Some(e) = x.error {
+                            self.status = Some((format!("mpv: {e}"), Instant::now(), Duration::from_secs(15), true));
+                        }
+                    }
+                    UiEvent::DiffviewExited(x) => {
+                        self.diffview = false;
+                        if let Some(e) = x.error {
+                            self.status = Some((format!("difference view — {e}"), Instant::now(), Duration::from_secs(15), true));
+                        }
+                    }
+                    UiEvent::ResolveStatus(st) => {
+                        if let ResolveStatus::Failed { message } = &st {
+                            self.resolve_on = false;
+                            self.status = Some((format!("Resolve: {message}"), Instant::now(), Duration::from_secs(12), true));
+                        }
+                        self.resolve_status = st;
+                    }
+                },
             }
         }
     }
@@ -651,8 +958,37 @@ impl VcApp {
                 Key::Equals | Key::Plus => self.chart.zoom_keys(series, tl, self.cursor, 0.5),
                 Key::Minus => self.chart.zoom_keys(series, tl, self.cursor, 2.0),
                 Key::Num0 => self.chart.reset(),
+                // With a player open, . and , step the players (and auto-seek
+                // brings the cursor along); otherwise they step the cursor.
+                Key::Period | Key::Comma if self.mpv || self.diffview => {
+                    let fwd = key == Key::Period;
+                    self.players(ctx, move |svc, diff| {
+                        let d = if fwd { "forward" } else { "backward" };
+                        let _ = if diff { svc.diffview_step(d) } else { svc.mpv_step(d) };
+                    });
+                }
                 Key::Period | Key::ArrowRight => self.step(1),
                 Key::Comma | Key::ArrowLeft => self.step(-1),
+                Key::P if m.shift => self.kill_player(false),
+                Key::P => self.launch_player(ctx, false),
+                Key::D if m.shift => self.kill_player(true),
+                Key::D => self.launch_player(ctx, true),
+                Key::S => {
+                    if self.cursor >= 0 {
+                        self.seek_players(ctx, self.cursor);
+                    }
+                }
+                Key::A => self.auto_seek = !self.auto_seek,
+                Key::R => self.toggle_resolve(ctx),
+                Key::Space => self.players(ctx, |svc, diff| {
+                    let _ = if diff { svc.diffview_pause() } else { svc.mpv_toggle_pause() };
+                }),
+                Key::F => {
+                    self.smooth = (self.smooth + 1) % Self::SMOOTH.len();
+                    self.resmooth(ctx);
+                    let w = Self::SMOOTH[self.smooth];
+                    self.say(if w == 0 { "Smoothing off".to_string() } else { format!("Smoothing: running median of {w} frames") }, false);
+                }
                 Key::M => {
                     let ms = &loaded.metrics;
                     if let Some(i) = ms.iter().position(|x| *x == series.metric) {
@@ -673,6 +1009,7 @@ impl VcApp {
                     match self.tab {
                         Tab::Det(_) => self.next_event(d),
                         Tab::Frames => self.step(d as i64),
+                        Tab::Report => {}
                     }
                 }
                 Key::T if m.shift => self.threshold = None,
@@ -690,7 +1027,7 @@ impl VcApp {
         let (Some(l), Some(t)) = (&self.loaded, &self.table) else { return };
         let next = match self.tab {
             Tab::Frames => t.step(&l.rows, self.cursor, d),
-            Tab::Det(_) => l.rows.index_of(self.cursor).and_then(|i| {
+            Tab::Det(_) | Tab::Report => l.rows.index_of(self.cursor).and_then(|i| {
                 let j = (i as i64 + d).clamp(0, l.rows.frames.len() as i64 - 1) as usize;
                 l.rows.frames.get(j).copied()
             }),
@@ -822,7 +1159,7 @@ impl VcApp {
         let ctx = ui.ctx().clone();
         let working = matches!(self.screen, Screen::Working(_));
         let results = matches!(self.screen, Screen::Results);
-        let sc = |k: &str| egui::RichText::new(if cfg!(target_os = "macos") { k.replace("Ctrl+", "⌘") } else { k.to_string() });
+        let sc = |k: &str| egui::RichText::new(if cfg!(target_os = "macos") { k.replace("Ctrl+", "Cmd+") } else { k.to_string() });
         ui.menu_button("File", |ui| {
             if ui.add_enabled(!working, egui::Button::new("New Analysis").shortcut_text(sc("Ctrl+N"))).clicked() {
                 self.new_analysis();
@@ -891,6 +1228,32 @@ impl VcApp {
                 if ui.button("Keys").on_hover_text("Keyboard and mouse shortcuts (F1)").clicked() {
                     self.show_keys = !self.show_keys;
                 }
+                if matches!(self.screen, Screen::Results) {
+                    let label = if self.resolve_on { "Resolve sync on" } else { "Resolve sync off" };
+                    let mut b = egui::Button::new(RichText::new(label).size(12.0)).selected(self.resolve_on);
+                    if matches!(self.resolve_status, ResolveStatus::SeekFailed { .. }) {
+                        b = b.stroke(egui::Stroke::new(1.0, theme::WARNING));
+                    }
+                    if ui
+                        .add_enabled(!self.resolve_busy, b)
+                        .on_hover_text(
+                            "Follow the cursor in DaVinci Resolve's open timeline (r). Needs Resolve running with external scripting enabled: \
+                             Preferences › System › General › External scripting using: Local.",
+                        )
+                        .clicked()
+                    {
+                        self.toggle_resolve(&ctx);
+                    }
+                    if let Some((t, c)) = self.resolve_text() {
+                        ui.add(egui::Label::new(RichText::new(t).monospace().size(11.0).color(c)).truncate());
+                    }
+                    if self.diffview {
+                        ui.label(RichText::new("diff view").size(11.0).color(theme::ACCENT));
+                    }
+                    if self.mpv {
+                        ui.label(RichText::new(format!("mpv · sync={}", if self.auto_seek { "bidi" } else { "fwd" })).size(11.0).color(theme::ACCENT));
+                    }
+                }
                 if let Some((title, line, path)) = info {
                     ui.add(egui::Label::new(RichText::new(line).monospace().size(11.5).color(theme::TEXT_DIM)).truncate());
                     ui.add(egui::Label::new(RichText::new(title).strong()).truncate()).on_hover_text(path);
@@ -909,7 +1272,15 @@ impl VcApp {
             ("m  M", "next / previous metric"),
             ("t  T", "threshold line from the metric (mean ± σ) / clear it"),
             ("1 – 4", "tabs under the chart"),
+            ("f", "smoothing: off / 5 / 11 / 21 / 51 frames (running median)"),
             ("e", "export CSV"),
+            ("p  P", "open / close mpv (side by side; the file alone for levels)"),
+            ("d  D", "open / close the difference view"),
+            ("s", "seek the players to the cursor"),
+            ("a", "auto-seek: the cursor follows mpv too (bidirectional)"),
+            ("space", "pause / play the players"),
+            (". ,", "with a player open: step the players"),
+            ("r", "DaVinci Resolve playhead sync on / off"),
             ("Esc", "cancel the running analysis (nothing is saved)"),
             ("Ctrl+N", "new analysis"),
             ("Ctrl+O", "open an analysis (or drop a file on the window)"),
@@ -1008,6 +1379,9 @@ impl VcApp {
                     if let Some(v) = s.value_at(self.cursor) {
                         ui.label(RichText::new(format!("{} {v:.3}", theme::metric_label(&s.metric))).monospace().color(theme::TEXT_DIM));
                     }
+                    if self.smooth > 0 {
+                        ui.label(RichText::new(format!("smooth {}", Self::SMOOTH[self.smooth])).monospace().color(theme::ACCENT));
+                    }
                     ui.separator();
                 }
             }
@@ -1046,9 +1420,26 @@ impl VcApp {
         let active = self.active_detector();
         {
             let loaded = self.loaded.as_ref().unwrap();
-            let series = self.series.as_ref().unwrap();
+            let series = self.smoothed.as_ref().filter(|s| Some(&s.metric) == self.series.as_ref().map(|r| &r.metric)).unwrap_or(self.series.as_ref().unwrap());
             let mut events: Vec<_> = active.map(|k| self.dets[det::index(k)].visible().into_iter().cloned().collect()).unwrap_or_default();
             events.sort_by_key(|e| e.frame);
+            // Timeline mode: what the run looked at, above the chart.
+            if loaded.mode == "timeline" && loaded.summary["timeline_run"].is_object() {
+                egui::Panel::top("timeline_report")
+                    .frame(egui::Frame::NONE.fill(theme::BG_SURFACE).inner_margin(egui::Margin::symmetric(12, 6)))
+                    .show(ui, |ui| timeline::report(ui, &loaded.summary["timeline_run"], false));
+            }
+            // Compare modes: how the two clips sit in timecode.
+            if let Some(tl) = loaded.timeline.as_ref() {
+                let fps = loaded.summary["tc_format"]["fps_num"].as_f64().unwrap_or(24.0) / loaded.summary["tc_format"]["fps_den"].as_f64().unwrap_or(1.0).max(1.0);
+                let svc = self.svc.clone();
+                let tc = move |f: i64| svc.engine().frame_to_tc(f).unwrap_or_else(|_| format!("F{f}"));
+                egui::Panel::top("timeline_bar").frame(egui::Frame::NONE.fill(theme::BG_SURFACE).inner_margin(egui::Margin::symmetric(8, 4))).show(ui, |ui| {
+                    if let Some(f) = timeline::bar(ui, tl, fps, &events, self.cursor, &tc) {
+                        new_cursor = Some(f);
+                    }
+                });
+            }
             egui::Panel::top("chart")
                 .resizable(true)
                 .default_size((h * 0.45).max(260.0))
@@ -1061,6 +1452,7 @@ impl VcApp {
                         threshold: self.threshold,
                         timeline: loaded.timeline.as_ref(),
                         sparse: loaded.mode == "timeline",
+                        peak: loaded.summary["bit_depth"].as_u64().filter(|b| (8..=16).contains(b)).map(|b| ((1u64 << b) - 1) as f64),
                     };
                     new_cursor = self.chart.show(ui, series, &props);
                 });
@@ -1072,10 +1464,11 @@ impl VcApp {
                 for (n, t) in tabs.iter().enumerate() {
                     let (label, tip) = match t {
                         Tab::Frames => ("Frames".to_string(), None),
+                        Tab::Report => ("Report".to_string(), None),
                         Tab::Det(k) => {
                             let d = &self.dets[det::index(*k)];
                             let count = d.result.as_ref().map(|_| format!(" ({})", d.visible().len())).unwrap_or_default();
-                            (format!("{}{count}", det::tab_label(*k)), self.unavailable(*k))
+                            (format!("{}{count}", det::tab_label(*k, d.timeline)), self.unavailable(*k))
                         }
                     };
                     let mut text = RichText::new(label);
@@ -1100,6 +1493,11 @@ impl VcApp {
                             new_cursor = Some(f);
                         }
                     }
+                }
+                Tab::Report => {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        timeline::report(ui, &loaded.summary["timeline_run"], true);
+                    });
                 }
                 Tab::Det(k) => {
                     if let Some(why) = self.unavailable(k) {
@@ -1194,6 +1592,29 @@ impl eframe::App for VcApp {
                     self.cancel(&ctx);
                 }
             }
+            Screen::TimelineReport(summary) => {
+                let r = summary["timeline_run"].clone();
+                let mut back = false;
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.add_space(30.0);
+                        ui.vertical_centered(|ui| {
+                            ui.set_max_width(860.0f32.min(ui.available_width() - 40.0));
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                let title = if r["dry_run"].as_bool() == Some(true) { "Dry run finished" } else { "Nothing was compared" };
+                                ui.label(RichText::new(title).size(18.0).strong());
+                                ui.add_space(8.0);
+                                timeline::report(ui, &r, true);
+                                ui.add_space(10.0);
+                                back = ui.button("Back").clicked();
+                            });
+                        });
+                    });
+                });
+                if back {
+                    self.screen = Screen::Pick;
+                }
+            }
             Screen::Error(msg) => {
                 let msg = msg.clone();
                 let mut back = false;
@@ -1242,7 +1663,19 @@ impl eframe::App for VcApp {
                 self.pick_actions(&ctx, acts);
             }
         }
+        self.sync_cursor(&ctx);
         self.timing(t0);
+    }
+
+    // Kill ffmpeg, the players and the Resolve helper on the way out.
+    #[cfg(feature = "glow")]
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.svc.shutdown();
+    }
+
+    #[cfg(not(feature = "glow"))]
+    fn on_exit(&mut self) {
+        self.svc.shutdown();
     }
 }
 

@@ -24,19 +24,19 @@ pub fn index(k: Detector) -> usize {
     }
 }
 
-pub fn tab_label(k: Detector) -> &'static str {
+pub fn tab_label(k: Detector, timeline: bool) -> &'static str {
     match k {
+        Detector::Flash if timeline => "Mismatches",
         Detector::Flash => "Flash frames",
         Detector::Repeat => "Repeats",
         Detector::Match => "Image match",
     }
 }
 
-/// Modes where the detector has a tab (detectors.ts TABS; timeline mode
-/// comes with §5).
+/// Modes where the detector has a tab (detectors.ts TABS).
 pub fn in_mode(k: Detector, mode: &str) -> bool {
     match k {
-        Detector::Flash => mode == "diff" || mode == "levels",
+        Detector::Flash => mode == "diff" || mode == "levels" || mode == "timeline",
         Detector::Repeat | Detector::Match => mode == "levels",
     }
 }
@@ -95,6 +95,8 @@ pub struct RefView<'a> {
 
 pub struct DetectorTab {
     pub kind: Detector,
+    /// Timeline mode: the flash detector lists mismatching samples.
+    pub timeline: bool,
     pub flash: FlashParams,
     pub repeat: RepeatParams,
     pub matching: MatchParams,
@@ -116,6 +118,7 @@ impl DetectorTab {
     pub fn new(kind: Detector) -> Self {
         Self {
             kind,
+            timeline: false,
             flash: FlashParams::default(),
             repeat: RepeatParams::default(),
             matching: MatchParams::default(),
@@ -216,12 +219,15 @@ impl DetectorTab {
                 _ => format!("repeated {len}"),
             },
             "match" => format!("{} · {len}", e.label.as_deref().unwrap_or(&e.subkind)),
+            "error" => format!("{} · not checked: {}", e.label.as_deref().unwrap_or(""), e.subkind.replace('_', " ")),
+            "mismatch" => e.label.clone().unwrap_or_else(|| e.subkind.clone()),
             _ => format!("{} · {len}{}", e.subkind, if e.at_cut { " · at cut" } else { "" }),
         }
     }
 
     fn score(&self, e: &Event, threshold: f64) -> String {
         match e.kind.as_str() {
+            "error" => "—".into(),
             "repeat" if e.score >= 1.0 && e.score.fract() == 0.0 => String::new(),
             "repeat" => format!("×{:.1}", e.score),
             "match" => format!("×{:.2}", e.score),
@@ -229,7 +235,7 @@ impl DetectorTab {
             // change ÷ threshold), so it reads as "set the slider above this".
             _ if threshold > 0.0 => {
                 let pct = e.score * threshold * 100.0;
-                format!("{pct:.*}%", if pct < 10.0 { 1 } else { 0 })
+                format!("{pct:.*}%", if pct >= 10.0 { 0 } else if self.timeline { 2 } else { 1 })
             }
             _ => format!("×{:.1}", e.score),
         }
@@ -240,6 +246,7 @@ impl DetectorTab {
             ("prev", "repeat") => "shown".into(),
             ("prev", _) => "prev".into(),
             ("next", _) => "next".into(),
+            _ if self.timeline => "sample".into(),
             (_, "repeat") => "repeat".into(),
             (_, "match") => "match".into(),
             _ if e.length > 1 => format!("flash {k}"),
@@ -258,6 +265,7 @@ impl DetectorTab {
             }
             Detector::Match => "No frames match the ticked references.",
             Detector::Repeat => "No repeated frames.",
+            Detector::Flash if self.timeline => "No mismatches: every sample matches the SDI picture.",
             Detector::Flash => "No flash frames found.",
         }
     }
@@ -347,12 +355,18 @@ impl DetectorTab {
         let mut parts: Vec<(String, usize)> = Vec::new();
         let mut at_cut = 0;
         for e in &ev {
-            let k = if self.kind == Detector::Match { e.label.clone().unwrap_or_else(|| e.subkind.clone()) } else { e.subkind.clone() };
+            let k = if self.kind == Detector::Match {
+                e.label.clone().unwrap_or_else(|| e.subkind.clone())
+            } else if self.timeline {
+                e.kind.clone()
+            } else {
+                e.subkind.clone()
+            };
             match parts.iter_mut().find(|p| p.0 == k) {
                 Some(p) => p.1 += 1,
                 None => parts.push((k, 1)),
             }
-            at_cut += (self.kind == Detector::Flash && e.at_cut) as usize;
+            at_cut += (self.kind == Detector::Flash && !self.timeline && e.at_cut) as usize;
         }
         let (mut acc, mut rej) = (0, 0);
         for e in &r.events {
@@ -381,7 +395,7 @@ impl DetectorTab {
             add(&mut job, &format!("{rej} rejected"), theme::THRESHOLD);
         }
         if self.kind == Detector::Flash {
-            add(&mut job, &format!(" · thr {:.1}%", r.threshold * 100.0), theme::TEXT_DIM);
+            add(&mut job, &format!(" · thr {:.*}%", if self.timeline { 2 } else { 1 }, r.threshold * 100.0), theme::TEXT_DIM);
         }
         ui.label(job);
     }
@@ -421,22 +435,40 @@ impl DetectorTab {
     }
 
     fn flash_controls(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
+        let tl = self.timeline;
         let mut auto = self.flash.threshold.is_none();
-        if ui.checkbox(&mut auto, "auto").on_hover_text("Derive the threshold from the footage's own frame-to-frame noise").changed() {
+        let auto_tip = if tl {
+            "Derive the threshold from the cleanest samples of this run (lower quartile + 6σ, kept between 0.4% and 3% of peak, so a fault on every sample is still flagged)"
+        } else {
+            "Derive the threshold from the footage's own frame-to-frame noise"
+        };
+        if ui.checkbox(&mut auto, "auto").on_hover_text(auto_tip).changed() {
             self.flash.threshold = if auto { None } else { Some(self.result.as_ref().map(|r| r.threshold).unwrap_or(0.04)) };
             acts.push(Action::Adjusting);
             acts.push(Action::Changed);
         }
-        let current = self.flash.threshold.or(self.result.as_ref().map(|r| r.threshold)).unwrap_or(0.04);
-        let pct = (current * 1000.0).round() / 10.0;
-        if let Some(v) = self.slider(ui, pct, 0.5..=40.0, 0.5, 1, "%", !auto, "Minimum frame-to-frame change, as % of signal peak. Applies when you let go.", acts) {
+        let current = self.flash.threshold.or(self.result.as_ref().map(|r| r.threshold)).unwrap_or(0.04) * 100.0;
+        let (range, step, dec, tip) = if tl {
+            (0.1..=10.0, 0.05, 2, "RMS luma difference that flags a sample, as % of peak. Applies when you let go.")
+        } else {
+            (0.5..=40.0, 0.5, 1, "Minimum frame-to-frame change, as % of signal peak. Applies when you let go.")
+        };
+        let shown = (current / step).round() * step;
+        if let Some(v) = self.slider(ui, shown, range, step, dec, "%", !auto, tip, acts) {
             self.flash.threshold = Some(v.max(0.1) / 100.0);
         }
-        ui.label("≤");
-        let opts: Vec<(u32, String)> = (1..=5).map(|n| (n, n.to_string())).collect();
-        Self::combo(ui, "flash_max_run", &mut self.flash.max_run, &opts, acts);
-        ui.label("fr").on_hover_text("Longest run of frames that still counts as a flash");
-        if ui.checkbox(&mut self.flash.exclude_at_cut, "hide at-cut").on_hover_text("Hide short inserts that sit on a cut (fast montage, etc.)").changed() {
+        if !tl {
+            ui.label("≤");
+            let opts: Vec<(u32, String)> = (1..=5).map(|n| (n, n.to_string())).collect();
+            Self::combo(ui, "flash_max_run", &mut self.flash.max_run, &opts, acts);
+            ui.label("fr").on_hover_text("Longest run of frames that still counts as a flash");
+        }
+        let (label, tip) = if tl {
+            ("hide cut frames", "Hide samples on a clip's first or last frame (where an edit that moved by a frame shows)")
+        } else {
+            ("hide at-cut", "Hide short inserts that sit on a cut (fast montage, etc.)")
+        };
+        if ui.checkbox(&mut self.flash.exclude_at_cut, label).on_hover_text(tip).changed() {
             acts.push(Action::Adjusting);
             acts.push(Action::Changed);
         }
@@ -569,7 +601,7 @@ impl DetectorTab {
                                 self.editing = Some((r.id.clone(), r.name.clone(), false));
                             }
                             if r.flat {
-                                ui.label(RichText::new("■").color(theme::TEXT_DIM)).on_hover_text("Flat colour: matched by colour");
+                                ui.label(RichText::new("flat").size(10.5).color(theme::TEXT_DIM)).on_hover_text("Flat colour: matched by colour");
                             }
                             if ui.small_button("×").on_hover_text("Delete this reference").clicked() {
                                 acts.push(Action::Delete(r.id.clone()));
@@ -828,6 +860,19 @@ mod tests {
         assert_eq!(t.label(&e), "held 48 fr");
         assert_eq!(t.score(&e, 0.0), "");
         let f = DetectorTab::new(Detector::Flash);
+        let mut t = DetectorTab::new(Detector::Flash);
+        t.timeline = true;
+        let mut m = ev("mismatch", 1, 1);
+        m.label = Some("clip3 (V1, first)".into());
+        m.score = 2.5;
+        assert_eq!(t.label(&m), "clip3 (V1, first)");
+        assert_eq!(t.score(&m, 0.01), "2.50%");
+        let mut er = ev("error", 1, 1);
+        er.subkind = "grab_timeout".into();
+        er.label = Some("clip4 (V1, last)".into());
+        assert_eq!(t.label(&er), "clip4 (V1, last) · not checked: grab timeout");
+        assert_eq!(t.score(&er, 0.01), "—");
+        assert_eq!(t.role_label("run", &m, 1), "sample");
         let mut e = ev("flash", 1, 1);
         e.score = 15.0;
         e.at_cut = true;

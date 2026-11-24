@@ -3,6 +3,7 @@
 
 use crate::pick::{group, mode_label};
 use crate::theme;
+use vcompare_service::engine::timeline_run;
 use eframe::egui::{self, vec2, Align, Layout, RichText, Ui};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -24,11 +25,13 @@ pub struct Job {
     pub eta: Option<f64>,
     pub diagnostics: Vec<String>,
     pub cancelling: bool,
+    /// Timeline mode: the sample being checked.
+    pub timeline: Option<timeline_run::Progress>,
 }
 
 impl Job {
     pub fn new(kind: JobKind) -> Self {
-        Self { kind, current: 0, total: 0, samples: VecDeque::new(), fps: None, eta: None, diagnostics: vec![], cancelling: false }
+        Self { kind, current: 0, total: 0, samples: VecDeque::new(), fps: None, eta: None, diagnostics: vec![], cancelling: false, timeline: None }
     }
 
     pub fn progress(&mut self, current: u64, total: u64) {
@@ -62,6 +65,7 @@ impl Job {
                 let opening = matches!(self.kind, JobKind::Open(_));
                 let title = match &self.kind {
                     JobKind::Open(_) => "Opening saved analysis…".to_string(),
+                    JobKind::Analyze { mode } if mode == "timeline" => "Checking the timeline…".to_string(),
                     JobKind::Analyze { mode } => format!("Analyzing… ({})", match mode.as_str() {
                         "diff" => "pixel diff",
                         "levels" => "levels",
@@ -77,7 +81,21 @@ impl Job {
                 }
                 ui.add(bar);
                 ui.add_space(6.0);
+                let timeline = matches!(&self.kind, JobKind::Analyze { mode } if mode == "timeline");
                 let line = match &self.kind {
+                    _ if timeline => match &self.timeline {
+                        Some(p) => {
+                            let mut s = format!("sample {} / {}", group(p.done as u64), group(p.total as u64));
+                            if !p.tc.is_empty() {
+                                s += &format!(" · {} · {}", p.tc, p.clip);
+                            }
+                            if let (Some(e), true) = (p.eta_s, p.done < p.total) {
+                                s += &format!(" · ~{} left", fmt_duration(e));
+                            }
+                            s
+                        }
+                        None => "Connecting to Resolve and scopetap_grab…".to_string(),
+                    },
                     JobKind::Open(p) => {
                         let name = std::path::Path::new(p).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                         format!("Reading {name} — nothing is being re-analysed")

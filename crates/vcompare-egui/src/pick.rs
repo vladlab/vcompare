@@ -3,6 +3,7 @@
 //! Port of the idle / probing view of App.svelte.
 
 use crate::theme;
+use crate::timeline::{Setup, SetupAction};
 use eframe::egui::{self, vec2, Align, Layout, RichText, Ui};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,8 @@ pub enum PickAction {
     Analyze(AnalyzeParams),
     LoadCached(String),
     ModeChanged,
+    /// Timeline mode: ask Resolve for its tracks.
+    TimelineConnect,
 }
 
 pub struct Pick {
@@ -51,11 +54,13 @@ pub struct Pick {
     parallel: u32,
     pub keep_signatures: bool,
     pub last_dir: Option<PathBuf>,
+    /// Timeline mode's setup (Resolve tracks, offset, dry run).
+    pub timeline: Setup,
 }
 
 impl Pick {
     pub fn new(mode: String, keep_signatures: bool, last_dir: Option<PathBuf>) -> Self {
-        let mode = if ["diff", "vmaf", "levels"].contains(&mode.as_str()) { mode } else { "diff".into() };
+        let mode = if ["diff", "vmaf", "levels", "timeline"].contains(&mode.as_str()) { mode } else { "diff".into() };
         Self {
             mode,
             ref_path: String::new(),
@@ -72,6 +77,7 @@ impl Pick {
             parallel: 0,
             keep_signatures,
             last_dir,
+            timeline: Setup::default(),
         }
     }
 
@@ -165,6 +171,10 @@ impl Pick {
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 let (title, blurb) = match self.mode.as_str() {
                     "levels" => ("Analyze Video", "Select or drop a video file to analyze signal levels."),
+                    "timeline" => (
+                        "Check a Deliverable Against Resolve",
+                        "Compares the file with what Resolve puts out on SDI, at the first, middle and last frame of every clip on the tracks you tick.",
+                    ),
                     _ => ("Compare Videos", "Select or drop a reference and distorted file — or drop both at once."),
                 };
                 ui.label(RichText::new(title).size(20.0).strong());
@@ -179,11 +189,9 @@ impl Pick {
                     ui.label("Mode");
                     let before = self.mode.clone();
                     egui::ComboBox::from_id_salt("mode").width(220.0).selected_text(mode_label(&self.mode)).show_ui(ui, |ui| {
-                        for m in ["diff", "vmaf", "levels"] {
+                        for m in ["diff", "vmaf", "levels", "timeline"] {
                             ui.selectable_value(&mut self.mode, m.to_string(), mode_label(m));
                         }
-                        ui.add_enabled(false, egui::Button::selectable(false, mode_label("timeline")))
-                            .on_disabled_hover_text("Not in the native UI yet; use the Tauri app for timeline checks.");
                     });
                     if self.mode != before {
                         acts.push(PickAction::ModeChanged);
@@ -192,12 +200,33 @@ impl Pick {
                 });
                 ui.add_space(8.0);
 
-                let ref_label = if self.mode == "levels" { "File" } else { "Reference" };
+                let ref_label = match self.mode.as_str() {
+                    "levels" => "File",
+                    "timeline" => "Deliverable",
+                    _ => "Reference",
+                };
                 self.file_row(ui, ref_label, Slot::Reference, &mut acts);
                 if !self.single_file() {
                     self.file_row(ui, "Distorted", Slot::Distorted, &mut acts);
                 }
                 ui.add_space(8.0);
+
+                if self.mode == "timeline" {
+                    let grabber = caps.and_then(|c| c.grabber.as_deref());
+                    match self.timeline.show(ui, self.ref_probe.is_some(), grabber) {
+                        Some(SetupAction::Connect) => acts.push(PickAction::TimelineConnect),
+                        Some(SetupAction::Start { tracks, offset, dry_run }) => acts.push(PickAction::Analyze(AnalyzeParams {
+                            reference: self.ref_path.clone(),
+                            mode: Some("timeline".into()),
+                            tracks: Some(tracks),
+                            offset: Some(offset),
+                            dry_run: Some(dry_run),
+                            ..Default::default()
+                        })),
+                        None => {}
+                    }
+                    return;
+                }
 
                 if !self.ready() {
                     if self.probing > 0 {
@@ -312,7 +341,7 @@ impl Pick {
             if (r.fps - d.fps).abs() > 0.01 {
                 ui.label(
                     RichText::new(format!(
-                        "⚠ Framerate mismatch: ref {}/{} ({:.3}fps) vs dist {}/{} ({:.3}fps) — results may be unreliable",
+                        "Warning — framerate mismatch: ref {}/{} ({:.3}fps) vs dist {}/{} ({:.3}fps) — results may be unreliable",
                         r.fps_num, r.fps_den, r.fps, d.fps_num, d.fps_den, d.fps
                     ))
                     .color(theme::WARNING),
