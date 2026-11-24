@@ -1,5 +1,6 @@
 //! Small things remembered between runs (the web UI kept them in
-//! localStorage): the last mode, the last folder, "keep frame signatures".
+//! localStorage): the last mode, the last folder, "keep frame signatures",
+//! the ticked image-match references.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -10,11 +11,13 @@ pub struct Settings {
     pub mode: String,
     pub last_dir: Option<PathBuf>,
     pub keep_signatures: bool,
+    /// Image-match references ticked (ids), across analyses and restarts.
+    pub match_references: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { mode: "diff".into(), last_dir: None, keep_signatures: true }
+        Self { mode: "diff".into(), last_dir: None, keep_signatures: true, match_references: vec![] }
     }
 }
 

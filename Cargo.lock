@@ -6223,6 +6223,7 @@ dependencies = [
 name = "vcompare-egui"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "eframe",
  "egui_extras",
  "image",

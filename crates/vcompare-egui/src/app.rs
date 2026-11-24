@@ -8,21 +8,22 @@
 
 use crate::chart::{Chart, ChartProps};
 use crate::data::{Loaded, Series};
-use crate::flash::{FlashAction, FlashTab};
+use crate::detector::{self as det, Action as DetAction, DetectorTab, RefView};
 use crate::pick::{group, Pick, PickAction, Slot, VIDEO_EXTENSIONS};
 use crate::progress::{Job, JobKind};
 use crate::settings::Settings;
 use crate::table::FrameTable;
 use crate::theme;
 use crate::thumbs::{ThumbLoader, QUICK, SETTLE};
-use eframe::egui::{self, Key, RichText, Ui};
+use eframe::egui::{self, Key, RichText, TextureHandle, Ui};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use vcompare_service::engine::detect::{DetectRequest, DetectResult, Detector};
+use vcompare_service::engine::detect::{DetectResult, Detector};
+use vcompare_service::engine::references::StoredReference;
 use vcompare_service::engine::types::{Capabilities, ProbeResult};
 use vcompare_service::{AnalyzeParams, RecentEntry, Service, UiEvent};
 
@@ -39,8 +40,14 @@ enum Msg {
         perf: Option<String>,
     },
     Series(Result<Series, String>),
-    Detected(u64, Result<DetectResult, String>),
+    Detected(Detector, u64, Result<DetectResult, String>),
     Exported(Result<String, String>),
+    /// An events export finished: (rows written, path) or error; EDL or CSV.
+    EventsExported(Result<(u64, String), String>, bool),
+    References(Vec<StoredReference>, HashMap<String, egui::ColorImage>),
+    /// A reference was added (tick it), renamed or deleted.
+    RefAdded(Result<StoredReference, String>),
+    RefChanged(Result<(), String>),
     /// A file dialog closed (None: cancelled, or no dialog available).
     Picked(Dialog, Option<PathBuf>),
     Service(UiEvent),
@@ -52,12 +59,14 @@ enum Dialog {
     Media(Slot),
     Analysis,
     ExportCsv,
+    RefImage,
+    ExportEvents(Detector, bool),
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Frames,
-    Flash,
+    Det(Detector),
 }
 
 enum Screen {
@@ -80,14 +89,19 @@ pub struct VcApp {
     series: Option<Series>,
     table: Option<FrameTable>,
     chart: Chart,
-    flash: FlashTab,
+    /// One per detector, indexed by `det::index`.
+    dets: [DetectorTab; 3],
+    detect_gen: [u64; 3],
+    references: Vec<StoredReference>,
+    ref_thumbs: HashMap<String, TextureHandle>,
+    /// Reference waiting for the delete confirmation: (id, name).
+    confirm_delete: Option<(String, String)>,
     thumbs: ThumbLoader,
     tab: Tab,
     cursor: i64,
     /// Chart threshold line (`t` / `T`); diff and vmaf start with one.
     threshold: Option<f64>,
     status: Option<(String, Instant, Duration, bool)>,
-    detect_gen: u64,
     ui_times: VecDeque<f32>,
     show_perf: bool,
     show_keys: bool,
@@ -113,6 +127,7 @@ impl VcApp {
         let data_dir = data_dir();
         let settings = Settings::load(&data_dir);
         let svc = Arc::new(Service::new(data_dir.clone(), Arc::new(sink)));
+        let ticked = settings.match_references.clone();
         let thumbs = ThumbLoader::new(svc.clone(), cc.egui_ctx.clone());
         let mut app = Self {
             svc,
@@ -127,13 +142,16 @@ impl VcApp {
             series: None,
             table: None,
             chart: Chart::default(),
-            flash: FlashTab::default(),
+            dets: det::ALL.map(DetectorTab::new),
+            detect_gen: [0; 3],
+            references: vec![],
+            ref_thumbs: HashMap::new(),
+            confirm_delete: None,
             thumbs,
             tab: Tab::Frames,
             cursor: -1,
             threshold: None,
             status: None,
-            detect_gen: 0,
             ui_times: VecDeque::new(),
             show_perf: false,
             show_keys: false,
@@ -141,6 +159,7 @@ impl VcApp {
             dialog_open: false,
             quit: false,
         };
+        app.dets[det::index(Detector::Match)].matching.references = ticked;
         app.spawn(&cc.egui_ctx, |svc| Msg::Caps(svc.detect_capabilities()));
         if !open.is_empty() {
             app.open_paths(&cc.egui_ctx, open);
@@ -157,8 +176,13 @@ impl VcApp {
     }
 
     fn save_settings(&self) {
-        Settings { mode: self.pick.mode.clone(), last_dir: self.pick.last_dir.clone(), keep_signatures: self.pick.keep_signatures }
-            .save(&self.data_dir);
+        Settings {
+            mode: self.pick.mode.clone(),
+            last_dir: self.pick.last_dir.clone(),
+            keep_signatures: self.pick.keep_signatures,
+            match_references: self.dets[det::index(Detector::Match)].matching.references.clone(),
+        }
+        .save(&self.data_dir);
     }
 
     fn say(&mut self, text: impl Into<String>, error: bool) {
@@ -229,7 +253,9 @@ impl VcApp {
         self.cursor = loaded.rows.frames.first().copied().unwrap_or(-1);
         self.table = Some(FrameTable::new(&loaded.rows));
         self.chart.reset();
-        self.flash.reset();
+        for d in &mut self.dets {
+            d.reset();
+        }
         self.thumbs.clear();
         self.thumbs.hold(QUICK);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("vcompare — {}", loaded.title())));
@@ -253,10 +279,64 @@ impl VcApp {
             "diff" | "vmaf" => auto_threshold(&loaded.summary, &series.metric),
             _ => None,
         };
+        let mode = loaded.mode.clone();
         self.loaded = Some(loaded);
         self.series = Some(series);
         self.screen = Screen::Results;
-        self.detect(ctx);
+        if !self.tabs().contains(&self.tab) {
+            self.tab = Tab::Frames;
+        }
+        if mode == "levels" {
+            self.load_references(ctx);
+        }
+        // Every detector with a tab, so the tabs show their counts at once.
+        for k in det::ALL {
+            self.detect(ctx, k);
+        }
+    }
+
+    /// The tabs under the chart for the loaded analysis.
+    fn tabs(&self) -> Vec<Tab> {
+        let mode = self.loaded.as_ref().map(|l| l.mode.as_str()).unwrap_or("");
+        let mut t = vec![Tab::Frames];
+        t.extend(det::ALL.iter().filter(|k| det::in_mode(**k, mode)).map(|k| Tab::Det(*k)));
+        t
+    }
+
+    /// Why a detector's tab can't be used, if it can't.
+    fn unavailable(&self, k: Detector) -> Option<&'static str> {
+        let l = self.loaded.as_ref()?;
+        (k == Detector::Match && l.summary["has_signatures"].as_bool() != Some(true))
+            .then_some("This analysis has no frame signatures — re-run it with “keep frame signatures” on")
+    }
+
+    /// The detector whose events the chart marks and the event keys act on:
+    /// the active tab's (none on Frames).
+    fn active_detector(&self) -> Option<Detector> {
+        match self.tab {
+            Tab::Det(k) if self.unavailable(k).is_none() => Some(k),
+            _ => None,
+        }
+    }
+
+    fn select_tab(&mut self, t: Tab) {
+        if self.tab != t {
+            self.tab = t;
+            self.thumbs.hold(QUICK);
+        }
+    }
+
+    fn load_references(&mut self, ctx: &egui::Context) {
+        self.spawn(ctx, |svc| {
+            let list = svc.list_references();
+            let mut imgs = HashMap::new();
+            for r in &list {
+                if let Some(img) = r.thumb.as_deref().and_then(decode_data_uri) {
+                    imgs.insert(r.id.clone(), img);
+                }
+            }
+            Msg::References(list, imgs)
+        });
     }
 
     fn new_analysis(&mut self) {
@@ -328,11 +408,23 @@ impl VcApp {
         self.spawn(ctx, move |svc| Msg::Series(Series::load(svc, &metric)));
     }
 
-    fn detect(&mut self, ctx: &egui::Context) {
-        self.detect_gen += 1;
-        let g = self.detect_gen;
-        let req = DetectRequest::Flash(self.flash.params.clone());
-        self.spawn(ctx, move |svc| Msg::Detected(g, svc.detect_events(&req)));
+    fn detect(&mut self, ctx: &egui::Context, k: Detector) {
+        let i = det::index(k);
+        self.detect_gen[i] += 1;
+        let g = self.detect_gen[i];
+        let in_mode = self.loaded.as_ref().is_some_and(|l| det::in_mode(k, &l.mode));
+        if !in_mode || self.unavailable(k).is_some() {
+            self.dets[i].result = None;
+            self.dets[i].error = None;
+            return;
+        }
+        match self.dets[i].request() {
+            Some(req) => self.spawn(ctx, move |svc| Msg::Detected(k, g, svc.detect_events(&req))),
+            None => {
+                self.dets[i].result = Some(self.dets[i].empty_result());
+                self.dets[i].error = None;
+            }
+        }
     }
 
     fn export_csv(&mut self, ctx: &egui::Context) {
@@ -401,14 +493,64 @@ impl VcApp {
                 }
                 Msg::Series(Ok(s)) => self.series = Some(s),
                 Msg::Series(Err(e)) => self.say(e, true),
-                Msg::Detected(g, r) if g == self.detect_gen => match r {
-                    Ok(r) => {
-                        self.flash.error = None;
-                        self.flash.result = Some(r);
+                Msg::Detected(k, g, r) if g == self.detect_gen[det::index(k)] => {
+                    let d = &mut self.dets[det::index(k)];
+                    match r {
+                        Ok(r) => {
+                            d.error = None;
+                            d.result = Some(r);
+                        }
+                        Err(e) => {
+                            d.result = None;
+                            d.error = Some(e);
+                        }
                     }
-                    Err(e) => self.flash.error = Some(e),
-                },
+                }
                 Msg::Detected(..) => {}
+                Msg::EventsExported(Ok((rows, p)), edl) => {
+                    let msg = if edl {
+                        format!("{rows} markers written — in Resolve: Timeline › Import › Timeline Markers from EDL")
+                    } else {
+                        format!("{rows} events written to {p}")
+                    };
+                    self.status = Some((msg, Instant::now(), Duration::from_secs(10), false));
+                }
+                Msg::EventsExported(Err(e), _) => self.say(format!("Export failed: {e}"), true),
+                Msg::References(list, imgs) => {
+                    self.ref_thumbs = imgs
+                        .into_iter()
+                        .map(|(id, img)| {
+                            let t = ctx.load_texture(format!("ref-{id}"), img, egui::TextureOptions::LINEAR);
+                            (id, t)
+                        })
+                        .collect();
+                    // Drop ticks for references that no longer exist.
+                    let ids: Vec<String> = list.iter().map(|r| r.id.clone()).collect();
+                    let m = &mut self.dets[det::index(Detector::Match)];
+                    let before = m.matching.references.len();
+                    m.matching.references.retain(|id| ids.contains(id));
+                    let dropped = m.matching.references.len() != before;
+                    self.references = list;
+                    if dropped {
+                        self.save_settings();
+                        self.detect(ctx, Detector::Match);
+                    }
+                }
+                Msg::RefAdded(Ok(r)) => {
+                    let m = &mut self.dets[det::index(Detector::Match)];
+                    if !m.matching.references.contains(&r.id) {
+                        m.matching.references.push(r.id.clone());
+                    }
+                    self.say(format!("Reference “{}” added{}", r.name, if r.flat { " (flat colour: matched by colour)" } else { "" }), false);
+                    self.save_settings();
+                    self.load_references(ctx);
+                    self.detect(ctx, Detector::Match);
+                }
+                Msg::RefAdded(Err(e)) | Msg::RefChanged(Err(e)) => self.say(format!("Reference: {e}"), true),
+                Msg::RefChanged(Ok(())) => {
+                    self.load_references(ctx);
+                    self.detect(ctx, Detector::Match);
+                }
                 Msg::Picked(what, path) => {
                     self.dialog_open = false;
                     let Some(p) = path.map(|p| p.to_string_lossy().to_string()) else { continue };
@@ -425,6 +567,17 @@ impl VcApp {
                             }
                         }
                         Dialog::ExportCsv => self.spawn(ctx, move |svc| Msg::Exported(svc.export_csv(Some(&p)).map(|_| p))),
+                        Dialog::RefImage => {
+                            if let Some(d) = Path::new(&p).parent() {
+                                self.pick.last_dir = Some(d.to_path_buf());
+                            }
+                            self.say("Adding reference…", false);
+                            self.spawn(ctx, move |svc| Msg::RefAdded(svc.add_reference_from_image(&p, None)));
+                        }
+                        Dialog::ExportEvents(k, edl) => self.spawn(ctx, move |svc| {
+                            let r = if edl { svc.export_events_edl(Some(k), Some(&p)) } else { svc.export_events_csv(Some(k), Some(&p)) };
+                            Msg::EventsExported(r.map(|v| (v["rows"].as_u64().unwrap_or(0), p)), edl)
+                        }),
                     }
                 }
                 Msg::Exported(Ok(p)) => self.say(format!("Exported {p}"), false),
@@ -480,6 +633,8 @@ impl VcApp {
             if key == Key::Escape {
                 if self.show_keys {
                     self.show_keys = false;
+                } else if self.confirm_delete.is_some() {
+                    self.confirm_delete = None;
                 } else if self.recents.is_some() {
                     self.recents = None;
                 } else {
@@ -506,16 +661,17 @@ impl VcApp {
                         self.set_metric(ctx, next);
                     }
                 }
-                Key::Num1 => self.tab = Tab::Frames,
-                Key::Num2 => {
-                    self.tab = Tab::Flash;
-                    self.thumbs.hold(QUICK);
+                Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 => {
+                    let n = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].iter().position(|k| *k == key).unwrap();
+                    if let Some(t) = self.tabs().get(n).copied() {
+                        self.select_tab(t);
+                    }
                 }
                 Key::N => self.next_event(if m.shift { -1 } else { 1 }),
                 Key::ArrowDown | Key::ArrowUp => {
                     let d = if key == Key::ArrowDown { 1 } else { -1 };
                     match self.tab {
-                        Tab::Flash => self.next_event(d),
+                        Tab::Det(_) => self.next_event(d),
                         Tab::Frames => self.step(d as i64),
                     }
                 }
@@ -534,7 +690,7 @@ impl VcApp {
         let (Some(l), Some(t)) = (&self.loaded, &self.table) else { return };
         let next = match self.tab {
             Tab::Frames => t.step(&l.rows, self.cursor, d),
-            Tab::Flash => l.rows.index_of(self.cursor).and_then(|i| {
+            Tab::Det(_) => l.rows.index_of(self.cursor).and_then(|i| {
                 let j = (i as i64 + d).clamp(0, l.rows.frames.len() as i64 - 1) as usize;
                 l.rows.frames.get(j).copied()
             }),
@@ -544,24 +700,97 @@ impl VcApp {
         }
     }
 
+    /// n / N / ↓ / ↑ on a detector tab (nothing on Frames).
     fn next_event(&mut self, dir: i32) {
-        self.tab = Tab::Flash;
-        if let Some(f) = self.flash.neighbour(self.cursor, dir) {
+        let Some(k) = self.active_detector() else { return };
+        if let Some(f) = self.dets[det::index(k)].neighbour(self.cursor, dir) {
             self.cursor = f;
         }
     }
 
+    /// y / x on the active tab's picked event.
     fn review_selected(&mut self, verdict: &'static str) {
-        let Some(f) = self.flash.selected else { return };
-        let cur = self.flash.result.as_ref().and_then(|r| r.events.iter().find(|e| e.frame == f)).and_then(|e| e.review.clone());
+        let Some(k) = self.active_detector() else { return };
+        let d = &self.dets[det::index(k)];
+        let Some(f) = d.selected else { return };
+        let Some(cur) = d.review_of(f) else { return };
         let v = if cur.as_deref() == Some(verdict) { None } else { Some(verdict) };
-        self.review(f, v);
+        self.review(k, f, v);
     }
 
-    fn review(&mut self, frame: i64, v: Option<&'static str>) {
-        match self.svc.set_event_review(Detector::Flash, frame, v) {
-            Ok(_) => self.flash.set_review(frame, v),
-            Err(e) => self.say(e, true),
+    fn review(&mut self, k: Detector, frame: i64, v: Option<&'static str>) {
+        match self.svc.set_event_review(k, frame, v) {
+            Ok(r) => {
+                self.dets[det::index(k)].set_review(frame, v);
+                if r["saved"].as_bool() == Some(false) {
+                    self.say("Verdict kept for this session only (analysis has no save path)", false);
+                }
+            }
+            Err(e) => self.say(format!("Review: {e}"), true),
+        }
+    }
+
+    fn export_events(&mut self, ctx: &egui::Context, k: Detector, edl: bool) {
+        let stem = self
+            .loaded
+            .as_ref()
+            .and_then(|l| Path::new(&l.ref_path).file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "vcompare".into());
+        let (what, short) = match k {
+            Detector::Flash => ("flash frames", "flash"),
+            Detector::Repeat => ("repeated frames", "repeat"),
+            Detector::Match => ("image matches", "match"),
+        };
+        let (title, name, filter) = if edl {
+            (format!("Export {what} as Resolve marker EDL"), format!("{stem}_{short}_markers.edl"), "edl")
+        } else {
+            (format!("Export {what} CSV"), format!("{stem}_{short}_frames.csv"), "csv")
+        };
+        let mut d = rfd::FileDialog::new().set_title(title).set_file_name(name).add_filter(filter.to_uppercase(), &[filter]);
+        if let Some(dir) = self.loaded.as_ref().and_then(|l| Path::new(&l.ref_path).parent().map(Path::to_path_buf)) {
+            d = d.set_directory(dir);
+        }
+        self.dialog(ctx, Dialog::ExportEvents(k, edl), move || d.save_file());
+    }
+
+    fn add_reference_image(&mut self, ctx: &egui::Context) {
+        let mut d = rfd::FileDialog::new()
+            .set_title("Reference picture (e.g. a still of the offline card)")
+            .add_filter("Images", &["png", "jpg", "jpeg", "tif", "tiff", "dpx", "exr", "bmp", "webp"])
+            .add_filter("All Files", &["*"]);
+        if let Some(dir) = &self.pick.last_dir {
+            d = d.set_directory(dir);
+        }
+        self.dialog(ctx, Dialog::RefImage, move || d.pick_file());
+    }
+
+    fn confirm_delete_window(&mut self, ctx: &egui::Context) {
+        let Some((id, name)) = self.confirm_delete.clone() else { return };
+        let mut answer = None;
+        let m = egui::Modal::new(egui::Id::unique("confirm_delete_ref")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(RichText::new(format!("Delete the reference “{name}”?")).strong());
+            ui.label(RichText::new("It is removed for every analysis.").color(theme::TEXT_DIM));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Delete").color(theme::THRESHOLD)).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if m.should_close() && answer.is_none() {
+            answer = Some(false);
+        }
+        match answer {
+            Some(true) => {
+                self.confirm_delete = None;
+                self.spawn(ctx, move |svc| Msg::RefChanged(svc.delete_reference(&id)));
+            }
+            Some(false) => self.confirm_delete = None,
+            None => {}
         }
     }
 
@@ -675,11 +904,11 @@ impl VcApp {
             ("= / -", "zoom in / out on the playhead"),
             ("0", "show all"),
             (". ,   → ←", "step a frame"),
-            ("n N   ↓ ↑", "next / previous event"),
+            ("n N   ↓ ↑", "next / previous event (on a detector tab)"),
             ("y  x", "accept / reject the picked event"),
             ("m  M", "next / previous metric"),
             ("t  T", "threshold line from the metric (mean ± σ) / clear it"),
-            ("1  2", "Frames / Flash tab"),
+            ("1 – 4", "tabs under the chart"),
             ("e", "export CSV"),
             ("Esc", "cancel the running analysis (nothing is saved)"),
             ("Ctrl+N", "new analysis"),
@@ -813,11 +1042,13 @@ impl VcApp {
         let (Some(_), Some(_)) = (&self.loaded, &self.series) else { return };
         let h = ui.available_height();
         let mut new_cursor = None;
-        let mut flash_acts = Vec::new();
+        let mut det_acts = Vec::new();
+        let active = self.active_detector();
         {
             let loaded = self.loaded.as_ref().unwrap();
             let series = self.series.as_ref().unwrap();
-            let events: Vec<_> = if self.tab == Tab::Flash { self.flash.visible().into_iter().cloned().collect() } else { vec![] };
+            let mut events: Vec<_> = active.map(|k| self.dets[det::index(k)].visible().into_iter().cloned().collect()).unwrap_or_default();
+            events.sort_by_key(|e| e.frame);
             egui::Panel::top("chart")
                 .resizable(true)
                 .default_size((h * 0.45).max(260.0))
@@ -834,18 +1065,32 @@ impl VcApp {
                     new_cursor = self.chart.show(ui, series, &props);
                 });
         }
+        let tabs = self.tabs();
         egui::CentralPanel::default().show(ui, |ui| {
+            let mut pick_tab = None;
             ui.horizontal(|ui| {
-                let n = self.flash.visible().len();
-                if ui.selectable_label(self.tab == Tab::Frames, "Frames").clicked() {
-                    self.tab = Tab::Frames;
-                }
-                let flash_label = if self.flash.result.is_some() { format!("Flash ({n})") } else { "Flash".into() };
-                if ui.selectable_label(self.tab == Tab::Flash, flash_label).clicked() && self.tab != Tab::Flash {
-                    self.tab = Tab::Flash;
-                    self.thumbs.hold(QUICK);
+                for (n, t) in tabs.iter().enumerate() {
+                    let (label, tip) = match t {
+                        Tab::Frames => ("Frames".to_string(), None),
+                        Tab::Det(k) => {
+                            let d = &self.dets[det::index(*k)];
+                            let count = d.result.as_ref().map(|_| format!(" ({})", d.visible().len())).unwrap_or_default();
+                            (format!("{}{count}", det::tab_label(*k)), self.unavailable(*k))
+                        }
+                    };
+                    let mut text = RichText::new(label);
+                    if tip.is_some() {
+                        text = text.color(theme::TEXT_MUTED);
+                    }
+                    let r = ui.selectable_label(self.tab == *t, text).on_hover_text(format!("{}{}", n + 1, tip.map(|t| format!(" — {t}")).unwrap_or_default()));
+                    if r.clicked() {
+                        pick_tab = Some(*t);
+                    }
                 }
             });
+            if let Some(t) = pick_tab {
+                self.select_tab(t);
+            }
             ui.separator();
             let loaded = self.loaded.as_ref().unwrap();
             match self.tab {
@@ -856,26 +1101,56 @@ impl VcApp {
                         }
                     }
                 }
-                Tab::Flash => {
-                    flash_acts = self.flash.show(ui, &mut self.thumbs, loaded.files);
+                Tab::Det(k) => {
+                    if let Some(why) = self.unavailable(k) {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(why).color(theme::TEXT_DIM));
+                    } else {
+                        let refs = RefView { list: &self.references, thumbs: &self.ref_thumbs };
+                        det_acts = self.dets[det::index(k)].show(ui, &mut self.thumbs, loaded.files, self.cursor, &refs).into_iter().map(|a| (k, a)).collect();
+                    }
                 }
             }
         });
 
-        let mut redetect = false;
-        for a in flash_acts {
+        let ctx = ui.ctx().clone();
+        let mut redetect = vec![];
+        for (k, a) in det_acts {
             match a {
-                FlashAction::Select(f) => {
-                    self.flash.pick(f);
-                    new_cursor = Some(f);
+                DetAction::Select { event, frame } => {
+                    self.dets[det::index(k)].pick(event);
+                    new_cursor = Some(frame);
                 }
-                FlashAction::Review(f, v) => self.review(f, v),
-                FlashAction::Adjusting => self.thumbs.hold(SETTLE),
-                FlashAction::Changed => redetect = true,
+                DetAction::Review(f, v) => self.review(k, f, v),
+                DetAction::Adjusting => self.thumbs.hold(SETTLE),
+                DetAction::Changed => {
+                    if !redetect.contains(&k) {
+                        redetect.push(k);
+                    }
+                    if k == Detector::Match {
+                        self.save_settings();
+                    }
+                }
+                DetAction::ExportEdl => self.export_events(&ctx, k, true),
+                DetAction::ExportCsv => self.export_events(&ctx, k, false),
+                DetAction::AddImage => self.add_reference_image(&ctx),
+                DetAction::AddFrame => {
+                    let f = self.cursor;
+                    if f < 0 {
+                        self.say("Put the cursor on the frame to use first", false);
+                    } else {
+                        self.spawn(&ctx, move |svc| Msg::RefAdded(svc.add_reference_from_frame(f, None)));
+                    }
+                }
+                DetAction::Rename(id, name) => self.spawn(&ctx, move |svc| Msg::RefChanged(svc.rename_reference(&id, &name))),
+                DetAction::Delete(id) => {
+                    let name = self.references.iter().find(|r| r.id == id).map(|r| r.name.clone()).unwrap_or_default();
+                    self.confirm_delete = Some((id, name));
+                }
             }
         }
-        if redetect {
-            self.detect(ui.ctx());
+        for k in redetect {
+            self.detect(&ctx, k);
         }
         if let Some(f) = new_cursor {
             self.cursor = f;
@@ -900,6 +1175,7 @@ impl eframe::App for VcApp {
 
         self.keys_window(&ctx);
         self.recents_window(&ctx);
+        self.confirm_delete_window(&ctx);
         egui::Panel::top("top").frame(egui::Frame::side_top_panel(ui.style()).fill(theme::BG_RAISED)).show(ui, |ui| {
             ui.add_space(4.0);
             self.top_bar(ui);
@@ -1024,6 +1300,15 @@ fn auto_threshold(summary: &Value, metric: &str) -> Option<f64> {
     let sd = st["stddev"].as_f64().unwrap_or(0.0);
     let v = if metric.starts_with("diff") || HIGHER_IS_WORSE.contains(&metric) { mean + sd } else { mean - sd };
     Some((v * 100.0).round() / 100.0)
+}
+
+/// `data:image/jpeg;base64,…` → image (reference thumbnails).
+fn decode_data_uri(uri: &str) -> Option<egui::ColorImage> {
+    use base64::Engine;
+    let b64 = uri.split_once(";base64,")?.1;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
 }
 
 /// Unix seconds → "2026-11-24" (UTC).

@@ -2,7 +2,7 @@
 
 Branch: `egui-port` (off `detector-tabs` at `1572726`). **Status: §1 built
 and checked by Vladimir (2026-11-24); §2 spike built and accepted (go);
-§3 built, see its status note.** §1: Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
+§3 and §4 built, see their status notes.** §1: Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
 Resolve): 131 tests from the workspace root (126 engine, 5 service, three
 of them end to end through `Service` on a generated clip); every
 `invoke()` in `rpc.ts` matched to a command with the same argument names
@@ -363,6 +363,71 @@ Vladimir said go after the spike. Built in `crates/vcompare-egui`:
 - **Exports:** CSV/EDL for events, CSV for frames.
 - **Gate:** the detector-tabs engine tests still pass; on a real file the
   same events and the same review state show in both UIs.
+
+### §4 status (2026-11-24): built
+
+- **One detector tab type** (`detector.rs`, replacing `flash.rs`) for
+  flash, repeat and match. Each detector keeps its own parameters,
+  result, error, picked event, visited events and hide-rejected.
+  Detection runs per detector with its own generation, so a slow answer
+  can't overwrite a newer one.
+- **Tabs by mode, as in `detectors.ts`:**
+  - Frames everywhere; Flash frames on diff and levels; Repeats and
+    Image match on levels.
+  - Image match is greyed, with the reason, when the analysis has no
+    signatures.
+  - Counts show in the tab labels. `1`–`4` pick a tab.
+  - The chart marks the active tab's events (none on Frames); `n` `N`
+    `↑` `↓` `y` `x` act on it.
+  - `n` / `N` now step from the picked event and wrap, as App.svelte does
+    (the spike stepped from the cursor).
+- **Toolbars:**
+  - flash: auto, threshold, max run, hide at-cut;
+  - repeat: exact, tolerance, ≥ min, ≤ max, holds, join-if-still, skip
+    black;
+  - match: similarity, min run;
+  - every tab: hide rejected.
+  - Sliders apply on release. Summary line: count, breakdown, at-cut,
+    accepted / rejected, flash threshold. The engine's note (e.g. "2
+    holds not listed") is shown.
+- **Rows:**
+  - strips capped per detector (5 / 3 / 2 frames, then +n);
+  - match rows start with the reference's tile; REF / DIST labels on
+    two-file strips;
+  - the frame under the cursor is outlined; clicking a tile goes to that
+    frame;
+  - accepted / rejected rows get a green / red edge; rejected rows are
+    dimmed;
+  - per-detector labels, scores and role names.
+- **References:**
+  - chips with thumbnail, tick, double-click rename (Enter applies,
+    Esc / click-away cancels), × delete behind a confirm modal;
+  - "+ image…" (dialog on a worker) and "+ this frame".
+  - Ticks persist in egui-settings.json; ticks for deleted references
+    are dropped.
+- **Exports:** EDL and CSV per tab, through the save dialog, with the web
+  UI's default names. The status line says how to import the EDL in
+  Resolve.
+- **Tests:**
+  - egui: strip layouts per detector, wrap and step-from-pick
+    navigation, match with nothing ticked, labels and scores;
+  - service: a PNG reference at another size finds a card spliced into a
+    clip; the card is also a hold; the review survives reopening;
+    EDL / CSV export; rename / delete.
+- **Gate, under Xvfb** on a 2,300-frame clip with a 1-frame and a 2-frame
+  repeat, a 60-frame freeze, a black run and a 24-frame "MEDIA OFFLINE"
+  card:
+  - Repeats: 2 short repeats, and the note about 2 holds; ticking
+    "holds" adds the freeze and the card.
+  - "+ this frame" on the card → 1 match of 24 frames, marked on the
+    chart.
+  - Rename, `n` + `y` accept, then delete with the confirm modal.
+  - The default parameters are the same as `DEFAULT_PARAMS` in
+    detectors.ts, so both UIs list the same events from the same
+    analysis (same engine call).
+- **Not testable here:** "+ image…" and the export buttons, because they
+  need the file dialog (no portal in the sandbox). Their engine side is
+  covered by the service test.
 
 ## 5. Players, Resolve, timeline mode
 

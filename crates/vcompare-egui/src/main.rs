@@ -9,7 +9,7 @@
 mod app;
 mod chart;
 mod data;
-mod flash;
+mod detector;
 mod pick;
 mod progress;
 mod pyramid;

@@ -241,3 +241,93 @@ fn typed_accessors_match_the_json_ones() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Image match through the service: a reference from a PNG of the card
+/// (at another size, as a still from Resolve would be) finds the card
+/// spliced into the clip; reviews survive reopening; events export.
+#[test]
+fn image_reference_finds_the_card_and_events_export() {
+    use vcompare_service::engine::detect::{DetectRequest, Detector, MatchParams, RepeatParams};
+    let dir = tmp("refs");
+    let clip = dir.join("card.mov");
+    let png = dir.join("card.png");
+    let font = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", "DejaVu Sans:bold"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .filter(|f| !f.is_empty());
+    let Some(font) = font else {
+        eprintln!("no font for drawtext; skipping");
+        return;
+    };
+    let text = |size: u32| format!("drawtext=fontfile={font}:text='MEDIA OFFLINE':fontsize={size}:fontcolor=white:x=(w-tw)/2:y=(h-th)/2");
+    let ok = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24", "-frames:v", "120", "-vf"])
+        .arg(format!(
+            "drawbox=x=0:y=0:w=iw:h=ih:t=fill:c=0xb02020:enable='between(n,40,59)',{}:enable='between(n,40,59)',format=yuv422p10le",
+            text(24)
+        ))
+        .args(["-c:v", "prores_ks", "-profile:v", "3"])
+        .arg(&clip)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0xb02020:s=1280x720", "-frames:v", "1", "-vf"])
+            .arg(text(96))
+            .arg(&png)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !ok {
+        eprintln!("no ffmpeg; skipping");
+        return;
+    }
+    let svc = Service::new(dir.join("data"), Arc::new(vcompare_service::NullSink));
+    let save = dir.join("card.levels.json").to_string_lossy().to_string();
+    let summary = svc
+        .analyze(&AnalyzeParams {
+            reference: clip.to_string_lossy().to_string(),
+            mode: Some("levels".into()),
+            log_path: Some(save.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(summary["has_signatures"], true);
+
+    let r = svc.add_reference_from_image(&png.to_string_lossy(), Some("Offline".into())).unwrap();
+    assert_eq!(svc.list_references().len(), 1);
+    let req = DetectRequest::Match(MatchParams { references: vec![r.id.clone()], ..Default::default() });
+    let found = svc.detect_events(&req).unwrap();
+    assert_eq!(found.events.len(), 1, "{:?}", found.events);
+    let e = &found.events[0];
+    let first = summary["ref_start_frame"].as_i64().unwrap();
+    assert!((e.frame - first - 40).abs() <= 1 && (19..=21).contains(&e.length), "{e:?}");
+    assert_eq!(e.label.as_deref(), Some("Offline"));
+
+    // The card is also a hold for the repeat detector.
+    let holds = svc.detect_events(&DetectRequest::Repeat(RepeatParams { include_long: true, ..Default::default() })).unwrap();
+    assert!(holds.events.iter().any(|h| h.subkind == "hold" && (h.frame - e.frame).abs() <= 1), "{:?}", holds.events);
+
+    // Review, reopen: the verdict is still there.
+    svc.set_event_review(Detector::Match, e.frame, Some("accept")).unwrap();
+    svc.load_saved_analysis(&save).unwrap();
+    let again = svc.detect_events(&req).unwrap();
+    assert_eq!(again.events[0].review.as_deref(), Some("accept"));
+
+    // Exports.
+    let edl = dir.join("m.edl").to_string_lossy().to_string();
+    let csv = dir.join("m.csv").to_string_lossy().to_string();
+    assert_eq!(svc.export_events_edl(Some(Detector::Match), Some(&edl)).unwrap()["rows"], 1);
+    assert_eq!(svc.export_events_csv(Some(Detector::Match), Some(&csv)).unwrap()["rows"], 1);
+    let edl_text = std::fs::read_to_string(&edl).unwrap();
+    assert!(edl_text.contains("TITLE"), "{edl_text}");
+    assert!(std::fs::read_to_string(&csv).unwrap().lines().count() >= 2);
+
+    svc.rename_reference(&r.id, "Card").unwrap();
+    assert_eq!(svc.list_references()[0].name, "Card");
+    svc.delete_reference(&r.id).unwrap();
+    assert!(svc.list_references().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

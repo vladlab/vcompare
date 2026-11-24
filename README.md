@@ -303,8 +303,9 @@ the usual WebKitGTK workaround env vars automatically.
 `crates/vcompare-egui` is the native UI that will replace the Tauri/Svelte
 one (see `docs/plans/egui-port.md`). It runs levels, pixel diff (± SSIM)
 and VMAF analyses and opens saved ones: chart, frame table and the Flash
-tab. Not there yet: the repeat / image-match tabs, mpv, Resolve sync and
-timeline mode (use the Tauri app for those).
+frames, Repeats and Image match tabs (with reviews, EDL / CSV export and
+reference pictures). Not there yet: mpv, Resolve sync and timeline mode
+(use the Tauri app for those).
 
 It needs no WebKit and no `-devel` packages, so it builds on Rocky / RHEL 9
 as well, with only Rust and gcc:
