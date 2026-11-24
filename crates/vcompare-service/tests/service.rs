@@ -1,0 +1,200 @@
+//! The service end to end, the way a UI drives it: a levels analysis of a
+//! generated clip with events collected from the sink, then queries,
+//! thumbnails, cache reuse and reload. Needs ffmpeg; skips without it.
+
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use vcompare_service::{AnalyzeParams, GetFramesParams, RecentEntry, Service, UiEvent, CANCELLED};
+
+fn tmp(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("vcompare_service_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// 48 frames at 24 fps, 10-bit 4:2:2, flat grey ramping 64 + 8·N code values.
+fn make_clip(dir: &Path) -> Option<PathBuf> {
+    let clip = dir.join("ramp.mkv");
+    let ok = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+               "-i", "color=c=black:s=128x72:r=24,format=yuv422p10le,geq=lum='64+8*N':cb=512:cr=512",
+               "-frames:v", "48", "-c:v", "ffv1"])
+        .arg(&clip)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(clip)
+}
+
+struct Collect(Mutex<Vec<UiEvent>>);
+
+impl Collect {
+    fn names(&self) -> Vec<&'static str> {
+        self.0.lock().unwrap().iter().map(|e| e.name()).collect()
+    }
+}
+
+#[test]
+fn levels_through_the_service() {
+    let dir = tmp("levels");
+    let Some(clip) = make_clip(&dir) else {
+        eprintln!("no ffmpeg; skipping");
+        return;
+    };
+    let events = Arc::new(Collect(Mutex::new(Vec::new())));
+    let sink = {
+        let events = events.clone();
+        move |e: UiEvent| events.0.lock().unwrap().push(e)
+    };
+    let svc = Service::new(dir.join("data"), Arc::new(sink));
+    let clip_s = clip.to_string_lossy().to_string();
+
+    let probe = svc.probe_file(&clip_s).unwrap();
+    assert!(serde_json::to_value(&probe).unwrap().is_object());
+
+    let cache = svc.check_levels_cache(&clip_s);
+    assert_eq!(cache["exists"], false);
+    let save = cache["path"].as_str().unwrap().to_string();
+
+    let params = AnalyzeParams {
+        reference: clip_s.clone(),
+        mode: Some("levels".into()),
+        log_path: Some(save.clone()),
+        ..Default::default()
+    };
+    let summary = svc.analyze(&params).unwrap();
+    assert_eq!(summary["mode"], "levels");
+    assert!(summary.get("perf").is_some(), "a fresh run reports perf");
+
+    // Progress and diagnostics reached the sink, with the web payloads.
+    let names = events.names();
+    assert!(names.contains(&"rpc:progress"), "{names:?}");
+    assert!(names.contains(&"rpc:diagnostics"), "{names:?}");
+    let last = events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| matches!(e, UiEvent::Progress { .. }))
+        .unwrap()
+        .payload();
+    assert_eq!(last["total"].as_u64(), Some(48), "{last}");
+
+    // Queries.
+    let frames = svc.get_frames(&GetFramesParams { limit: Some(100), ..Default::default() }).unwrap();
+    let rows = frames["frames"].as_array().expect("frames array");
+    assert_eq!(rows.len(), 48);
+    let series = svc.get_metric_series("y_avg").unwrap();
+    assert!(series.is_object());
+
+    // Thumbnails: JPEG bytes, missing before the file's start, at most 3
+    // extractions at once (12 callers).
+    let strip = svc.preview_frames(-1, 3, 36).unwrap();
+    assert_eq!(strip.len(), 1);
+    let f = &strip[0].frames;
+    assert!(f[0].jpeg.is_none());
+    for t in &f[1..] {
+        let j = t.jpeg.as_ref().expect("jpeg");
+        assert_eq!(&j[..2], &[0xFF, 0xD8]);
+    }
+    let svc = Arc::new(svc);
+    let handles: Vec<_> = (0..12)
+        .map(|k| {
+            let s = svc.clone();
+            std::thread::spawn(move || s.preview_frames(k * 3, 2, 24).map(|r| r[0].frames.len()))
+        })
+        .collect();
+    for h in handles {
+        assert_eq!(h.join().unwrap().unwrap(), 2);
+    }
+
+    // Detection runs on the loaded analysis.
+    let det = svc.detect_events(&Default::default()).unwrap();
+    assert!(serde_json::to_value(&det).unwrap().is_object());
+
+    // Same params again. Existing behaviour, kept as is: `analyze` re-runs
+    // levels even when its cache exists (`cache::load_diff_cache` only
+    // accepts diff caches); the UI reopens levels caches through
+    // `load_saved_analysis` instead.
+    let again = svc.analyze(&params).unwrap();
+    assert!(again.get("perf").is_some());
+
+    // Reload as Recent Analyses does.
+    let reloaded = svc.load_saved_analysis(&save).unwrap();
+    assert_eq!(reloaded["mode"], "levels");
+    assert_eq!(svc.get_frames(&GetFramesParams { limit: Some(100), ..Default::default() }).unwrap()["frames"]
+        .as_array()
+        .unwrap()
+        .len(), 48);
+
+    svc.add_recent(RecentEntry {
+        ref_path: clip_s.clone(),
+        dist_path: String::new(),
+        cache_path: save.clone(),
+        mode: "levels".into(),
+        frame_count: 48,
+        timestamp: 1,
+    });
+    assert_eq!(svc.recents().len(), 1);
+
+    // No player is running: a clear error, not a panic.
+    assert_eq!(svc.mpv_seek(3).unwrap_err(), "mpv not running");
+    assert_eq!(svc.diffview_step("forward").unwrap_err(), "diffview not running");
+    assert!(svc.diffview_launch().unwrap_err().contains("two files"));
+
+    svc.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cancel_reports_cancelled() {
+    let dir = tmp("cancel");
+    let Some(clip) = make_clip(&dir) else {
+        eprintln!("no ffmpeg; skipping");
+        return;
+    };
+    // Cancel from the first progress callback.
+    let svc: Arc<Mutex<Option<Arc<Service>>>> = Arc::new(Mutex::new(None));
+    let sink = {
+        let svc = svc.clone();
+        move |e: UiEvent| {
+            if let UiEvent::Progress { .. } = e {
+                if let Some(s) = svc.lock().unwrap().as_ref() {
+                    s.cancel_analysis();
+                }
+            }
+        }
+    };
+    let s = Arc::new(Service::new(dir.join("data"), Arc::new(sink)));
+    *svc.lock().unwrap() = Some(s.clone());
+    let save = dir.join("out.vcompare.json");
+    let r = s.analyze(&AnalyzeParams {
+        reference: clip.to_string_lossy().to_string(),
+        mode: Some("levels".into()),
+        log_path: Some(save.to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    // A 48-frame clip may finish before the kill lands; when it doesn't,
+    // it must say cancelled and save nothing.
+    if let Err(e) = r {
+        assert_eq!(e, CANCELLED);
+        assert!(!save.exists());
+    }
+    *svc.lock().unwrap() = None;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_file_is_an_error() {
+    let dir = tmp("missing");
+    let svc = Service::new(dir.join("data"), Arc::new(vcompare_service::NullSink));
+    assert!(svc.load_saved_analysis("/nonexistent/x.vcompare.json").unwrap_err().contains("File not found"));
+    assert!(svc.probe_file("/nonexistent/x.mov").is_err());
+    let v: Value = svc.check_levels_cache("/nonexistent/x.mov");
+    assert_eq!(v["exists"], false);
+    let _ = std::fs::remove_dir_all(&dir);
+}

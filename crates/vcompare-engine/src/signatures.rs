@@ -88,7 +88,7 @@ impl Signatures {
     }
 
     pub fn write(&self, path: &str) -> Result<(), String> {
-        crate::engine::cache::write_atomic(path, &self.to_bytes())
+        crate::cache::write_atomic(path, &self.to_bytes())
     }
 
     pub fn read(path: &str) -> Result<Signatures, String> {

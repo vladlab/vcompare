@@ -18,6 +18,7 @@ pub mod sysenv;
 pub mod testenv;
 pub mod thumbs;
 pub mod timeline;
+pub mod tools;
 pub mod timeline_compare;
 pub mod timeline_run;
 pub mod timecode;

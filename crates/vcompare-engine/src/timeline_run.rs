@@ -22,13 +22,13 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use crate::engine::grab::{self, GrabError, GrabMeta, Grabber};
-use crate::engine::probe::{ffprobe_json, get_video_info};
-use crate::engine::process::Job;
-use crate::engine::resolve::{ResolveSession, TimelineMeta};
-use crate::engine::timecode::{detect_timecode_format, TimecodeFormat};
-use crate::engine::timeline::{plan_samples, FileRange, Plan, Sample, TimelineClock};
-use crate::engine::timeline_compare::{compare_one, Diff, FileSide};
+use crate::grab::{self, GrabError, GrabMeta, Grabber};
+use crate::probe::{ffprobe_json, get_video_info};
+use crate::process::Job;
+use crate::resolve::{ResolveSession, TimelineMeta};
+use crate::timecode::{detect_timecode_format, TimecodeFormat};
+use crate::timeline::{plan_samples, FileRange, Plan, Sample, TimelineClock};
+use crate::timeline_compare::{compare_one, Diff, FileSide};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RunParams {
@@ -164,7 +164,7 @@ fn file_start(file_tc: Option<&str>, clock: &TimelineClock, diag: &mut Vec<Strin
     match file_tc {
         Some(tc) => {
             let file_df = tc.contains(';');
-            let tl_df = clock.tc_fmt.tc_type == crate::engine::timecode::TcType::DropFrame;
+            let tl_df = clock.tc_fmt.tc_type == crate::timecode::TcType::DropFrame;
             if file_df != tl_df {
                 diag.push(format!(
                     "warning: file timecode {tc} is {} but the timeline counts {}",
@@ -172,7 +172,7 @@ fn file_start(file_tc: Option<&str>, clock: &TimelineClock, diag: &mut Vec<Strin
                     if tl_df { "drop-frame" } else { "non-drop" }
                 ));
             }
-            crate::engine::timecode::tc_string_to_frames(tc, &clock.tc_fmt)
+            crate::timecode::tc_string_to_frames(tc, &clock.tc_fmt)
         }
         None => {
             diag.push("file has no timecode: assuming it starts at the timeline's start".into());
@@ -480,7 +480,7 @@ pub fn run(p: &RunParams, job: &Arc<Job>, cb: &Callbacks) -> Result<Value, Strin
             let median = ys[ys.len() / 2];
             let peak = ((1u64 << depth) - 1) as f64;
             diag.push(format!("diff_y median {median:.2} codes ({:.2}% of peak)", median / peak * 100.0));
-            if median / peak > crate::engine::detect::TIMELINE_MEDIAN_WARN {
+            if median / peak > crate::detect::TIMELINE_MEDIAN_WARN {
                 diag.push(format!(
                     "warning: the file differs from the SDI picture everywhere (median {median:.1} codes): \
                      check levels, matrix, output LUTs and Resolve's monitoring state"
@@ -547,9 +547,9 @@ pub fn run(p: &RunParams, job: &Arc<Job>, cb: &Callbacks) -> Result<Value, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::process::standalone_job;
-    use crate::engine::testenv;
-    use crate::engine::timeline_compare::tests::Fixture;
+    use crate::process::standalone_job;
+    use crate::testenv;
+    use crate::timeline_compare::tests::Fixture;
     use std::process::Command;
     use std::sync::Mutex;
 
@@ -616,7 +616,7 @@ mod tests {
         .unwrap();
         let playhead = dir.join("playhead");
         testenv::use_fake_resolve(&tl, Some(&playhead));
-        let grabber = testenv::crate_dir().join("../scripts/dev/fake_scopetap_grab.py");
+        let grabber = testenv::repo_root().join("scripts/dev/fake_scopetap_grab.py");
         std::env::set_var("VCOMPARE_GRABBER", &grabber);
         std::env::set_var("FAKE_GRAB_SOURCE", &fx.truth);
         std::env::set_var("FAKE_GRAB_START_TC", "01:00:00:00");
@@ -673,7 +673,7 @@ mod tests {
         }
 
         // Detection over the result flags exactly the six bad samples.
-        let state = crate::engine::state::EngineState::new();
+        let state = crate::state::EngineState::new();
         state.apply_timeline_result(&v);
         let det = state.detect_events(&Default::default(), &[]).unwrap();
         let mut flagged: Vec<&str> = det.events.iter().map(|e| e.tc.as_str()).collect();
@@ -793,7 +793,7 @@ mod tests {
         let playhead = dir.join("playhead");
         testenv::use_fake_resolve(&tl, Some(&playhead));
 
-        let sdi_script = testenv::crate_dir().join("../scripts/dev/scopetap_rig_sdi.py");
+        let sdi_script = testenv::repo_root().join("scripts/dev/scopetap_rig_sdi.py");
         let mut sdi = Command::new("python3")
             .arg(&sdi_script)
             .arg(rig.join("fake_stream"))
@@ -840,7 +840,7 @@ mod tests {
         for tc in ["01:00:01:00", "01:00:01:11", "01:00:01:23", "01:00:02:00", "01:00:02:11", "01:00:02:23"] {
             assert!(y(tc) > 15.0, "bad {tc} {}", y(tc));
         }
-        let state = crate::engine::state::EngineState::new();
+        let state = crate::state::EngineState::new();
         state.apply_timeline_result(&v);
         let det = state.detect_events(&Default::default(), &[]).unwrap();
         assert_eq!(det.events.len(), 6, "{:?}", det.events.iter().map(|e| &e.tc).collect::<Vec<_>>());

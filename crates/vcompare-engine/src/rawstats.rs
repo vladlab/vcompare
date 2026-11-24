@@ -44,10 +44,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::engine::analysis::ProgressFn;
-use crate::engine::pixfmt::parse_pix_fmt;
-use crate::engine::probe::is_concat_manifest;
-use crate::engine::timecode::TimecodeFormat;
+use crate::analysis::ProgressFn;
+use crate::pixfmt::parse_pix_fmt;
+use crate::probe::is_concat_manifest;
+use crate::timecode::TimecodeFormat;
 
 /// Thumbnail grid used for the temporal signature.
 pub const THUMB_W: usize = 32;
@@ -494,7 +494,7 @@ fn plane_absdiff_sum(a: &[u8], b: &[u8], two_byte: bool) -> u64 {
 
 /// Box-average a luma plane onto the THUMB_W × THUMB_H grid, normalized 0..1.
 fn luma_thumbnail(plane: &[u8], w: usize, h: usize, two_byte: bool, peak: f64) -> Vec<f32> {
-    crate::engine::signatures::grid_average(plane, w, h, two_byte, peak, THUMB_W, THUMB_H)
+    crate::signatures::grid_average(plane, w, h, two_byte, peak, THUMB_W, THUMB_H)
 }
 
 fn thumb_distance(a: &[f32], b: &[f32]) -> f64 {
@@ -529,10 +529,6 @@ struct WorkerOut {
     thumb: Vec<f32>,
 }
 
-/// Test-only fault injection: panic in the worker computing this frame.
-#[cfg(test)]
-static PANIC_AT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
 fn compute_frame(fmt: &RawFormat, frame: &[u8], prev: Option<&[u8]>) -> (FrameStats, Vec<f32>) {
     let two = fmt.bytes_per_sample() == 2;
     let bins = 1usize << fmt.bit_depth;
@@ -565,7 +561,7 @@ fn compute_frame(fmt: &RawFormat, frame: &[u8], prev: Option<&[u8]>) -> (FrameSt
     let (yw, yh) = fmt.plane_dims(0);
     let thumb = luma_thumbnail(&frame[fmt.plane_range(0)], yw, yh, two, fmt.peak());
     let (cw, ch) = fmt.plane_dims(1);
-    let sig = crate::engine::signatures::build(
+    let sig = crate::signatures::build(
         &thumb,
         &frame[fmt.plane_range(1)],
         &frame[fmt.plane_range(2)],
@@ -862,6 +858,10 @@ pub struct RawRunOptions {
     pub decoder_threads: Option<usize>,
     /// Bytes of decoded frames allowed in flight (default 1 GiB).
     pub buffer_bytes: Option<usize>,
+    /// Test-only fault injection: panic in the worker computing this frame.
+    /// Per run, not a global, so tests running alongside aren't hit.
+    #[cfg(test)]
+    pub panic_at_frame: Option<u64>,
 }
 
 /// Seek target for `start_frame`: half a frame before its nominal time, so
@@ -880,7 +880,7 @@ pub fn run_raw_stats(
     fmt: &RawFormat,
     opts: &RawRunOptions,
     progress: Option<ProgressFn>,
-    process_handle: crate::engine::analysis::ProcessHandle,
+    process_handle: crate::analysis::ProcessHandle,
 ) -> Result<(Vec<FrameStats>, RunReport), RawStatsError> {
     let hwaccel = opts.hwaccel.as_deref();
     let frame_limit = opts.frame_limit;
@@ -944,7 +944,7 @@ pub fn run_raw_stats(
 
     eprintln!("[vcompare] cmd: ffmpeg {}", args.join(" "));
 
-    let mut child = crate::engine::sysenv::command("ffmpeg")
+    let mut child = crate::tools::command(crate::tools::Tool::Ffmpeg)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1035,6 +1035,8 @@ pub fn run_raw_stats(
         let rx = job_rx.clone();
         let tx = res_tx.clone();
         let fmt = fmt.clone();
+        #[cfg(test)]
+        let panic_at = opts.panic_at_frame;
         workers.push(std::thread::spawn(move || loop {
             let job = match rx.lock().unwrap().recv() {
                 Ok(j) => j,
@@ -1042,7 +1044,7 @@ pub fn run_raw_stats(
             };
             let prev = job.prev.as_ref().map(|p| p.data.as_slice());
             #[cfg(test)]
-            if job.index == PANIC_AT_FRAME.load(std::sync::atomic::Ordering::Relaxed) {
+            if Some(job.index) == panic_at {
                 panic!("injected worker failure at frame {}", job.index);
             }
             let t0 = Instant::now();
@@ -1249,7 +1251,7 @@ pub fn fps_mode_args() -> [String; 2] {
 fn ffmpeg_has_fps_mode() -> bool {
     static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HAS.get_or_init(|| {
-        crate::engine::sysenv::command("ffmpeg")
+        crate::tools::command(crate::tools::Tool::Ffmpeg)
             .args(["-hide_banner", "-h", "long"])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -1520,7 +1522,7 @@ mod tests {
         let t = std::time::Instant::now();
         let r = run_raw_stats(
             "/nonexistent.mov", &f, &RawRunOptions::default(), None,
-            crate::engine::process::standalone_job(),
+            crate::process::standalone_job(),
         );
         let e = r.unwrap_err();
         assert!(e.message.contains("0x0"), "{}", e.message);
@@ -1552,16 +1554,14 @@ mod tests {
 
         // Sanity: the clean run returns every frame.
         let (ok, report) = run_raw_stats(&clip_s, &f, &RawRunOptions::default(), None,
-                               crate::engine::process::standalone_job()).unwrap();
+                               crate::process::standalone_job()).unwrap();
         assert_eq!(ok.len(), 400);
         assert_eq!(report.frames, 400);
         assert!(report.fps() > 0.0 && report.worker_busy > 0.0 && report.worker_busy <= 1.0);
 
-        PANIC_AT_FRAME.store(5, std::sync::atomic::Ordering::Relaxed);
         let t = std::time::Instant::now();
-        let r = run_raw_stats(&clip_s, &f, &RawRunOptions::default(), None,
-                              crate::engine::process::standalone_job());
-        PANIC_AT_FRAME.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        let failing = RawRunOptions { panic_at_frame: Some(5), ..Default::default() };
+        let r = run_raw_stats(&clip_s, &f, &failing, None, crate::process::standalone_job());
         let _ = std::fs::remove_dir_all(&dir);
 
         let e = r.expect_err("a worker failure must not return Ok");

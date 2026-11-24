@@ -184,7 +184,7 @@ long a real run will take on a given machine and reel.
 
 **Without the hardware:** `scripts/dev/fake_timeline_demo.sh` builds a reel
 with two planted faults and prints the environment that points vcompare at a
-fake Resolve (`src-tauri/testdata/fake_resolve`) and a fake grabber
+fake Resolve (`crates/vcompare-engine/testdata/fake_resolve`) and a fake grabber
 (`scripts/dev/fake_scopetap_grab.py`).
 
 ## Architecture
@@ -211,36 +211,46 @@ Progress and diagnostics are streamed to the frontend as Tauri events
 ## Project structure
 
 ```
-src-tauri/
+Cargo.toml                     Workspace: the three crates below
+crates/vcompare-engine/        Analysis engine (no UI)
 ├── src/
-│   ├── lib.rs                 App setup, menu, managed state
-│   ├── bridge.rs              #[tauri::command] handlers
-│   └── engine/
-│       ├── analysis.rs        ffmpeg command construction + stats parsing
-│       ├── rawstats.rs        Native per-frame stats over a rawvideo pipe
-│       ├── detect/            Event detectors over per-frame data
-│       │   ├── mod.rs         Event, DetectRequest, Resolve marker EDL
-│       │   ├── flash.rs       Flash frames (levels, diff)
-│       │   ├── repeat.rs      Repeated frames (levels)
-│       │   ├── matcher.rs     Image match over frame signatures
-│       │   └── timeline.rs    Timeline mode: flagged samples
-│       ├── signatures.rs      Per-frame picture signatures + .sig sidecar
-│       ├── references.rs      Image-match reference store
-│       ├── thumbs.rs          Event filmstrips (ffmpeg → JPEG)
-│       ├── state.rs           In-memory analysis results, queries, CSV export
-│       ├── cache.rs           .vcompare.json load/save
-│       ├── probe.rs           ffprobe, capability detection
-│       ├── pixfmt.rs          Pixel-format negotiation
-│       ├── timecode.rs        TC ⇄ frame arithmetic (incl. drop-frame)
-│       ├── mpv.rs             mpv IPC controller
-│       ├── resolve.rs         Resolve bridge: cursor sync + run sessions
-│       ├── resolve_bridge.py  Python helper (Resolve's API is Python)
-│       ├── grab.rs            scopetap_grab client (SDI frames by timecode)
-│       ├── timeline.rs        Timeline mode: sample planner
-│       ├── timeline_compare.rs  …one SDI frame vs. the file (ffmpeg psnr)
-│       ├── timeline_run.rs    …the run: seek, grab, compare pool, report
-│       └── types.rs           Shared structs
-├── testdata/fake_resolve/     Fake DaVinciResolveScript for tests and the demo
+│   ├── analysis.rs            ffmpeg command construction + stats parsing
+│   ├── rawstats.rs            Native per-frame stats over a rawvideo pipe
+│   ├── detect/                Event detectors over per-frame data
+│   │   ├── mod.rs             Event, DetectRequest, Resolve marker EDL
+│   │   ├── flash.rs           Flash frames (levels, diff)
+│   │   ├── repeat.rs          Repeated frames (levels)
+│   │   ├── matcher.rs         Image match over frame signatures
+│   │   └── timeline.rs        Timeline mode: flagged samples
+│   ├── signatures.rs          Per-frame picture signatures + .sig sidecar
+│   ├── references.rs          Image-match reference store
+│   ├── thumbs.rs              Event filmstrips (ffmpeg → JPEG)
+│   ├── state.rs               In-memory analysis results, queries, CSV export
+│   ├── cache.rs               .vcompare.json load/save
+│   ├── probe.rs               ffprobe, capability detection
+│   ├── pixfmt.rs              Pixel-format negotiation
+│   ├── tools.rs               Where ffmpeg / ffprobe / mpv are (config, env, PATH)
+│   ├── timecode.rs            TC ⇄ frame arithmetic (incl. drop-frame)
+│   ├── mpv.rs                 mpv IPC controller
+│   ├── resolve.rs             Resolve bridge: cursor sync + run sessions
+│   ├── resolve_bridge.py      Python helper (Resolve's API is Python)
+│   ├── grab.rs                scopetap_grab client (SDI frames by timecode)
+│   ├── timeline.rs            Timeline mode: sample planner
+│   ├── timeline_compare.rs    …one SDI frame vs. the file (ffmpeg psnr)
+│   ├── timeline_run.rs        …the run: seek, grab, compare pool, report
+│   └── types.rs               Shared structs
+└── testdata/fake_resolve/     Fake DaVinciResolveScript for tests and the demo
+crates/vcompare-service/       Application layer (no UI toolkit)
+└── src/
+    ├── lib.rs                 Service: owns the state, runs jobs, one method per action
+    ├── events.rs              UiEvent + EventSink (progress, mpv position, Resolve status)
+    ├── players.rs             mpv / difference-view windows and their poll threads
+    ├── recents.rs             Recent analyses list
+    └── slots.rs               Bounds concurrent thumbnail extraction
+src-tauri/                     Tauri shell for the web UI
+├── src/
+│   ├── lib.rs                 App setup, menu, managed Service
+│   └── bridge.rs              #[tauri::command] wrappers over Service
 └── tauri.conf.json
 scripts/dev/                   fake_scopetap_grab.py, fake_timeline_demo.sh
 src/
@@ -266,6 +276,10 @@ src/
 - **Node.js** ≥ 18
 - **ffmpeg / ffprobe** built with `libvmaf` (and optionally `libvmaf_cuda`)
 - **mpv** for side-by-side / difference preview (optional)
+- vcompare runs `ffmpeg`, `ffprobe` and `mpv` from `PATH`. To use other
+  builds, set `VCOMPARE_FFMPEG`, `VCOMPARE_FFPROBE` and `VCOMPARE_MPV` to
+  their paths. If only `VCOMPARE_FFMPEG` is set, an `ffprobe` next to it is
+  used.
 - WebKitGTK and friends — Fedora:
   ```bash
   sudo dnf install webkit2gtk4.1-devel openssl-devel curl-devel \
@@ -278,7 +292,7 @@ src/
 npm install
 cargo tauri dev        # Vite dev server + Rust binary, hot-reloading frontend
 npm run dev            # frontend only (no engine) — useful for layout work
-cargo test --manifest-path src-tauri/Cargo.toml   # engine unit tests
+cargo test --workspace   # engine + service unit tests
 ```
 
 Set `RUST_LOG=debug` for verbose logging. On NVIDIA / Wayland the app sets
@@ -287,7 +301,7 @@ the usual WebKitGTK workaround env vars automatically.
 ## Building and installing
 
 ```bash
-./scripts/build.sh      # → src-tauri/target/release/bundle/{appimage,deb}/
+./scripts/build.sh      # → target/release/bundle/{appimage,deb}/
 ./scripts/install.sh    # AppImage → ~/.local/bin/vcompare + app-menu entry and icon
 ./scripts/install.sh --uninstall
 ```

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::*;
-use crate::engine::signatures::{Signatures, SIG_C_LEN, SIG_LEN, SIG_Y_LEN};
+use crate::signatures::{Signatures, SIG_C_LEN, SIG_LEN, SIG_Y_LEN};
 
 /// A reference picture, as the detector needs it.
 #[derive(Debug, Clone, Serialize, Deserialize)]

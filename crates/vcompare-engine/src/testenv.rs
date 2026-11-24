@@ -11,9 +11,14 @@ pub fn lock() -> MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `src-tauri/` (where Cargo.toml lives).
+/// `crates/vcompare-engine/` (where this crate's Cargo.toml lives).
 pub fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The repository root (`scripts/` lives there).
+pub fn repo_root() -> PathBuf {
+    crate_dir().join("../..")
 }
 
 /// Point the Resolve bridge at `testdata/fake_resolve`, serving `timeline`

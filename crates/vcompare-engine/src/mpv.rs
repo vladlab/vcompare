@@ -45,8 +45,8 @@ fn log_errors(log: &str) -> Vec<String> {
     out
 }
 
-use crate::engine::timecode::TimecodeFormat;
-use crate::engine::types::TimelineInfo;
+use crate::timecode::TimecodeFormat;
+use crate::types::TimelineInfo;
 
 /// How to combine the two video streams in mpv.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -180,7 +180,7 @@ impl MpvController {
 
         let sock_str = self.sock_path.to_string_lossy().to_string();
 
-        let mut cmd = crate::engine::sysenv::command("mpv");
+        let mut cmd = crate::tools::command(crate::tools::Tool::Mpv);
 
         let title = if self.view_mode == ViewMode::Single {
             eprintln!("[vcompare] mpv: single file {ref_name}");
@@ -541,7 +541,7 @@ mod exit_report_tests {
 
     #[test]
     fn missing_file_is_reported_before_launch() {
-        let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::engine::timecode::TcType::NonDrop };
+        let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::timecode::TcType::NonDrop };
         let m = MpvController::new("/nonexistent/a.mov".into(), String::new(), tc, 0, None, ViewMode::Single, 0, 0, false);
         let err = m.launch().unwrap();
         assert!(err.contains("file not found: /nonexistent/a.mov"), "{err}");
@@ -551,14 +551,14 @@ mod exit_report_tests {
     /// quits. That used to be silent. Needs mpv and a display (xvfb-run).
     #[test]
     fn unplayable_file_is_explained() {
-        let have_mpv = crate::engine::sysenv::command("mpv").arg("--version").output().is_ok();
+        let have_mpv = crate::tools::command(crate::tools::Tool::Mpv).arg("--version").output().is_ok();
         if !have_mpv || std::env::var_os("DISPLAY").is_none() {
             eprintln!("mpv or a display unavailable; skipping");
             return;
         }
         let path = std::env::temp_dir().join(format!("vcompare_notvideo_{}.mov", std::process::id()));
         std::fs::write(&path, b"this is not a movie").unwrap();
-        let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::engine::timecode::TcType::NonDrop };
+        let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::timecode::TcType::NonDrop };
         let m = MpvController::new(path.to_string_lossy().into(), String::new(), tc, 0, None, ViewMode::Single, 0, 0, false);
         let report = match m.launch() {
             Some(err) => err, // quit before its socket appeared

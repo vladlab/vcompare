@@ -37,7 +37,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     exit 0
 fi
 
-APPIMAGE=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' 2>/dev/null | sort | tail -1 || true)
+APPIMAGE=$(find target/release/bundle/appimage -name '*.AppImage' 2>/dev/null | sort | tail -1 || true)
 if [ -z "$APPIMAGE" ]; then
     echo "No AppImage found — run ./scripts/build.sh first." >&2
     exit 1

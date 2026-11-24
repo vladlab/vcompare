@@ -10,11 +10,12 @@ use std::process::Stdio;
 #[cfg(test)]
 use std::process::Command;
 
-use crate::engine::probe::is_concat_manifest;
-use crate::engine::rawstats::{fps_mode_args, seek_seconds};
+use crate::probe::is_concat_manifest;
+use crate::rawstats::{fps_mode_args, seek_seconds};
 
 /// Extract `count` frames starting at `file_frame` (0-based from the start
-/// of the file), scaled to `height` px, as `data:image/jpeg;base64,…` URIs.
+/// of the file), scaled to `height` px, as JPEG bytes (see `data_uri` for
+/// the web form).
 /// Fewer than `count` come back at the end of the file.
 pub fn extract_frames(
     file_path: &str,
@@ -22,7 +23,7 @@ pub fn extract_frames(
     file_frame: i64,
     count: u32,
     height: u32,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<Vec<u8>>, String> {
     let file_frame = file_frame.max(0) as u64;
     let count = count.clamp(1, 16);
     let height = height.clamp(16, 1080);
@@ -60,7 +61,7 @@ pub fn extract_frames(
         "pipe:1".into(),
     ]);
 
-    let mut child = crate::engine::sysenv::command("ffmpeg")
+    let mut child = crate::tools::command(crate::tools::Tool::Ffmpeg)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -83,10 +84,12 @@ pub fn extract_frames(
         return Err(format!("ffmpeg failed: {}", err.trim()));
     }
 
-    Ok(split_mjpeg(&out)
-        .into_iter()
-        .map(|jpeg| format!("data:image/jpeg;base64,{}", base64(jpeg)))
-        .collect())
+    Ok(split_mjpeg(&out).into_iter().map(<[u8]>::to_vec).collect())
+}
+
+/// A JPEG as a `data:image/jpeg;base64,…` URI.
+pub fn data_uri(jpeg: &[u8]) -> String {
+    format!("data:image/jpeg;base64,{}", base64(jpeg))
 }
 
 /// Split a concatenated MJPEG stream into frames at SOI markers. Inside
@@ -182,12 +185,14 @@ mod tests {
             .status();
         for src in [&clip, &mp4] {
         if !src.exists() { continue; }
-        let uris = extract_frames(&src.to_string_lossy(), (24, 1), 7, 3, 36).unwrap();
-        assert_eq!(uris.len(), 3);
+        let jpegs = extract_frames(&src.to_string_lossy(), (24, 1), 7, 3, 36).unwrap();
+        assert_eq!(jpegs.len(), 3);
         // Decode each JPEG's mean luma back through ffmpeg and check the ramp.
-        for (k, uri) in uris.iter().enumerate() {
+        for (k, jpeg) in jpegs.iter().enumerate() {
+            let uri = data_uri(jpeg);
             let b64 = uri.strip_prefix("data:image/jpeg;base64,").unwrap();
             let bytes = decode_b64(b64);
+            assert_eq!(&bytes, jpeg);
             let p = dir.join(format!("f{k}.jpg"));
             std::fs::write(&p, bytes).unwrap();
             let out = Command::new("ffmpeg")

@@ -10,7 +10,7 @@
 #   timeline.json   a fake Resolve timeline: 6 clips on V1, a title on V2
 #
 # then prints the environment to start vcompare with: the bridge talks to
-# src-tauri/testdata/fake_resolve instead of Resolve, and the grabber is
+# crates/vcompare-engine/testdata/fake_resolve instead of Resolve, and the grabber is
 # scripts/dev/fake_scopetap_grab.py serving truth.nut.
 #
 # Usage:
@@ -67,8 +67,8 @@ if [ ! -f "$DIR/deliverable.mov" ]; then
 EOF
 fi
 
-ENV="export RESOLVE_SCRIPT_API='$HERE/src-tauri/testdata/fake_resolve'
-export RESOLVE_SCRIPT_LIB='$HERE/src-tauri/testdata/fake_resolve/Modules/DaVinciResolveScript.py'
+ENV="export RESOLVE_SCRIPT_API='$HERE/crates/vcompare-engine/testdata/fake_resolve'
+export RESOLVE_SCRIPT_LIB='$HERE/crates/vcompare-engine/testdata/fake_resolve/Modules/DaVinciResolveScript.py'
 export VCOMPARE_FAKE_TIMELINE='$DIR/timeline.json'
 export VCOMPARE_FAKE_PLAYHEAD='$DIR/playhead'
 export VCOMPARE_GRABBER='$HERE/scripts/dev/fake_scopetap_grab.py'

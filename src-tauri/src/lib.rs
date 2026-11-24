@@ -1,9 +1,9 @@
 mod bridge;
-mod engine;
 
-use bridge::{DiffViewState, EngineState, FfmpegHandle, MpvState, RecentsState, ResolveState};
 use std::env;
+use std::sync::Arc;
 use tauri::{Emitter, Manager};
+use vcompare_service::{Service, UiEvent};
 
 /// Build the native menu bar.
 fn build_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -89,19 +89,15 @@ pub fn run() {
             });
 
             // ── Engine state ──
-            app.manage(EngineState::new());
-            app.manage(MpvState::new());
-            app.manage(DiffViewState::new());
-            app.manage(FfmpegHandle::new());
-            app.manage(ResolveState::new());
-
-            // ── Recent analyses store ──
             let data_dir = app
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
-            app.manage(bridge::ReferenceStore::new(data_dir.clone()));
-            app.manage(RecentsState::new(data_dir));
+            let handle = app.handle().clone();
+            let sink = move |e: UiEvent| {
+                let _ = handle.emit(e.name(), e.payload());
+            };
+            app.manage(Arc::new(Service::new(data_dir, Arc::new(sink))));
 
             log::info!("vcompare engine ready (native, pid={})", std::process::id());
             Ok(())
@@ -153,35 +149,10 @@ pub fn run() {
         if let tauri::RunEvent::Exit = event {
             log::info!("App exiting — cleaning up");
 
-            // Kill any running ffmpeg process (same path as Cancel: the
-            // runners then neither retry nor save).
-            if let Some(handle) = app_handle.try_state::<FfmpegHandle>() {
-                handle.0.cancel();
-            }
-
-            // Kill mpv if running
-            if let Some(state) = app_handle.try_state::<MpvState>() {
-                if let Ok(mut ctrl) = state.controller.lock() {
-                    if let Some(mpv) = ctrl.take() {
-                        mpv.kill();
-                    }
-                }
-            }
-
-            // Close the Resolve bridge if open
-            if let Some(state) = app_handle.try_state::<ResolveState>() {
-                if let Some(s) = state.sync.lock().unwrap().take() {
-                    s.disconnect();
-                }
-            }
-
-            // Kill diffview if running
-            if let Some(state) = app_handle.try_state::<DiffViewState>() {
-                if let Ok(mut ctrl) = state.controller.lock() {
-                    if let Some(mpv) = ctrl.take() {
-                        mpv.kill();
-                    }
-                }
+            // Kill ffmpeg (as Cancel does, so the runner neither retries
+            // nor saves), the mpv windows and the Resolve helper.
+            if let Some(svc) = app_handle.try_state::<Arc<Service>>() {
+                svc.shutdown();
             }
         }
     });

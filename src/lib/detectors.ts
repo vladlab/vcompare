@@ -1,6 +1,6 @@
 // Tabs under the chart, and what each detector's rows show.
 //
-// Adding a detector: an engine detector (src-tauri/src/engine/detect/), a
+// Adding a detector: an engine detector (crates/vcompare-engine/src/detect/), a
 // `DetectorKind`, an entry in TABS, its defaults in DEFAULT_PARAMS, its
 // controls in DetectorToolbar.svelte and its strip in `stripFor`.
 

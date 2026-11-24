@@ -23,7 +23,7 @@ use std::process::{ChildStdin, ChildStdout, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::engine::process::{ChildId, Job};
+use crate::process::{ChildId, Job};
 
 pub const BINARY: &str = "scopetap_grab";
 
@@ -151,7 +151,7 @@ pub fn find_binary() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
-    let path = crate::engine::sysenv::path()?;
+    let path = crate::sysenv::path()?;
     std::env::split_paths(&path)
         .map(|d| d.join(BINARY))
         .find(|p| is_executable(p))
@@ -185,7 +185,7 @@ pub struct Grabber {
 
 impl Grabber {
     pub fn start(bin: &Path, tc_base: u32, settle_ms: Option<u32>, job: &Arc<Job>) -> Result<Self, String> {
-        let mut cmd = crate::engine::sysenv::command(bin);
+        let mut cmd = crate::sysenv::command(bin);
         cmd.args(["--serve", "--tc-base", &tc_base.to_string()]);
         if let Some(ms) = settle_ms {
             cmd.args(["--settle-ms", &ms.to_string()]);

@@ -13,17 +13,17 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::engine::pixfmt::{choose_common_pixfmt, parse_pix_fmt};
-use crate::engine::probe::{ffprobe_json, get_video_info, is_concat_manifest};
-use crate::engine::timecode::{detect_timecode_format, TimecodeFormat};
-use crate::engine::types::{ComparisonConfig, TimelineInfo};
+use crate::pixfmt::{choose_common_pixfmt, parse_pix_fmt};
+use crate::probe::{ffprobe_json, get_video_info, is_concat_manifest};
+use crate::timecode::{detect_timecode_format, TimecodeFormat};
+use crate::types::{ComparisonConfig, TimelineInfo};
 
 /// Callback for progress updates: (current_frame, total_frames).
 pub type ProgressFn = Box<dyn Fn(u64, u64) + Send>;
 
 /// The running ffmpeg process and cancel flag, shared with the app so it can
 /// cancel or kill on quit. See `engine::process`.
-pub type ProcessHandle = Arc<crate::engine::process::Job>;
+pub type ProcessHandle = Arc<crate::process::Job>;
 
 /// Removes a scratch directory (and anything ffmpeg left in it) when
 /// dropped, so killed or failed runs don't leave partial stats / VMAF JSON
@@ -303,6 +303,7 @@ pub fn run_diff_analysis(
     };
 
     // Build command
+    // args[0] is a placeholder: the runner gets `args[1..]`.
     let mut args = vec!["ffmpeg".to_string(), "-y".to_string()];
     args.extend(input_args_for(ref_path, config.ref_seek_sec));
     args.extend(input_args_for(dist_path, config.dist_seek_sec));
@@ -590,8 +591,8 @@ pub fn run_levels_analysis(
     process_handle: ProcessHandle,
     diagnostics: &mut Vec<String>,
     publish: &dyn Fn(&[String]),
-) -> Result<(Vec<Value>, String, Option<crate::engine::signatures::Signatures>), String> {
-    use crate::engine::rawstats::{chunk_count, choose_hwaccel, ChunkSource, RawFormat};
+) -> Result<(Vec<Value>, String, Option<crate::signatures::Signatures>), String> {
+    use crate::rawstats::{chunk_count, choose_hwaccel, ChunkSource, RawFormat};
 
     let fmt = RawFormat::for_source(&info.pix_fmt, info.width, info.height)
         .with_full_range(info.full_range);
@@ -662,7 +663,7 @@ pub fn run_levels_analysis(
         report.summary()
     };
     let sigs = want_signatures.then(|| {
-        use crate::engine::signatures::{Signatures, SIG_LEN};
+        use crate::signatures::{Signatures, SIG_LEN};
         let mut data = Vec::with_capacity(stats.len() * SIG_LEN);
         for s in &stats {
             debug_assert_eq!(s.sig.len(), SIG_LEN);
@@ -675,8 +676,8 @@ pub fn run_levels_analysis(
 
 /// Do `warmup` (a chunk's first frames) repeat the end of `stitched`?
 fn seam_matches(
-    stitched: &[crate::engine::rawstats::FrameStats],
-    warmup: &[crate::engine::rawstats::FrameStats],
+    stitched: &[crate::rawstats::FrameStats],
+    warmup: &[crate::rawstats::FrameStats],
 ) -> bool {
     warmup.len() <= stitched.len()
         && stitched[stitched.len() - warmup.len()..]
@@ -697,7 +698,7 @@ fn progress_wrapper(shared: &Option<Arc<Mutex<ProgressFn>>>) -> Option<ProgressF
 #[allow(clippy::too_many_arguments)]
 fn run_single(
     file_path: &str,
-    fmt: &crate::engine::rawstats::RawFormat,
+    fmt: &crate::rawstats::RawFormat,
     info: &SingleFileInfo,
     hw: Option<&str>,
     cores: usize,
@@ -705,8 +706,8 @@ fn run_single(
     process_handle: &ProcessHandle,
     diagnostics: &mut Vec<String>,
     publish: &dyn Fn(&[String]),
-) -> Result<(Vec<crate::engine::rawstats::FrameStats>, crate::engine::rawstats::RunReport), String> {
-    use crate::engine::rawstats::{run_raw_stats, RawRunOptions};
+) -> Result<(Vec<crate::rawstats::FrameStats>, crate::rawstats::RunReport), String> {
+    use crate::rawstats::{run_raw_stats, RawRunOptions};
     let opts = RawRunOptions {
         hwaccel: hw.map(String::from),
         fps: info.fps,
@@ -739,14 +740,14 @@ enum ChunkedError {
 /// Decode `n` chunks in parallel ffmpeg processes and stitch the results.
 fn run_chunked(
     file_path: &str,
-    fmt: &crate::engine::rawstats::RawFormat,
+    fmt: &crate::rawstats::RawFormat,
     info: &SingleFileInfo,
     n: u32,
     cores: usize,
     shared_progress: &Option<Arc<Mutex<ProgressFn>>>,
     process_handle: &ProcessHandle,
-) -> Result<(Vec<crate::engine::rawstats::FrameStats>, crate::engine::rawstats::RunReport), ChunkedError> {
-    use crate::engine::rawstats::{plan_chunks, run_raw_stats, RawRunOptions, RunReport};
+) -> Result<(Vec<crate::rawstats::FrameStats>, crate::rawstats::RunReport), ChunkedError> {
+    use crate::rawstats::{plan_chunks, run_raw_stats, RawRunOptions, RunReport};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // With only an estimated length, the last chunk runs to the end of the
@@ -775,6 +776,7 @@ fn run_chunked(
                     workers: Some(per),
                     decoder_threads: Some(per.max(2)),
                     buffer_bytes: Some((1usize << 30) / chunks.len()),
+                    ..Default::default()
                 };
                 // Each chunk reports its own count; turn that into increments
                 // of the shared total and report against the whole file.
@@ -893,7 +895,7 @@ pub fn prepare_single_file(
     let tc_fmt = detect_timecode_format(&probe)?;
     let info = get_video_info(&probe, &tc_fmt)?;
     let stream_str = |key: &str| {
-        crate::engine::timecode::find_video_stream(&probe)
+        crate::timecode::find_video_stream(&probe)
             .and_then(|v| v.get(key))
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -901,7 +903,7 @@ pub fn prepare_single_file(
     };
     let codec_name = stream_str("codec_name");
     let full_range = stream_str("color_range") == "pc";
-    let cfr = match crate::engine::timecode::parse_rational(&stream_str("avg_frame_rate")) {
+    let cfr = match crate::timecode::parse_rational(&stream_str("avg_frame_rate")) {
         Some((an, ad)) if an > 0 && ad > 0 && info.fps_den > 0 => {
             let avg = an as f64 / ad as f64;
             let nominal = info.fps_num as f64 / info.fps_den as f64;
@@ -985,7 +987,7 @@ fn run_ffmpeg_with_progress(
     progress: Option<ProgressFn>,
     process_handle: ProcessHandle,
 ) -> Result<(), String> {
-    let mut child = crate::engine::sysenv::command("ffmpeg")
+    let mut child = crate::tools::command(crate::tools::Tool::Ffmpeg)
         .args(args)
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
@@ -1310,7 +1312,7 @@ mod tests {
             let run = |n: u32| {
                 let mut d = Vec::new();
                 run_levels_analysis(&p, &info, None, Some(n), true, None,
-                                    crate::engine::process::standalone_job(), &mut d, &|_| {})
+                                    crate::process::standalone_job(), &mut d, &|_| {})
                     .unwrap()
             };
             let (single, s1, sig1) = run(1);
@@ -1332,7 +1334,7 @@ mod tests {
     /// The seam check must reject a chunk that starts one frame off.
     #[test]
     fn seam_check_catches_off_by_one() {
-        use crate::engine::rawstats::{bench_compute, RawFormat};
+        use crate::rawstats::{bench_compute, RawFormat};
         let f = RawFormat::for_source("yuv420p", 64, 36);
         // Distinct frames: frame k is a flat field at level 20 + 10k.
         let frames: Vec<_> = (0..12u8)

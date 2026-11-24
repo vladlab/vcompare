@@ -386,7 +386,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vcompare_repeat_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("dup.mov").to_string_lossy().to_string();
-        let ok = crate::engine::sysenv::command("ffmpeg")
+        let ok = crate::tools::command(crate::tools::Tool::Ffmpeg)
             .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=3",
                    "-vf", "loop=loop=1:size=1:start=30,setpts=N/24/TB", "-frames:v", "72",
                    "-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le", &clip])
@@ -398,9 +398,9 @@ mod tests {
             return;
         }
         let mut d = Vec::new();
-        let info = crate::engine::analysis::prepare_single_file(&clip, &mut d).unwrap();
-        let (frames, _, _) = crate::engine::analysis::run_levels_analysis(
-            &clip, &info, None, Some(1), false, None, crate::engine::process::standalone_job(), &mut d, &|_| {},
+        let info = crate::analysis::prepare_single_file(&clip, &mut d).unwrap();
+        let (frames, _, _) = crate::analysis::run_levels_analysis(
+            &clip, &info, None, Some(1), false, None, crate::process::standalone_job(), &mut d, &|_| {},
         )
         .unwrap();
         let r = detect_repeats(&frames, info.bit_depth, &RepeatParams::default()).unwrap();

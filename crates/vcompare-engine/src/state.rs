@@ -10,10 +10,10 @@ use std::sync::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::engine::detect::{self as events, DetectRequest, DetectResult, Detector, Event, Reference};
-use crate::engine::signatures::{self, Signatures};
-use crate::engine::timecode::TimecodeFormat;
-use crate::engine::types::TimelineInfo;
+use crate::detect::{self as events, DetectRequest, DetectResult, Detector, Event, Reference};
+use crate::signatures::{self, Signatures};
+use crate::timecode::TimecodeFormat;
+use crate::types::TimelineInfo;
 
 /// Context needed by the mpv controller — extracted from analysis results.
 #[derive(Debug, Clone)]
@@ -369,7 +369,7 @@ impl EngineState {
                 };
                 let content = serde_json::to_string_pretty(&file)
                     .map_err(|e| format!("Failed to serialize reviews: {e}"))?;
-                crate::engine::cache::write_atomic(&path, content.as_bytes())?;
+                crate::cache::write_atomic(&path, content.as_bytes())?;
             }
         }
         Ok(serde_json::json!({

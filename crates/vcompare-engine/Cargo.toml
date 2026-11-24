@@ -1,0 +1,13 @@
+[package]
+name = "vcompare-engine"
+description = "vcompare analysis engine: ffmpeg pipelines, stats, detectors, mpv and Resolve control. No UI."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

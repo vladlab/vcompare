@@ -21,8 +21,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::engine::resolve::{ClipItem, TimelineMeta};
-use crate::engine::timecode::{tc_string_to_frames, TcType, TimecodeFormat};
+use crate::resolve::{ClipItem, TimelineMeta};
+use crate::timecode::{tc_string_to_frames, TcType, TimecodeFormat};
 
 /// Resolve's frame-rate setting string → a timecode format.
 ///

@@ -13,8 +13,8 @@ use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::detect::Reference;
-use crate::engine::signatures::{self, SIG_LEN, SIG_Y_H, SIG_Y_W};
+use crate::detect::Reference;
+use crate::signatures::{self, SIG_LEN, SIG_Y_H, SIG_Y_W};
 
 /// A stored reference picture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +74,7 @@ impl ReferenceStore {
     pub fn save(&self, r: &StoredReference) -> Result<(), String> {
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
         let content = serde_json::to_string_pretty(r).map_err(|e| e.to_string())?;
-        crate::engine::cache::write_atomic(&self.path(&r.id)?.to_string_lossy(), content.as_bytes())
+        crate::cache::write_atomic(&self.path(&r.id)?.to_string_lossy(), content.as_bytes())
     }
 
     pub fn rename(&self, id: &str, name: &str) -> Result<(), String> {
@@ -138,11 +138,11 @@ pub fn thumbnail_of_image(path: &str) -> Option<String> {
         "-q:v", "4", "pipe:1",
     ])
     .ok()?;
-    (!jpeg.is_empty()).then(|| format!("data:image/jpeg;base64,{}", crate::engine::thumbs::base64(&jpeg)))
+    (!jpeg.is_empty()).then(|| crate::thumbs::data_uri(&jpeg))
 }
 
 fn run_ffmpeg(args: &[&str]) -> Result<Vec<u8>, String> {
-    let mut child = crate::engine::sysenv::command("ffmpeg")
+    let mut child = crate::tools::command(crate::tools::Tool::Ffmpeg)
         .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
         .args(args)
         .stdin(Stdio::null())
@@ -166,16 +166,16 @@ fn run_ffmpeg(args: &[&str]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::detect::matcher::similarity;
+    use crate::detect::matcher::similarity;
 
     fn ffmpeg_ok() -> bool {
-        crate::engine::sysenv::command("ffmpeg").arg("-version").output().is_ok()
+        crate::tools::command(crate::tools::Tool::Ffmpeg).arg("-version").output().is_ok()
     }
 
     /// Make a test card PNG with ffmpeg's own sources.
     fn make_png(dir: &Path, name: &str, src: &str) -> String {
         let p = dir.join(name).to_string_lossy().to_string();
-        let ok = crate::engine::sysenv::command("ffmpeg")
+        let ok = crate::tools::command(crate::tools::Tool::Ffmpeg)
             .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", src, "-frames:v", "1", "-y", &p])
             .status()
             .map(|s| s.success())
@@ -250,8 +250,8 @@ mod tests {
             eprintln!("ffmpeg unavailable; skipping");
             return;
         }
-        use crate::engine::detect::matcher::detect_matches;
-        use crate::engine::detect::MatchParams;
+        use crate::detect::matcher::detect_matches;
+        use crate::detect::MatchParams;
         let dir = std::env::temp_dir().join(format!("vcompare_card_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let card = "color=c=0x8a1010:s=640x360,drawbox=x=200:y=140:w=240:h=80:color=white:t=fill,\
@@ -261,7 +261,7 @@ mod tests {
         let graph = format!(
             "testsrc2=s=640x360:r=24:d=2[a];{card},trim=duration=1,fps=24[b];mandelbrot=s=640x360:r=24,trim=duration=2[c];[a][b][c]concat=n=3:v=1:a=0,format=yuv422p10le"
         );
-        let ok = crate::engine::sysenv::command("ffmpeg")
+        let ok = crate::tools::command(crate::tools::Tool::Ffmpeg)
             .args(["-nostdin", "-loglevel", "error", "-y", "-filter_complex", &graph, "-c:v", "prores_ks", "-profile:v", "3", &clip])
             .status()
             .map(|s| s.success())
@@ -269,9 +269,9 @@ mod tests {
         assert!(ok, "could not make the clip");
 
         let mut d = Vec::new();
-        let info = crate::engine::analysis::prepare_single_file(&clip, &mut d).unwrap();
-        let (frames, _, sigs) = crate::engine::analysis::run_levels_analysis(
-            &clip, &info, None, Some(1), true, None, crate::engine::process::standalone_job(), &mut d, &|_| {},
+        let info = crate::analysis::prepare_single_file(&clip, &mut d).unwrap();
+        let (frames, _, sigs) = crate::analysis::run_levels_analysis(
+            &clip, &info, None, Some(1), true, None, crate::process::standalone_job(), &mut d, &|_| {},
         )
         .unwrap();
         let sigs = sigs.unwrap();

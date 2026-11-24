@@ -13,7 +13,7 @@ Speaks the protocol in scopetap's docs/GRAB_PLAN.md §4 (proto=1):
 The "SDI output" is a video file (the monitor's truth). A GRAB for timecode T
 returns that file's frame at T, decoded to packed rgb48le, top row first.
 If FAKE_GRAB_PLAYHEAD is set, the frame is only returned once that file (the
-fake Resolve's playhead, see src-tauri/testdata/fake_resolve) says T, like a
+fake Resolve's playhead, see crates/vcompare-engine/testdata/fake_resolve) says T, like a
 real SDI output that only shows the parked frame; otherwise the GRAB times
 out with `ERR timeout have=<playhead>`.
 

@@ -1,6 +1,28 @@
 # Plan: port the UI from Tauri/Svelte to egui
 
-Branch: `egui-port` (off `detector-tabs` at `1572726`). **Status: plan only.**
+Branch: `egui-port` (off `detector-tabs` at `1572726`). **Status: §1 built
+(2026-11-23).** Gates passed in a sandbox (Ubuntu 24.04, no GPU, no
+Resolve): 131 tests from the workspace root (126 engine, 5 service, three
+of them end to end through `Service` on a generated clip); every
+`invoke()` in `rpc.ts` matched to a command with the same argument names
+and every `listen()` to a `UiEvent` name; the release Tauri build starts
+under Xvfb. Not yet checked: the web UI clicked through on a real machine
+(levels, diff, a saved analysis, mpv).
+
+Differences from the plan, found while building:
+- **Test fix.** `rawstats`' worker-failure test injected its panic through
+  a process-wide static, so `chunked_levels_match_single_process`
+  sometimes died with it when the two ran in parallel. The injection is
+  now a test-only field of `RawRunOptions`.
+- **Tool lookup.** Production code already started every child through
+  `sysenv::command`, so `tools::command(Tool)` sits on top of it. Test
+  code still calls `Command::new("ffmpeg")` directly, which is fine.
+- **Mpv and diffview share code.** The two copies of the launch / poll /
+  kill code are now one `Player` in `vcompare-service`.
+- **Levels cache reuse.** Unchanged and pinned by a test: `analyze` re-runs
+  levels even when its cache exists, because `cache::load_diff_cache` only
+  accepts diff caches. The UI reopens levels caches through
+  `load_saved_analysis`, so nothing visible depends on it.
 
 ## Why
 

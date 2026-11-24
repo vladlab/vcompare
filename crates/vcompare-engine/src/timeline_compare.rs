@@ -30,11 +30,11 @@ use std::sync::Arc;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::engine::pixfmt::parse_pix_fmt;
-use crate::engine::probe::is_concat_manifest;
-use crate::engine::process::Job;
-use crate::engine::rawstats::{fps_mode_args, seek_seconds};
-use crate::engine::timecode::{find_video_stream, parse_rational};
+use crate::pixfmt::parse_pix_fmt;
+use crate::probe::is_concat_manifest;
+use crate::process::Job;
+use crate::rawstats::{fps_mode_args, seek_seconds};
+use crate::timecode::{find_video_stream, parse_rational};
 
 /// The file side of the comparison, from ffprobe.
 #[derive(Debug, Clone)]
@@ -322,7 +322,7 @@ pub fn compare_one(
     args.extend(fps_mode_args());
     args.extend(["-frames:v".into(), "1".into(), "-f".into(), "null".into(), "-".into()]);
 
-    let mut child = crate::engine::sysenv::command("ffmpeg")
+    let mut child = crate::tools::command(crate::tools::Tool::Ffmpeg)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -360,8 +360,8 @@ pub fn compare_one(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::engine::probe::ffprobe_json;
-    use crate::engine::process::standalone_job;
+    use crate::probe::ffprobe_json;
+    use crate::process::standalone_job;
     use std::path::{Path, PathBuf};
 
     fn ff(args: &[&str]) {

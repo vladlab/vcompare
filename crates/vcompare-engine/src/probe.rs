@@ -7,15 +7,15 @@
 use serde_json::Value;
 use std::path::Path;
 
-use crate::engine::timecode::{find_video_stream, parse_rational, tc_string_to_frames};
-use crate::engine::timecode::TimecodeFormat;
-use crate::engine::types::{Capabilities, ProbeResult, VideoInfo};
+use crate::timecode::{find_video_stream, parse_rational, tc_string_to_frames};
+use crate::timecode::TimecodeFormat;
+use crate::types::{Capabilities, ProbeResult, VideoInfo};
 
 // ─── FFprobe ────────────────────────────────────────────────────────────────
 
 /// Run ffprobe and return parsed JSON. Handles concat manifests.
 pub fn ffprobe_json(path: &str) -> Result<Value, String> {
-    let mut cmd = crate::engine::sysenv::command("ffprobe");
+    let mut cmd = crate::tools::command(crate::tools::Tool::Ffprobe);
     cmd.args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"]);
 
     if is_concat_manifest(path) {
@@ -221,7 +221,7 @@ pub fn detect_hwaccel() -> Option<String> {
         vec!["cuda", "vaapi"]
     };
 
-    let output = crate::engine::sysenv::command("ffmpeg")
+    let output = crate::tools::command(crate::tools::Tool::Ffmpeg)
         .args(["-hide_banner", "-hwaccels"])
         .output()
         .ok()?;
@@ -239,7 +239,7 @@ pub fn detect_hwaccel() -> Option<String> {
 
 /// Check if ffmpeg was built with the libvmaf_cuda filter.
 pub fn detect_vmaf_cuda() -> bool {
-    let output = match crate::engine::sysenv::command("ffmpeg")
+    let output = match crate::tools::command(crate::tools::Tool::Ffmpeg)
         .args(["-hide_banner", "-filters"])
         .output()
     {
@@ -261,13 +261,13 @@ pub fn detect_capabilities() -> Capabilities {
         hwaccel,
         vmaf_cuda,
         has_mpv,
-        grabber: crate::engine::grab::find_binary().map(|p| p.to_string_lossy().to_string()),
+        grabber: crate::grab::find_binary().map(|p| p.to_string_lossy().to_string()),
     }
 }
 
 /// Check if mpv is available in PATH.
 fn detect_mpv() -> bool {
-    crate::engine::sysenv::command("mpv")
+    crate::tools::command(crate::tools::Tool::Mpv)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -360,7 +360,7 @@ mod tests {
         let tc_fmt = TimecodeFormat {
             fps_num: 24,
             fps_den: 1,
-            tc_type: crate::engine::timecode::TcType::NonDrop,
+            tc_type: crate::timecode::TcType::NonDrop,
         };
 
         let info = get_video_info(&probe, &tc_fmt).unwrap();

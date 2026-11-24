@@ -31,7 +31,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::engine::timecode::TimecodeFormat;
+use crate::timecode::TimecodeFormat;
 
 pub mod flash;
 pub mod matcher;
@@ -222,7 +222,7 @@ fn default_detector() -> Detector {
 /// sitting on a cut get Cyan so they're easy to tell apart. Repeats are
 /// Green, image matches Pink.
 pub fn events_to_resolve_edl(events: &[Event], tc_fmt: &TimecodeFormat, title: &str) -> String {
-    use crate::engine::timecode::TcType;
+    use crate::timecode::TcType;
     let mut out = String::new();
     out.push_str(&format!("TITLE: {}
 ", title.trim()));
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn resolve_edl_format() {
-        use crate::engine::timecode::{TcType, TimecodeFormat};
+        use crate::timecode::{TcType, TimecodeFormat};
         let tc = TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: TcType::NonDrop };
         let ev = |frame: i64, length: u32, subkind: &str, at_cut: bool| Event {
             frame, tc: tc.frame_to_tc(frame), length, kind: "flash".into(),
@@ -693,7 +693,7 @@ mod tests {
         // Markers.
         let edl = events_to_resolve_edl(
             &detect_timeline(&frames, 10, &DetectParams::default()).unwrap().events,
-            &crate::engine::timecode::TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::engine::timecode::TcType::NonDrop },
+            &crate::timecode::TimecodeFormat { fps_num: 24, fps_den: 1, tc_type: crate::timecode::TcType::NonDrop },
             "t",
         );
         assert!(edl.contains("|C:ResolveColorRed |M:mismatch: c (V1, first) x"), "{edl}");

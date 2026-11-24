@@ -1,0 +1,10 @@
+[package]
+name = "vcompare-service"
+description = "vcompare application layer: owns the engine state, runs jobs, talks to the UI through an EventSink. No UI toolkit."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vcompare-engine = { path = "../vcompare-engine" }
+serde.workspace = true
+serde_json.workspace = true

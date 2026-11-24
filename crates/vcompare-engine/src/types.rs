@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::timecode::TimecodeFormat;
+use crate::timecode::TimecodeFormat;
 
 /// Key properties extracted from a video file via ffprobe.
 #[derive(Debug, Clone, Serialize, Deserialize)]

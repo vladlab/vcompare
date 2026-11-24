@@ -3,7 +3,7 @@
 use serde_json::Value;
 use std::path::Path;
 
-use crate::engine::timecode::{TcType, TimecodeFormat};
+use crate::timecode::{TcType, TimecodeFormat};
 
 /// Default cache path for an analysis: `{ref_dir}/{ref_stem}_vs_{dist_stem}.vcompare.json`
 pub fn default_log_path(ref_path: &str, dist_path: &str) -> String {

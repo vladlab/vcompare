@@ -403,7 +403,7 @@ impl Drop for ResolveSession {
 /// A Python 3 to run the bridge with. `VCOMPARE_PYTHON` overrides.
 fn python_command() -> Result<Command, String> {
     if let Some(p) = std::env::var_os("VCOMPARE_PYTHON") {
-        return Ok(crate::engine::sysenv::command(p));
+        return Ok(crate::sysenv::command(p));
     }
     let candidates: &[&str] = if cfg!(target_os = "windows") {
         &["python", "py", "python3"]
@@ -413,13 +413,13 @@ fn python_command() -> Result<Command, String> {
     // Why each candidate didn't do, so "not found" never hides "found but broken".
     let mut why: Vec<String> = Vec::new();
     for c in candidates {
-        match crate::engine::sysenv::command(c)
+        match crate::sysenv::command(c)
             .args(["-c", "import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)"])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
         {
-            Ok(o) if o.status.success() => return Ok(crate::engine::sysenv::command(c)),
+            Ok(o) if o.status.success() => return Ok(crate::sysenv::command(c)),
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr);
                 let last = err.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("").trim().to_string();
@@ -450,7 +450,7 @@ mod tests {
             eprintln!("no python3; skipping");
             return;
         }
-        let _env = crate::engine::testenv::lock();
+        let _env = crate::testenv::lock();
         let dir = std::env::temp_dir().join(format!("vcompare_resolve_stub_{}", std::process::id()));
         let modules = dir.join("Modules");
         std::fs::create_dir_all(&modules).unwrap();
@@ -530,7 +530,7 @@ def scriptapp(name): return _R()
             eprintln!("no python3; skipping");
             return;
         }
-        let _env = crate::engine::testenv::lock();
+        let _env = crate::testenv::lock();
         let dir = std::env::temp_dir().join(format!("vcompare_session_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tl = dir.join("timeline.json");
@@ -545,7 +545,7 @@ def scriptapp(name): return _R()
         )
         .unwrap();
         let playhead = dir.join("playhead");
-        crate::engine::testenv::use_fake_resolve(&tl, Some(&playhead));
+        crate::testenv::use_fake_resolve(&tl, Some(&playhead));
 
         let mut s = ResolveSession::connect().unwrap();
         assert_eq!(s.target, "P / Reel 1");

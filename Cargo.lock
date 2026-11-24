@@ -3798,9 +3798,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -4149,9 +4147,7 @@ name = "vcompare"
 version = "0.1.0"
 dependencies = [
  "env_logger",
- "libc",
  "log",
- "regex",
  "serde",
  "serde_json",
  "tauri",
@@ -4159,6 +4155,26 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-shell",
  "tokio",
+ "vcompare-service",
+]
+
+[[package]]
+name = "vcompare-engine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "vcompare-service"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "vcompare-engine",
 ]
 
 [[package]]
