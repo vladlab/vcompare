@@ -1,7 +1,12 @@
 # vcompare
 
-Video comparison and QC tool — Tauri desktop app with a native Rust analysis
-engine driving ffmpeg.
+Video comparison and QC tool: a native desktop app (Rust, egui) with an
+analysis engine driving ffmpeg. Runs on Linux (including Rocky / RHEL 9)
+and macOS.
+
+The original Tauri / Svelte web UI is still in the repo while the native one
+takes over; both use the same engine, caches and settings folder. See
+[Web UI](#web-ui-being-retired) at the end.
 
 ## Modes
 
@@ -39,14 +44,16 @@ the Reference / Distorted rows individually, or two at once to fill both.
 A running analysis can be cancelled (button or `Esc`); a cancelled job
 saves nothing and leaves no temp files.
 
-Results are cached as `.vcompare.json` next to the reference file and can be
-reopened from the Recent Analyses list, exported to CSV, and scrubbed in mpv
-(side-by-side or difference view).
+Results are saved next to the (reference) file, one file per mode:
+`<ref>_vs_<dist>.diff.json` / `.vmaf.json`, `<file>.levels.json`,
+`<file>.timeline.json`. Picking the same files again offers to load the
+saved result instead of re-running. Analyses reopen from Recent Analyses,
+export to CSV, and can be scrubbed in mpv (side by side or difference view).
 
 ### Results layout
 
-The chart runs the full width of the window. Below it (drag the handle
-between them to resize; the split is remembered) a tab strip holds the frame
+The chart runs the full width of the window. Below it (drag the edge
+between them to resize) a tab strip holds the frame
 table and one tab per detector, each full width:
 
 | Tab | Modes | Finds |
@@ -63,7 +70,7 @@ tab that can't run on an older cache stays visible, greyed, with the reason.
 The chart and timeline-bar markers show the active detector tab's events, and
 `↑` / `↓`, `y` / `x` act on it; on Frames (and Report) the chart shows the
 signal alone.
-`1`–`5` switch tabs.
+`1`–`4` switch tabs.
 
 Every event row carries a filmstrip: the frame before, the event's frames
 (long runs are capped, with "+n") and the frame after; both files side by
@@ -131,7 +138,8 @@ theirs. Tick the references to look for; double-click a name to rename it.
 With **Resolve sync** on (`r`), the cursor drives the playhead of the timeline
 open in Resolve, via Resolve's scripting API. Needs Resolve running with
 *Preferences › System › General › External scripting using: Local*, and a
-Python 3 on the PATH (set `VCOMPARE_PYTHON` to pick one). Timecodes are the
+Python 3 on the PATH (set `VCOMPARE_PYTHON` to pick one). The top bar shows
+whether it's connected. Timecodes are the
 file's own, so this lines up when the file was exported from that timeline.
 
 ### Timeline mode (file vs. Resolve's SDI output)
@@ -187,31 +195,140 @@ with two planted faults and prints the environment that points vcompare at a
 fake Resolve (`crates/vcompare-engine/testdata/fake_resolve`) and a fake grabber
 (`scripts/dev/fake_scopetap_grab.py`).
 
+## Install
+
+Linux: unpack the release tarball and run its `install.sh` (per user, into
+`~/.local`; `sudo ./install.sh --prefix /usr/local` for everyone). It adds
+"vcompare (native)" to the application menu. macOS: unzip `vcompare.app`
+into Applications; it isn't notarised, so open it the first time with
+right-click > Open.
+
+Not included, install them separately:
+
+- **ffmpeg / ffprobe.** VMAF mode needs a build with `libvmaf` (or
+  `libvmaf_cuda` for the GPU path). Everything else works with any recent
+  ffmpeg.
+- **mpv**, for the side-by-side and difference players (optional).
+- **scopetap**, for timeline mode only (see above).
+
+**File > Tools…** shows which ffmpeg, ffprobe and mpv vcompare is using,
+their versions, whether that ffmpeg has `libvmaf` / `libvmaf_cuda` and
+hardware decoding, and whether `scopetap_grab` was found. Paths set there are
+kept with the app's settings and take precedence. Without one, vcompare uses
+`VCOMPARE_FFMPEG` / `VCOMPARE_FFPROBE` / `VCOMPARE_MPV` if set, then the
+program on `PATH`, then `/usr/local/bin` (on macOS also `/opt/homebrew/bin`
+and `/opt/local/bin`, since apps opened from the Finder don't get the shell's
+`PATH`). A set ffmpeg brings the `ffprobe` next to it. The start screen warns
+when ffmpeg is missing, or when VMAF is picked and the ffmpeg can't do it.
+
+## Using it
+
+```bash
+vcompare-egui                          # start screen: pick a mode and files
+vcompare-egui ref.mov dist.mov         # comparison, both files filled in
+vcompare-egui clip.mov                 # levels
+vcompare-egui clip.levels.json         # open a saved analysis
+```
+
+Files can also be dropped on the window. F1 lists every shortcut.
+
+Settings and app data (recent analyses, image-match references, tool paths)
+live in `~/.local/share/com.vcompare.app/` (macOS: `~/Library/Application
+Support/com.vcompare.app/`).
+
+Two renderers are built in: `VCOMPARE_RENDERER=glow` (OpenGL, the Linux
+default) and `VCOMPARE_RENDERER=wgpu` (Vulkan on Linux, Metal on macOS,
+where it is the default). If the window is blank or sluggish, over a remote
+desktop for instance, try the other one. `VCOMPARE_VSYNC=0` turns vsync off
+(a little less lag, may tear).
+
+### Keyboard
+
+| Key | Action |
+|-----|--------|
+| `=` / `-`, `0` | zoom in / out on the cursor, show all |
+| `.` `,` / `→` `←` | step a frame (the players, when one is open) |
+| `n` `N` / `↓` `↑` | next / previous event of the active detector tab |
+| `y` / `x` | accept / reject the picked event |
+| `m` / `M` | next / previous metric |
+| `t` / `T` | threshold line from the metric (mean ± σ) / clear it |
+| `1`–`4` | tabs under the chart |
+| `f` | smoothing: off / 5 / 11 / 21 / 51 frames (running median) |
+| `e` | export CSV |
+| `p` / `P` | open / close mpv side by side (the file alone for levels) |
+| `d` / `D` | open / close the difference view |
+| `s`, `a`, space | seek the players to the cursor, auto-seek both ways, pause / play |
+| `r` | DaVinci Resolve playhead sync on / off |
+| `Esc` | cancel the running analysis (nothing is saved) |
+| Ctrl+N, Ctrl+O, Ctrl+Shift+O | new analysis, open an analysis, recent analyses |
+
+Mouse on the chart: wheel zooms at the pointer, drag scrubs, double-click
+shows all; on the minimap, drag the window to pan or drag elsewhere to zoom
+to that range.
+
+## Building
+
+Needs Rust (rustup) and a C compiler. No `-devel` packages: the binary links
+only glibc and loads X11 / Wayland, OpenGL / Vulkan and xkbcommon from the
+desktop at run time.
+
+```bash
+cargo build --release -p vcompare-egui     # → target/release/vcompare-egui
+cargo test --workspace --exclude vcompare  # engine, service and UI tests
+```
+
+File dialogs go through the desktop portal (`xdg-desktop-portal`, part of
+GNOME and KDE); without one, drop files on the window or pass them on the
+command line.
+
+Packages:
+
+```bash
+./scripts/package-linux.sh   # → target/dist/vcompare-egui-<version>-linux-<arch>.tar.gz
+./scripts/package-macos.sh   # → target/dist/vcompare.app and a .zip (--universal for both CPUs)
+```
+
+A Linux binary runs on systems with the glibc it was built against or newer,
+so build the tarball on Rocky 9 (glibc 2.34), or install `cargo-zigbuild`,
+which `package-linux.sh` then uses to target 2.34 from any distro. The script
+refuses to pack a binary that needs a newer glibc than `MAX_GLIBC` (2.34 by
+default).
+
+Headless, without any UI:
+
+```bash
+cargo run --release -p vcompare-service --example analyze -- levels clip.mov
+```
+
+Set `RUST_LOG=debug` for verbose logging.
+
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Svelte 5 frontend (webview)                    │
-│  uPlot charts · virtual-scroll table · timeline │
-└──────────────┬──────────────────────────────────┘
-               │ invoke() / listen()   (Tauri IPC)
-┌──────────────┴──────────────────────────────────┐
-│  Rust core (Tauri v2)                           │
-│  bridge.rs   Tauri commands                     │
-│  engine/     ffmpeg pipeline, parsing, state,   │
-│              event detection, mpv IPC, timecode │
-└──────────────┬──────────────────────────────────┘
+┌──────────────────────────────┐  ┌───────────────────────────────┐
+│  vcompare-egui (native UI)   │  │  src-tauri + src/ (web UI,    │
+│  chart · table · detectors   │  │  being retired)               │
+└──────────────┬───────────────┘  └───────────────┬───────────────┘
+               │ method calls, UiEvent callbacks  │ Tauri IPC
+┌──────────────┴──────────────────────────────────┴───────────────┐
+│  vcompare-service   one method per action, jobs, players,       │
+│                     recents; no UI toolkit                      │
+├─────────────────────────────────────────────────────────────────┤
+│  vcompare-engine    ffmpeg pipelines, per-frame stats, state,   │
+│                     detectors, timecode, mpv IPC, Resolve       │
+└──────────────┬──────────────────────────────────────────────────┘
                │ subprocess
-         ffmpeg / ffprobe / mpv
+   ffmpeg / ffprobe / mpv / scopetap_grab / python3 (Resolve API)
 ```
 
-Progress and diagnostics are streamed to the frontend as Tauri events
-(`rpc:progress`, `rpc:diagnostics`, `rpc:mpv-position`, …).
+Long work (analysis, detection, filmstrips, probing) runs on worker threads;
+the native UI receives results over a channel and never blocks on ffmpeg.
+Progress, player positions and Resolve status come back as `UiEvent`s.
 
 ## Project structure
 
 ```
-Cargo.toml                     Workspace: the three crates below
+Cargo.toml                     Workspace
 crates/vcompare-engine/        Analysis engine (no UI)
 ├── src/
 │   ├── analysis.rs            ffmpeg command construction + stats parsing
@@ -226,10 +343,11 @@ crates/vcompare-engine/        Analysis engine (no UI)
 │   ├── references.rs          Image-match reference store
 │   ├── thumbs.rs              Event filmstrips (ffmpeg → JPEG)
 │   ├── state.rs               In-memory analysis results, queries, CSV export
-│   ├── cache.rs               .vcompare.json load/save
+│   ├── cache.rs               Saved analyses (….diff.json, ….levels.json, …)
 │   ├── probe.rs               ffprobe, capability detection
 │   ├── pixfmt.rs              Pixel-format negotiation
-│   ├── tools.rs               Where ffmpeg / ffprobe / mpv are (config, env, PATH)
+│   ├── tools.rs               Where ffmpeg / ffprobe / mpv are, their versions
+│   ├── sysenv.rs              Clean environment for child processes
 │   ├── timecode.rs            TC ⇄ frame arithmetic (incl. drop-frame)
 │   ├── mpv.rs                 mpv IPC controller
 │   ├── resolve.rs             Resolve bridge: cursor sync + run sessions
@@ -241,118 +359,54 @@ crates/vcompare-engine/        Analysis engine (no UI)
 │   └── types.rs               Shared structs
 └── testdata/fake_resolve/     Fake DaVinciResolveScript for tests and the demo
 crates/vcompare-service/       Application layer (no UI toolkit)
-└── src/
-    ├── lib.rs                 Service: owns the state, runs jobs, one method per action
-    ├── events.rs              UiEvent + EventSink (progress, mpv position, Resolve status)
-    ├── players.rs             mpv / difference-view windows and their poll threads
-    ├── recents.rs             Recent analyses list
-    └── slots.rs               Bounds concurrent thumbnail extraction
-src-tauri/                     Tauri shell for the web UI
 ├── src/
-│   ├── lib.rs                 App setup, menu, managed Service
-│   └── bridge.rs              #[tauri::command] wrappers over Service
-└── tauri.conf.json
-scripts/dev/                   fake_scopetap_grab.py, fake_timeline_demo.sh
-src/
-├── App.svelte                 State machine: pick → analyze → view
-├── lib/rpc.ts                 Typed invoke() wrappers + event listeners
-├── lib/detectors.ts           Tab registry, detector defaults, strip spans
-├── lib/thumbLoader.svelte.ts  Lazy, bounded filmstrip loading
-├── lib/eventColors.ts         Marker colours shared by chart, bar, lists
-└── components/
-    ├── MetricChart.svelte     uPlot detail + overview minimap
-    ├── TimelineBar.svelte     Ref/dist overlap + event markers
-    ├── FrameTable.svelte      Virtual-scrolled frame table
-    ├── TabStrip.svelte        Tabs under the chart
-    ├── DetectorTab.svelte     A detector's toolbar + list (+ references)
-    ├── EventList.svelte       Virtualised event rows with filmstrips
-    ├── TimelineSetup.svelte   Timeline mode: Resolve tracks, start
-    └── TimelineReport.svelte  Timeline mode: what a run looked at
+│   ├── lib.rs                 Service: owns the state, runs jobs, one method per action
+│   ├── events.rs              UiEvent + EventSink (progress, mpv position, Resolve status)
+│   ├── players.rs             mpv / difference-view windows and their poll threads
+│   ├── recents.rs             Recent analyses list
+│   └── slots.rs               Bounds concurrent thumbnail extraction
+├── examples/analyze.rs        Headless analysis
+└── tests/service.rs           End-to-end tests through the Service
+crates/vcompare-egui/          Native UI
+└── src/
+    ├── main.rs                Window, renderer choice
+    ├── app.rs                 Screens, menu, keys, worker messages, players, Resolve
+    ├── pick.rs                Start screen: mode, files, options
+    ├── progress.rs            Running-analysis screen
+    ├── chart.rs               Metric chart + minimap (painted)
+    ├── pyramid.rs             Min/max levels for fast chart drawing at any zoom
+    ├── table.rs               Frame table (virtual rows)
+    ├── detector.rs            Detector tabs: settings, event list, filmstrips, references
+    ├── thumbs.rs              Lazy, bounded filmstrip loading
+    ├── timeline.rs            Timeline mode: setup, report, REF/DIST bar
+    ├── tools.rs               File > Tools… window
+    ├── data.rs                Loaded analysis, series, smoothing
+    ├── settings.rs            Remembered settings (egui-settings.json)
+    └── theme.rs               Colours, fonts, glyph checks
+packaging/                     Icons, Linux install.sh + README for the tarball
+scripts/
+├── package-linux.sh           Rocky 9 compatible tarball
+├── package-macos.sh           vcompare.app + zip
+└── dev/                       fake_scopetap_grab.py, fake_timeline_demo.sh
+docs/plans/egui-port.md        The port from Tauri / Svelte, stage by stage
+src-tauri/, src/               Web UI (being retired)
 ```
 
-## Prerequisites
+## Web UI (being retired)
 
-- **Rust** (via rustup) and the Tauri CLI: `cargo install tauri-cli --version "^2.0"`
-- **Node.js** ≥ 18
-- **ffmpeg / ffprobe** built with `libvmaf` (and optionally `libvmaf_cuda`)
-- **mpv** for side-by-side / difference preview (optional)
-- vcompare runs `ffmpeg`, `ffprobe` and `mpv` from `PATH`. To use other
-  builds, set `VCOMPARE_FFMPEG`, `VCOMPARE_FFPROBE` and `VCOMPARE_MPV` to
-  their paths. If only `VCOMPARE_FFMPEG` is set, an `ffprobe` next to it is
-  used.
-- WebKitGTK and friends — Fedora:
-  ```bash
-  sudo dnf install webkit2gtk4.1-devel openssl-devel curl-devel \
-    librsvg2-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel
-  ```
-
-## Development
+The Tauri 2 / Svelte 5 app in `src-tauri/` and `src/` does the same jobs and
+shares the engine, saved analyses and the settings folder, but not the tool
+paths set in File > Tools… (it uses the environment variables and `PATH`).
+It needs WebKitGTK 4.1, which RHEL / Rocky 9 don't ship, and will be removed
+once the native app has been used on real jobs.
 
 ```bash
+# Fedora build dependencies
+sudo dnf install webkit2gtk4.1-devel openssl-devel curl-devel \
+  librsvg2-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel
 npm install
-cargo tauri dev        # Vite dev server + Rust binary, hot-reloading frontend
-npm run dev            # frontend only (no engine) — useful for layout work
-cargo test --workspace   # engine + service unit tests
+cargo install tauri-cli --version "^2.0"
+cargo tauri dev          # development, hot-reloading frontend
+./scripts/build.sh       # → target/release/bundle/{appimage,deb}/
+./scripts/install.sh     # AppImage → ~/.local/bin/vcompare + menu entry
 ```
-
-Set `RUST_LOG=debug` for verbose logging. On NVIDIA / Wayland the app sets
-the usual WebKitGTK workaround env vars automatically.
-
-## Native UI (egui) — in progress
-
-`crates/vcompare-egui` is the native UI that will replace the Tauri/Svelte
-one (see `docs/plans/egui-port.md`). It does everything the web UI does:
-levels, pixel diff (± SSIM), VMAF and timeline (vs. Resolve SDI) analyses;
-the chart, frame table and the Flash / Mismatches, Repeats and Image match
-tabs with reviews and EDL / CSV export; mpv side by side and the difference
-view; DaVinci Resolve playhead sync. Still to come: a settings window for
-tool paths, and packaging.
-
-It needs no WebKit and no `-devel` packages, so it builds on Rocky / RHEL 9
-as well, with only Rust and gcc:
-
-```bash
-cargo build --release -p vcompare-egui
-./target/release/vcompare-egui                               # start screen
-./target/release/vcompare-egui ref.mov dist.mov              # files filled in
-./target/release/vcompare-egui clip.levels.json              # open an analysis
-VCOMPARE_RENDERER=wgpu ./target/release/vcompare-egui …      # default: glow (OpenGL)
-VCOMPARE_VSYNC=0 ./target/release/vcompare-egui …            # vsync off (less lag, may tear)
-```
-
-The binary links only glibc. X11 / Wayland, OpenGL (or Vulkan for wgpu)
-and xkbcommon are loaded at runtime from the desktop's own libraries.
-File dialogs go through the desktop portal (`xdg-desktop-portal`, part of
-GNOME and KDE); without one, drop files on the window or pass them on the
-command line. F1 lists the shortcuts.
-
-Headless, without any UI:
-
-```bash
-cargo run --release -p vcompare-service --example analyze -- levels clip.mov
-```
-
-## Building and installing
-
-```bash
-./scripts/build.sh      # → target/release/bundle/{appimage,deb}/
-./scripts/install.sh    # AppImage → ~/.local/bin/vcompare + app-menu entry and icon
-./scripts/install.sh --uninstall
-```
-
-The install is per-user (no root). ffmpeg, ffprobe and mpv aren't bundled;
-install them from your distribution.
-
-## Keyboard
-
-| Key | Action |
-|-----|--------|
-| `m` | cycle active metric |
-| `t` / `T` | auto-threshold from active metric / clear threshold |
-| `1`–`5` | switch tab under the chart |
-| `↑` / `↓` (or `n` / `N`) | previous / next event of the active detector |
-| `y` / `x` | accept / reject the picked event |
-| `r` | toggle DaVinci Resolve playhead sync |
-| `Esc` | cancel the running analysis (nothing is saved) |
-| `p` / `P` | launch / close mpv side-by-side |
-| `d` / `D` | launch / close mpv difference view |

@@ -169,6 +169,9 @@ pub struct DiffDistribution {
 pub struct Capabilities {
     pub hwaccel: Option<String>,
     pub vmaf_cuda: bool,
+    /// The CPU `libvmaf` filter; without it (and without CUDA) VMAF can't run.
+    #[serde(default)]
+    pub libvmaf: bool,
     pub has_mpv: bool,
     /// scopetap's `scopetap_grab`, which timeline mode needs.
     #[serde(default)]

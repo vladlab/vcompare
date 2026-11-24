@@ -16,6 +16,7 @@ use crate::table::FrameTable;
 use crate::theme;
 use crate::thumbs::{ThumbLoader, QUICK, SETTLE};
 use crate::timeline;
+use crate::tools::{ToolsAction, ToolsWindow};
 use eframe::egui::{self, Key, RichText, TextureHandle, Ui};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -27,10 +28,11 @@ use vcompare_service::engine::detect::{DetectResult, Detector};
 use vcompare_service::engine::references::StoredReference;
 use vcompare_service::engine::resolve::ResolveStatus;
 use vcompare_service::engine::types::{Capabilities, ProbeResult};
-use vcompare_service::{AnalyzeParams, RecentEntry, Service, UiEvent};
+use vcompare_service::engine::tools::Tool;
+use vcompare_service::{AnalyzeParams, RecentEntry, Service, ToolReport, UiEvent};
 
 enum Msg {
-    Caps(Capabilities),
+    ToolReport(ToolReport),
     Probed(Slot, String, Result<ProbeResult, String>),
     /// Cache check result for (mode, reference, distorted).
     Cache((String, String, String), Value),
@@ -72,6 +74,7 @@ enum Dialog {
     ExportCsv,
     RefImage,
     ExportEvents(Detector, bool),
+    Tool(Tool),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -121,6 +124,7 @@ pub struct VcApp {
     ui_times: VecDeque<f32>,
     show_perf: bool,
     show_keys: bool,
+    tools: ToolsWindow,
     recents: Option<Vec<RecentEntry>>,
     // ── Players (mpv side-by-side / single, difference view) ──
     mpv: bool,
@@ -165,6 +169,7 @@ impl VcApp {
         let data_dir = data_dir();
         let settings = Settings::load(&data_dir);
         let svc = Arc::new(Service::new(data_dir.clone(), Arc::new(sink)));
+        svc.set_tool_paths(settings.tools.clone());
         let ticked = settings.match_references.clone();
         let thumbs = ThumbLoader::new(svc.clone(), cc.egui_ctx.clone());
         let mut app = Self {
@@ -193,6 +198,7 @@ impl VcApp {
             ui_times: VecDeque::new(),
             show_perf: false,
             show_keys: false,
+            tools: ToolsWindow::new(settings.tools.clone()),
             recents: None,
             mpv: false,
             diffview: false,
@@ -211,7 +217,8 @@ impl VcApp {
             quit: false,
         };
         app.dets[det::index(Detector::Match)].matching.references = ticked;
-        app.spawn(&cc.egui_ctx, |svc| Msg::Caps(svc.detect_capabilities()));
+        app.tools.checking = true;
+        app.spawn(&cc.egui_ctx, |svc| Msg::ToolReport(svc.tool_report()));
         if !open.is_empty() {
             app.open_paths(&cc.egui_ctx, open);
         }
@@ -232,6 +239,7 @@ impl VcApp {
             last_dir: self.pick.last_dir.clone(),
             keep_signatures: self.pick.keep_signatures,
             match_references: self.dets[det::index(Detector::Match)].matching.references.clone(),
+            tools: vcompare_service::engine::tools::configured(),
         }
         .save(&self.data_dir);
     }
@@ -596,6 +604,7 @@ impl VcApp {
                 PickAction::LoadCached(p) => self.open_saved(ctx, p, "Failed to load cached analysis"),
                 PickAction::ModeChanged => self.save_settings(),
                 PickAction::TimelineConnect => self.spawn(ctx, |svc| Msg::Tracks(svc.timeline_tracks())),
+                PickAction::OpenTools => self.open_tools(ctx),
             }
         }
     }
@@ -673,7 +682,11 @@ impl VcApp {
     fn receive(&mut self, ctx: &egui::Context) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Msg::Caps(c) => self.caps = Some(c),
+                Msg::ToolReport(r) => {
+                    self.tools.checking = false;
+                    self.caps = Some(r.capabilities.clone());
+                    self.tools.report = Some(r);
+                }
                 Msg::Probed(slot, path, r) => {
                     self.pick.probing = self.pick.probing.saturating_sub(1);
                     let current = match slot {
@@ -844,6 +857,7 @@ impl VcApp {
                             self.say("Adding reference…", false);
                             self.spawn(ctx, move |svc| Msg::RefAdded(svc.add_reference_from_image(&p, None)));
                         }
+                        Dialog::Tool(t) => self.tools.set(t, p),
                         Dialog::ExportEvents(k, edl) => self.spawn(ctx, move |svc| {
                             let r = if edl { svc.export_events_edl(Some(k), Some(&p)) } else { svc.export_events_csv(Some(k), Some(&p)) };
                             Msg::EventsExported(r.map(|v| (v["rows"].as_u64().unwrap_or(0), p)), edl)
@@ -1147,6 +1161,58 @@ impl VcApp {
         self.dialog(ctx, Dialog::Analysis, move || d.pick_file());
     }
 
+    fn open_tools(&mut self, ctx: &egui::Context) {
+        self.tools.open = true;
+        self.check_tools(ctx);
+    }
+
+    fn check_tools(&mut self, ctx: &egui::Context) {
+        if !self.tools.checking {
+            self.tools.checking = true;
+            self.spawn(ctx, |svc| Msg::ToolReport(svc.tool_report()));
+        }
+    }
+
+    /// What's missing for the chosen mode, from the last tool check.
+    fn tool_warning(&self) -> Option<String> {
+        let r = self.tools.report.as_ref()?;
+        let broken = |t: Tool| r.tools.iter().find(|s| s.tool == t).is_some_and(|s| s.version.is_err());
+        let missing: Vec<&str> = [Tool::Ffmpeg, Tool::Ffprobe].into_iter().filter(|&t| broken(t)).map(Tool::name).collect();
+        if !missing.is_empty() {
+            return Some(format!("{} not found or won't run, so nothing can be analysed.", missing.join(" and ")));
+        }
+        let c = &r.capabilities;
+        if self.pick.mode == "vmaf" && !c.libvmaf && !c.vmaf_cuda {
+            return Some("This ffmpeg has no libvmaf filter, so VMAF won't run. Pixel Diff and Levels are fine.".into());
+        }
+        None
+    }
+
+    fn tools_window(&mut self, ctx: &egui::Context) {
+        if !self.tools.open {
+            return;
+        }
+        for a in self.tools.show(ctx) {
+            match a {
+                ToolsAction::Browse(t) => {
+                    let mut d = rfd::FileDialog::new().set_title(format!("Choose {}", t.name()));
+                    let current = vcompare_service::engine::tools::locate(t);
+                    if let Some(dir) = current.as_deref().and_then(Path::parent) {
+                        d = d.set_directory(dir);
+                    }
+                    self.dialog(ctx, Dialog::Tool(t), move || d.pick_file());
+                }
+                ToolsAction::Apply(paths) => {
+                    self.svc.set_tool_paths(paths.clone());
+                    self.tools.applied(paths);
+                    self.save_settings();
+                    self.check_tools(ctx);
+                }
+                ToolsAction::Recheck => self.check_tools(ctx),
+            }
+        }
+    }
+
     fn show_recents(&mut self) {
         if !matches!(self.screen, Screen::Working(_)) {
             self.recents = Some(self.svc.recents());
@@ -1173,6 +1239,10 @@ impl VcApp {
             ui.separator();
             if ui.add_enabled(results, egui::Button::new("Export CSV…").shortcut_text(sc("Ctrl+Shift+E"))).clicked() {
                 self.export_csv(&ctx);
+            }
+            ui.separator();
+            if ui.button("Tools…").on_hover_text("Which ffmpeg, ffprobe and mpv to use").clicked() {
+                self.open_tools(&ctx);
             }
             ui.separator();
             if ui.add(egui::Button::new("Quit").shortcut_text(sc("Ctrl+Q"))).clicked() {
@@ -1572,6 +1642,7 @@ impl eframe::App for VcApp {
         }
 
         self.keys_window(&ctx);
+        self.tools_window(&ctx);
         self.recents_window(&ctx);
         self.confirm_delete_window(&ctx);
         egui::Panel::top("top").frame(egui::Frame::side_top_panel(ui.style()).fill(theme::BG_RAISED)).show(ui, |ui| {
@@ -1655,9 +1726,10 @@ impl eframe::App for VcApp {
             Screen::Pick => {
                 let status = self.status.as_ref().filter(|s| s.1.elapsed() < s.2).map(|s| s.0.clone());
                 let mut acts = Vec::new();
+                let warning = self.tool_warning();
                 egui::CentralPanel::default().show(ui, |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        acts = self.pick.show(ui, self.caps.as_ref(), status.as_deref());
+                        acts = self.pick.show(ui, self.caps.as_ref(), status.as_deref(), warning.as_deref());
                     });
                 });
                 self.pick_actions(&ctx, acts);
@@ -1760,9 +1832,15 @@ fn fmt_date(ts: u64) -> String {
 }
 
 fn data_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        if let Some(h) = &home {
+            return h.join("Library/Application Support/com.vcompare.app");
+        }
+    }
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .or_else(|| home.map(|h| h.join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."));
     // Same place as the Tauri app (its identifier), so recents and
     // references are shared while both exist.

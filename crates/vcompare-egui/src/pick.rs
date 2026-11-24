@@ -34,6 +34,8 @@ pub enum PickAction {
     ModeChanged,
     /// Timeline mode: ask Resolve for its tracks.
     TimelineConnect,
+    /// Open File > Tools….
+    OpenTools,
 }
 
 pub struct Pick {
@@ -162,7 +164,8 @@ impl Pick {
         }
     }
 
-    pub fn show(&mut self, ui: &mut Ui, caps: Option<&Capabilities>, status: Option<&str>) -> Vec<PickAction> {
+    /// `tool_warning`: something missing for this mode (see File > Tools…).
+    pub fn show(&mut self, ui: &mut Ui, caps: Option<&Capabilities>, status: Option<&str>, tool_warning: Option<&str>) -> Vec<PickAction> {
         let mut acts = Vec::new();
         let width = 760.0f32.min(ui.available_width() - 40.0);
         ui.add_space(28.0);
@@ -198,6 +201,15 @@ impl Pick {
                         acts.push(PickAction::CheckCache);
                     }
                 });
+                if let Some(w) = tool_warning {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(w).color(theme::WARNING));
+                        if ui.small_button("Tools…").clicked() {
+                            acts.push(PickAction::OpenTools);
+                        }
+                    });
+                }
                 ui.add_space(8.0);
 
                 let ref_label = match self.mode.as_str() {

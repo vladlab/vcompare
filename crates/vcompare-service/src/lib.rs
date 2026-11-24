@@ -185,6 +185,24 @@ impl Service {
         engine::tools::Tool::ALL.iter().map(|&t| (t, engine::tools::locate(t))).collect()
     }
 
+    /// Each tool's path, where that came from and its version line, plus
+    /// what this ffmpeg can do. Runs the tools, so call it off the UI thread.
+    pub fn tool_report(&self) -> ToolReport {
+        use engine::tools::{self, Tool};
+        let tools = Tool::ALL
+            .iter()
+            .map(|&tool| {
+                let path = tools::locate(tool);
+                let version = match &path {
+                    Some(_) => tools::version(tool),
+                    None => Err("not found".into()),
+                };
+                ToolStatus { tool, source: tools::source(tool), program: PathBuf::from(tools::program(tool)), path, version }
+            })
+            .collect();
+        ToolReport { tools, capabilities: engine::probe::detect_capabilities() }
+    }
+
     // ── Probing and caches ──
 
     pub fn detect_capabilities(&self) -> engine::types::Capabilities {
@@ -855,4 +873,22 @@ impl Service {
     pub fn clear_recents(&self) {
         self.recents.clear()
     }
+}
+
+/// One tool in `Service::tool_report`.
+#[derive(Debug, Clone)]
+pub struct ToolStatus {
+    pub tool: engine::tools::Tool,
+    pub source: engine::tools::Source,
+    /// What would be run: a path, or the bare name for a `PATH` lookup.
+    pub program: PathBuf,
+    /// The file that runs, `None` if there isn't one.
+    pub path: Option<PathBuf>,
+    pub version: Result<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolReport {
+    pub tools: Vec<ToolStatus>,
+    pub capabilities: engine::types::Capabilities,
 }

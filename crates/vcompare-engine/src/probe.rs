@@ -239,27 +239,37 @@ pub fn detect_hwaccel() -> Option<String> {
 
 /// Check if ffmpeg was built with the libvmaf_cuda filter.
 pub fn detect_vmaf_cuda() -> bool {
+    vmaf_filters().1
+}
+
+/// (libvmaf, libvmaf_cuda) in this ffmpeg's `-filters`.
+pub fn vmaf_filters() -> (bool, bool) {
     let output = match crate::tools::command(crate::tools::Tool::Ffmpeg)
         .args(["-hide_banner", "-filters"])
         .output()
     {
         Ok(o) => o,
-        Err(_) => return false,
+        Err(_) => return (false, false),
     };
+    parse_vmaf_filters(&String::from_utf8_lossy(&output.stdout))
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().any(|line| line.contains("libvmaf_cuda"))
+fn parse_vmaf_filters(filters: &str) -> (bool, bool) {
+    // Lines look like " ... libvmaf           VV->V      Calculate the VMAF…".
+    let names: Vec<&str> = filters.lines().filter_map(|l| l.split_whitespace().nth(1)).collect();
+    (names.contains(&"libvmaf"), names.contains(&"libvmaf_cuda"))
 }
 
 /// Detect all capabilities in one call — used by the frontend at startup.
 pub fn detect_capabilities() -> Capabilities {
     let hwaccel = detect_hwaccel();
-    let vmaf_cuda = detect_vmaf_cuda();
+    let (libvmaf, vmaf_cuda) = vmaf_filters();
     let has_mpv = detect_mpv();
 
     Capabilities {
         hwaccel,
         vmaf_cuda,
+        libvmaf,
         has_mpv,
         grabber: crate::grab::find_binary().map(|p| p.to_string_lossy().to_string()),
     }
@@ -372,5 +382,20 @@ mod tests {
         assert_eq!(info.pix_fmt, "yuv422p10le");
         assert_eq!(info.start_tc.as_deref(), Some("01:00:00:00"));
         assert_eq!(info.start_tc_frames, 86400); // 1hr at 24fps
+    }
+}
+
+#[cfg(test)]
+mod vmaf_filter_tests {
+    use super::parse_vmaf_filters;
+
+    #[test]
+    fn finds_libvmaf_by_name() {
+        let both = " ... libvmaf           VV->V      Calculate the VMAF between two video streams.\n \
+                    ... libvmaf_cuda      VV->V      Calculate the VMAF between two video streams.\n";
+        assert_eq!(parse_vmaf_filters(both), (true, true));
+        let cuda_only = " ... libvmaf_cuda      VV->V      Calculate the VMAF.\n ... scale  V->V  Scale.\n";
+        assert_eq!(parse_vmaf_filters(cuda_only), (false, true));
+        assert_eq!(parse_vmaf_filters(""), (false, false));
     }
 }

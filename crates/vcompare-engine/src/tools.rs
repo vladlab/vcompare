@@ -2,7 +2,8 @@
 //!
 //! In order: a path set by the app (`configure`, from its settings), then
 //! `VCOMPARE_FFMPEG` / `VCOMPARE_FFPROBE` / `VCOMPARE_MPV`, then the bare
-//! name on `PATH`. If only ffmpeg is set and an `ffprobe` sits next to it,
+//! name on `PATH`, then a few usual install folders `PATH` may lack (see
+//! `fallback_dirs`). If only ffmpeg is set and an `ffprobe` sits next to it,
 //! that one is used (static builds ship the two together).
 
 use serde::{Deserialize, Serialize};
@@ -76,24 +77,89 @@ fn env_path(tool: Tool) -> Option<PathBuf> {
 }
 
 /// What to run for `tool`: a path, or the bare name for a `PATH` lookup.
+/// A bare name that isn't on `PATH` but is in one of `fallback_dirs`
+/// comes back as that full path.
 pub fn program(tool: Tool) -> OsString {
-    resolve(tool, &configured(), env_path).into_os_string()
+    let p = resolve(tool, &configured(), env_path);
+    if p.components().count() == 1 && on_path(&p).is_none() {
+        if let Some(found) = fallback_dirs().iter().map(|d| Path::new(d).join(&p)).find(|c| c.is_file()) {
+            return found.into_os_string();
+        }
+    }
+    p.into_os_string()
+}
+
+/// Where tools live that a desktop launch's `PATH` may not include. Apps
+/// started from Finder get only /usr/bin:/bin:/usr/sbin:/sbin, so Homebrew
+/// and MacPorts installs would never be found.
+fn fallback_dirs() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+    } else {
+        &["/usr/local/bin"]
+    }
+}
+
+fn on_path(name: &Path) -> Option<PathBuf> {
+    let path = crate::sysenv::path()?;
+    std::env::split_paths(&path).map(|d| d.join(name)).find(|c| c.is_file())
+}
+
+/// Where `program` got a tool's path from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The app's settings (`configure`).
+    Settings,
+    /// `VCOMPARE_FFMPEG` and friends.
+    Env,
+    /// The ffprobe next to a set ffmpeg.
+    NextToFfmpeg,
+    /// The bare name, looked up on `PATH`.
+    Path,
+}
+
+/// Where `tool`'s path comes from right now.
+pub fn source(tool: Tool) -> Source {
+    resolve_with_source(tool, &configured(), env_path).1
 }
 
 fn resolve(tool: Tool, cfg: &ToolPaths, env: impl Fn(Tool) -> Option<PathBuf>) -> PathBuf {
+    resolve_with_source(tool, cfg, env).0
+}
+
+fn resolve_with_source(tool: Tool, cfg: &ToolPaths, env: impl Fn(Tool) -> Option<PathBuf>) -> (PathBuf, Source) {
     if let Some(p) = cfg.get(tool) {
-        return p.to_path_buf();
+        return (p.to_path_buf(), Source::Settings);
     }
     if let Some(p) = env(tool) {
-        return p;
+        return (p, Source::Env);
     }
     if tool == Tool::Ffprobe {
         let ffmpeg = cfg.get(Tool::Ffmpeg).map(Path::to_path_buf).or_else(|| env(Tool::Ffmpeg));
         if let Some(sibling) = ffmpeg.and_then(|f| sibling_ffprobe(&f)) {
-            return sibling;
+            return (sibling, Source::NextToFfmpeg);
         }
     }
-    PathBuf::from(tool.name())
+    (PathBuf::from(tool.name()), Source::Path)
+}
+
+/// The first line of `tool -version` (`--version` for mpv), trimmed of
+/// the copyright tail: "ffmpeg version 6.1.1", "mpv 0.37.0". `Err` says
+/// why it couldn't run.
+pub fn version(tool: Tool) -> Result<String, String> {
+    let flag = if tool == Tool::Mpv { "--version" } else { "-version" };
+    let out = command(tool).arg(flag).output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("exited with {}", out.status));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next().unwrap_or("").trim();
+    Ok(short_version(line).to_string())
+}
+
+fn short_version(line: &str) -> &str {
+    let cut = line.find(" Copyright").or_else(|| line.find(" (C)")).unwrap_or(line.len());
+    line[..cut].trim()
 }
 
 fn sibling_ffprobe(ffmpeg: &Path) -> Option<PathBuf> {
@@ -114,8 +180,7 @@ pub fn locate(tool: Tool) -> Option<PathBuf> {
     if p.components().count() > 1 {
         return p.is_file().then_some(p);
     }
-    let path = crate::sysenv::path()?;
-    std::env::split_paths(&path).map(|d| d.join(&p)).find(|c| c.is_file())
+    on_path(&p)
 }
 
 #[cfg(test)]
@@ -139,6 +204,25 @@ mod tests {
         // Empty counts as unset.
         let empty = ToolPaths { ffmpeg: Some(PathBuf::new()), ..Default::default() };
         assert_eq!(resolve(Tool::Ffmpeg, &empty, no_env), PathBuf::from("ffmpeg"));
+    }
+
+    #[test]
+    fn source_says_where_a_path_came_from() {
+        let cfg = ToolPaths { mpv: Some("/opt/mpv".into()), ..Default::default() };
+        assert_eq!(resolve_with_source(Tool::Mpv, &cfg, no_env).1, Source::Settings);
+        assert_eq!(resolve_with_source(Tool::Ffmpeg, &cfg, no_env).1, Source::Path);
+        let env = |t: Tool| (t == Tool::Ffmpeg).then(|| PathBuf::from("/env/ffmpeg"));
+        assert_eq!(resolve_with_source(Tool::Ffmpeg, &cfg, env).1, Source::Env);
+    }
+
+    #[test]
+    fn version_line_drops_the_copyright() {
+        assert_eq!(
+            short_version("ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers"),
+            "ffmpeg version 6.1.1"
+        );
+        assert_eq!(short_version("mpv 0.37.0 Copyright © 2000-2023 mpv/MPlayer/mplayer2 projects"), "mpv 0.37.0");
+        assert_eq!(short_version("ffprobe version n7.1"), "ffprobe version n7.1");
     }
 
     #[test]

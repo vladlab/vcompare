@@ -16,6 +16,7 @@ pub const ACCENT: Color32 = Color32::from_rgb(0x5a, 0x8f, 0xd4);
 pub const WARNING: Color32 = Color32::from_rgb(0xe8, 0xb8, 0x30);
 pub const THRESHOLD: Color32 = Color32::from_rgb(0xe5, 0x45, 0x45);
 pub const SUCCESS: Color32 = Color32::from_rgb(0x4e, 0xc9, 0x66);
+pub const ERROR: Color32 = THRESHOLD;
 
 pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());

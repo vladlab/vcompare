@@ -327,6 +327,7 @@ export interface MetricSeries {
 export interface Capabilities {
   hwaccel: string | null;
   vmaf_cuda: boolean;
+  libvmaf?: boolean;
   has_mpv: boolean;
   /** Path of scopetap_grab, if installed (timeline mode needs it) */
   grabber?: string | null;

@@ -18,11 +18,14 @@ mod table;
 mod theme;
 mod thumbs;
 mod timeline;
+mod tools;
 
 fn renderer() -> eframe::Renderer {
     let want = std::env::var("VCOMPARE_RENDERER").unwrap_or_default();
+    // macOS: wgpu runs on Metal, glow on Apple's deprecated OpenGL, so
+    // wgpu is the default there; elsewhere glow is, until the spike decides.
     #[cfg(feature = "wgpu")]
-    if want.eq_ignore_ascii_case("wgpu") {
+    if want.eq_ignore_ascii_case("wgpu") || (cfg!(target_os = "macos") && !want.eq_ignore_ascii_case("glow")) {
         return eframe::Renderer::Wgpu;
     }
     #[cfg(feature = "glow")]
@@ -37,8 +40,14 @@ fn renderer() -> eframe::Renderer {
     }
 }
 
+/// The window icon (X11 shows it in the taskbar / alt-tab; Wayland and
+/// macOS take theirs from the .desktop file / app bundle).
+fn icon() -> eframe::egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../packaging/icons/256x256.png")).unwrap_or_default()
+}
+
 fn main() -> eframe::Result {
-    let open: Vec<String> = std::env::args().skip(1).collect();
+    let open: Vec<String> = std::env::args().skip(1).filter(|a| !a.is_empty()).collect();
     let renderer = renderer();
     eprintln!("[vcompare] renderer: {renderer:?}");
     // VCOMPARE_VSYNC=0: present without waiting for vblank (less latency,
@@ -48,10 +57,11 @@ fn main() -> eframe::Result {
         renderer,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("vcompare")
-            .with_app_id("vcompare")
+            .with_app_id("vcompare-egui")
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(icon()),
         ..Default::default()
     };
     #[cfg(feature = "glow")]

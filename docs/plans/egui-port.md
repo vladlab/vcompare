@@ -523,6 +523,50 @@ Vladimir said go after the spike. Built in `crates/vcompare-egui`:
   Vladimir has used the egui build on a real job and says so. Until then
   both build.
 
+### §6 status (2026-11-24): built, except the removal
+
+- **File > Tools…** (`tools.rs`): a path per tool with Browse / Clear,
+  Apply / Revert, "Check again". Each tool shows its version line, the
+  file that runs and where that came from (set here, env var, next to
+  ffmpeg, PATH). Below: libvmaf, libvmaf_cuda, hardware decode,
+  scopetap_grab. Paths are saved in `egui-settings.json` and applied at
+  startup; the Tauri app doesn't read them. The engine gained
+  `tools::source`, `tools::version`, `probe::vmaf_filters` and
+  `Capabilities::libvmaf`; the service `tool_report()`.
+- **Start screen warning** when ffmpeg / ffprobe is missing or doesn't
+  run, or when VMAF is picked and the ffmpeg has neither VMAF filter, with
+  a Tools… button.
+- **macOS lookup:** a bare tool name not on PATH is also looked for in
+  `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin` (Finder-launched
+  apps get a minimal PATH); on Linux `/usr/local/bin`.
+- **Packaging:**
+  - `scripts/package-linux.sh` → `target/dist/vcompare-egui-<v>-linux-<arch>.tar.gz`
+    with the binary, icons, `install.sh` (`~/.local` or `--prefix`,
+    `--uninstall`) and a README. It uses cargo-zigbuild for glibc 2.34
+    when installed, and always refuses a binary that needs a newer glibc
+    than `MAX_GLIBC` (2.34). A build on the sandbox (Ubuntu, 2.39) is
+    refused, as it should be; the Rocky build itself is untried.
+  - `scripts/package-macos.sh` → `vcompare.app` (+ zip), ad hoc signed,
+    `--universal` via lipo. Hand-made bundle rather than cargo-bundle (one
+    less tool). Untested: no Mac here.
+  - No AppImage: the binary needs only glibc, so the tarball does the
+    job.
+  - Everything is named `vcompare-egui` (binary, desktop file, icon, Wayland
+    app id) so it installs next to the Tauri AppImage. Rename to
+    `vcompare` when the web UI goes.
+- **Window icon** embedded; icons copied to `packaging/icons/` so they
+  outlive `src-tauri/`.
+- **macOS:** data folder is `~/Library/Application Support/com.vcompare.app`
+  (same as Tauri there), and wgpu (Metal) is the default renderer.
+- **Rocky 9 build deps:** none beyond Rust and gcc, as measured in the
+  spike (no -devel packages; rfd uses the portal, not gtk3).
+- **README** rewritten around the native app; the web UI is a short
+  section at the end. No screenshots yet.
+- **Fonts:** egui's defaults kept; not bundling Inter / JetBrains Mono.
+
+**Left:** Vladimir uses it on a real job; then remove the web UI and rename
+to `vcompare`.
+
 ## Risks / open questions
 
 - **Look:** egui won't be pixel-identical to the Svelte UI. Fonts in
