@@ -230,7 +230,18 @@ vcompare-egui clip.mov                 # levels
 vcompare-egui clip.levels.json         # open a saved analysis
 ```
 
-Files can also be dropped on the window. F1 lists every shortcut.
+The start screen has a box per file: drop a file on a box or click it to
+browse. While files are dragged over the window, the box they'll land in
+lights up. Two files dropped together fill reference and distorted in order,
+and Swap exchanges them. Dropping a saved analysis (.json) opens it, and
+dropping media on the results screen starts a new analysis with it. Under
+the boxes: what each file is, what differs between the two, and whether a
+saved result exists for this pair. Below that, the recent analyses. F1 lists
+every shortcut.
+
+On Linux vcompare runs as an X11 app (XWayland on a Wayland desktop),
+because its windowing library can't receive dropped files on Wayland. Set
+`VCOMPARE_WAYLAND=1` to run natively on Wayland without drag and drop.
 
 Settings and app data (recent analyses, image-match references, tool paths)
 live in `~/.local/share/com.vcompare.app/` (macOS: `~/Library/Application

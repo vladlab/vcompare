@@ -6227,10 +6227,13 @@ dependencies = [
  "eframe",
  "egui_extras",
  "image",
+ "raw-window-handle",
  "rfd 0.18.0",
  "serde",
  "serde_json",
  "vcompare-service",
+ "winit",
+ "x11rb",
 ]
 
 [[package]]

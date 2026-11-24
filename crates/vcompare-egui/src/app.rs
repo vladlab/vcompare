@@ -8,8 +8,9 @@
 
 use crate::chart::{Chart, ChartProps};
 use crate::data::{Loaded, Series};
+use crate::dnd::{Dnd, Drop};
 use crate::detector::{self as det, Action as DetAction, DetectorTab, RefView};
-use crate::pick::{group, Pick, PickAction, Slot, VIDEO_EXTENSIONS};
+use crate::pick::{group, is_analysis, Pick, PickAction, Slot, VIDEO_EXTENSIONS};
 use crate::progress::{Job, JobKind};
 use crate::settings::Settings;
 use crate::table::FrameTable;
@@ -125,6 +126,7 @@ pub struct VcApp {
     show_perf: bool,
     show_keys: bool,
     tools: ToolsWindow,
+    dnd: Dnd,
     recents: Option<Vec<RecentEntry>>,
     // ── Players (mpv side-by-side / single, difference view) ──
     mpv: bool,
@@ -199,6 +201,7 @@ impl VcApp {
             show_perf: false,
             show_keys: false,
             tools: ToolsWindow::new(settings.tools.clone()),
+            dnd: Dnd::default(),
             recents: None,
             mpv: false,
             diffview: false,
@@ -253,6 +256,7 @@ impl VcApp {
 
     fn begin(&mut self, kind: JobKind) -> u64 {
         self.job_token += 1;
+        self.pick.recents = None; // this job joins the list
         self.screen = Screen::Working(Job::new(kind));
         self.job_token
     }
@@ -286,22 +290,55 @@ impl VcApp {
         self.spawn(ctx, move |svc| Msg::Finished { token, result: Loaded::open(svc, &path), what, perf: None });
     }
 
-    /// Paths from the command line or a drop: an analysis opens; media
-    /// goes to the pick screen's slots.
+    /// Paths from the command line: an analysis opens; media goes to the
+    /// start screen's boxes.
     fn open_paths(&mut self, ctx: &egui::Context, paths: Vec<String>) {
-        if let Some(j) = paths.iter().find(|p| p.to_lowercase().ends_with(".json")) {
-            self.open_saved(ctx, j.clone(), "Failed to open the analysis");
+        self.handle_drop(ctx, Drop { paths, at: None });
+    }
+
+    /// Files dropped on the window (or given on the command line). On the
+    /// start screen, a single file goes to the box it was dropped on.
+    fn handle_drop(&mut self, ctx: &egui::Context, drop: Drop) {
+        if let Some(j) = drop.paths.iter().find(|p| is_analysis(p)) {
+            if !matches!(self.screen, Screen::Working(_)) {
+                self.open_saved(ctx, j.clone(), "Failed to open the analysis");
+            }
             return;
         }
         if matches!(self.screen, Screen::Working(_)) {
             return;
         }
-        self.screen = Screen::Pick;
-        let (acts, note) = self.pick.drop_files(&paths);
+        let target = match self.screen {
+            Screen::Pick => drop.at.and_then(|p| self.pick.slot_at(p)),
+            _ => None,
+        };
+        if !matches!(self.screen, Screen::Pick) {
+            self.new_analysis();
+        }
+        let (acts, note) = self.pick.drop_files(&drop.paths, target);
         if let Some(n) = note {
             self.say(n, false);
         }
         self.pick_actions(ctx, acts);
+    }
+
+    /// While files are dragged over a screen other than the start screen:
+    /// say what a drop would do.
+    fn drop_overlay(&self, ctx: &egui::Context) {
+        if !self.dnd.hovering() || matches!(self.screen, Screen::Pick) {
+            return;
+        }
+        let analysis = self.dnd.hovered.iter().any(|p| is_analysis(p));
+        let text = match (&self.screen, analysis) {
+            (Screen::Working(_), _) => "Busy — drop files when the analysis has finished",
+            (_, true) => "Drop to open this saved analysis",
+            _ => "Drop to start a new analysis with these files",
+        };
+        let rect = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop_overlay")));
+        painter.rect_filled(rect, 0.0, theme::BG_BASE.gamma_multiply(0.85));
+        painter.rect_stroke(rect.shrink(10.0), 10.0, egui::Stroke::new(2.0, theme::ACCENT), egui::StrokeKind::Inside);
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(20.0), theme::TEXT);
     }
 
     fn cancel(&mut self, ctx: &egui::Context) {
@@ -428,6 +465,7 @@ impl VcApp {
             return;
         }
         self.pick.clear_files();
+        self.pick.recents = None;
         self.screen = Screen::Pick;
         self.recents = None;
         self.kill_players();
@@ -605,6 +643,8 @@ impl VcApp {
                 PickAction::ModeChanged => self.save_settings(),
                 PickAction::TimelineConnect => self.spawn(ctx, |svc| Msg::Tracks(svc.timeline_tracks())),
                 PickAction::OpenTools => self.open_tools(ctx),
+                PickAction::OpenRecent(p) => self.open_saved(ctx, p, "Failed to load recent analysis"),
+                PickAction::AllRecents => self.show_recents(),
             }
         }
     }
@@ -701,10 +741,7 @@ impl VcApp {
                             Slot::Reference => self.pick.ref_probe = Some(p),
                             Slot::Distorted => self.pick.dist_probe = Some(p),
                         },
-                        Err(e) => {
-                            let name = Path::new(&path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or(path);
-                            self.say(format!("Can't read {name}: {e}"), true);
-                        }
+                        Err(e) => self.pick.probe_failed(slot, e),
                     }
                     self.check_cache(ctx);
                 }
@@ -1432,6 +1469,7 @@ impl VcApp {
         }
         if clear {
             self.svc.clear_recents();
+            self.pick.recents = None;
             self.recents = Some(vec![]);
         }
         if let Some(p) = open {
@@ -1627,15 +1665,18 @@ impl VcApp {
 }
 
 impl eframe::App for VcApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.dnd.take(raw);
+    }
+
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let t0 = Instant::now();
         let ctx = ui.ctx().clone();
         self.receive(&ctx);
         self.thumbs.poll();
         self.keys(&ctx);
-        let dropped: Vec<String> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().to_string()).collect());
-        if !dropped.is_empty() {
-            self.open_paths(&ctx, dropped);
+        if let Some(drop) = self.dnd.update(&ctx, frame) {
+            self.handle_drop(&ctx, drop);
         }
         if self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1727,14 +1768,23 @@ impl eframe::App for VcApp {
                 let status = self.status.as_ref().filter(|s| s.1.elapsed() < s.2).map(|s| s.0.clone());
                 let mut acts = Vec::new();
                 let warning = self.tool_warning();
+                if self.pick.recents.is_none() {
+                    let list = self.svc.recents().into_iter().map(|e| {
+                        let exists = Path::new(&e.cache_path).is_file();
+                        (e, exists)
+                    });
+                    self.pick.recents = Some(list.collect());
+                }
+                let drag = self.dnd.hovering().then_some((self.dnd.hovered.as_slice(), self.dnd.pointer));
                 egui::CentralPanel::default().show(ui, |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        acts = self.pick.show(ui, self.caps.as_ref(), status.as_deref(), warning.as_deref());
+                        acts = self.pick.show(ui, self.caps.as_ref(), status.as_deref(), warning.as_deref(), drag);
                     });
                 });
                 self.pick_actions(&ctx, acts);
             }
         }
+        self.drop_overlay(&ctx);
         self.sync_cursor(&ctx);
         self.timing(t0);
     }
@@ -1817,7 +1867,7 @@ fn decode_data_uri(uri: &str) -> Option<egui::ColorImage> {
 }
 
 /// Unix seconds → "2026-11-24" (UTC).
-fn fmt_date(ts: u64) -> String {
+pub(crate) fn fmt_date(ts: u64) -> String {
     // Civil-from-days (Howard Hinnant), no date crate needed.
     let z = (ts / 86400) as i64 + 719468;
     let era = z.div_euclid(146097);

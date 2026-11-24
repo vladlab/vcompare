@@ -567,6 +567,41 @@ Vladimir said go after the spike. Built in `crates/vcompare-egui`:
 **Left:** Vladimir uses it on a real job; then remove the web UI and rename
 to `vcompare`.
 
+### Start screen redo (Vladimir, 2026-11-24: "drag and drop is rough")
+
+- **Report:** the UI stuttered during a drag, and nothing showed whether a
+  drop would be taken or which field it would go to.
+- **Cause of the stutter:** egui repaints nonstop while files hover, and the
+  drag source waits for our XdndStatus after each XdndPosition; winit only
+  answers between frames, so each drag step waited up to a vsync. Measured
+  with a fake XDND source (`xdnd_drag.py`, grabs the pointer like Nautilus):
+  median reply 5.6 ms before, 1.2 ms after on Xvfb (no vsync there; on a
+  real display the old wait grows to a full frame).
+- **Fix (`dnd.rs`):** the hover is taken out of egui's input in
+  `raw_input_hook` and we repaint at 25 fps instead.
+- **Where the pointer is:** winit gives no pointer position during a drag
+  (X11 swallows XdndPosition; macOS likewise). On X11 we QueryPointer on our
+  own x11rb connection while files hover, so the box under the pointer
+  lights up live. Elsewhere a drop waits up to 400 ms for the first fresh
+  pointer position, then falls back to the default box.
+- **Wayland:** winit 0.30 has no file drops there at all, so on Linux the app
+  now runs on X11 (XWayland) when `DISPLAY` is set; `VCOMPARE_WAYLAND=1`
+  opts out.
+- **New start screen (`pick.rs`):**
+  - mode as a row of buttons with a one-line description;
+  - one box per file: dashed "Drop a file here / or click to browse" when
+    empty; name, folder and probe details when filled, with Change… and
+    Remove; read errors shown in the box;
+  - while files hover: the target box filled in accent with "Drop to use /
+    Drop to replace with <name>", the other boxes outlined;
+  - under the boxes: Swap, plus notes when frame rate, size or pixel format
+    differ, or timecode sync is set but a file has none;
+  - the Analyze button says what's missing, or becomes "Open saved result" /
+    "Analyze again" when a saved result exists;
+  - the six most recent analyses at the bottom.
+- **On other screens:** an overlay says what a drop will do (open the saved
+  analysis, start a new one, or wait while busy).
+
 ## Risks / open questions
 
 - **Look:** egui won't be pixel-identical to the Svelte UI. Fonts in
